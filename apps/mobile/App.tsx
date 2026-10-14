@@ -2,12 +2,17 @@ import { CopilotKitProvider } from "@copilotkit/react-native/headless";
 import { StatusBar } from "expo-status-bar";
 import {
   Bell,
+  CalendarDays,
   Check,
+  FolderOpen,
   Lightbulb,
   type LucideIcon,
   Menu,
   MessageCircle,
+  MessagesSquare,
+  Monitor,
   PanelsTopLeft,
+  Plug,
   Shapes,
   SquareCheck,
   X,
@@ -16,13 +21,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   AppState,
+  Platform,
   Pressable,
   ScrollView,
   Text,
   useWindowDimensions,
   View,
 } from "react-native";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import type { Section, Workspace } from "../../packages/domain/src";
 import {
   AgentActivityScreen,
@@ -37,6 +43,21 @@ import { ChatScreen, WorkspaceTools } from "./src/chat";
 import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
 import { Details } from "./src/details";
+import { sessionCookie, signOut } from "./src/openbot/auth";
+import { OpenBotCalendarScreen } from "./src/openbot/calendar";
+import { applyArchived, applyRenamed, applyReopened } from "./src/openbot/channel-actions";
+import { mergeCreated, sessionFor } from "./src/openbot/channel-state";
+import { OpenBotChannelsScreen } from "./src/openbot/channels";
+import { OpenBotChatScreen } from "./src/openbot/chat";
+import { setOpenbotTransportDefaults } from "./src/openbot/client";
+import { OpenBotComputerScreen } from "./src/openbot/computer";
+import { openbotUrl } from "./src/openbot/config";
+import { OpenBotConnectionsScreen } from "./src/openbot/connections";
+import { OpenBotFilesScreen } from "./src/openbot/files";
+import { OpenBotGate } from "./src/openbot/gate";
+import { clearPrivateState } from "./src/openbot/private-state";
+import { OpenBotTasksScreen } from "./src/openbot/tasks";
+import type { OpenBotSession, OpenBotWorkspace } from "./src/openbot/types";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
 import { t } from "./src/strings";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
@@ -67,7 +88,227 @@ const titles: Partial<Record<Section, { title: string; subtitle: string }>> = {
   browser: { title: t("navBrowser"), subtitle: t("subtitleBrowser") },
   files: { title: t("shortcutFiles"), subtitle: t("subtitleFiles") },
 };
+const web = Platform.OS === "web";
+
+/*
+ * Transport boot (I04): native has no cookie jar, so every OpenBot request
+ * carries the session cookie from SecureStore explicitly. Web is unchanged
+ * (browser cookie via credentials). Platform + cookie register at module
+ * scope — child effects (the gate's first /api/me) run before a parent's
+ * effect could. The 401 hook registers inside OpenBotApp instead: only there
+ * can it flip the tree back to the sign-in gate.
+ */
+setOpenbotTransportDefaults({
+  platform: web ? "web" : "native",
+  getCookie: sessionCookie,
+});
+
+/**
+ * OpenBot gate for every platform (I04 switched native over; the legacy local
+ * flow below stays in tree, unreferenced, until B04 removes it).
+ */
 export default function App() {
+  return <OpenBotApp />;
+}
+
+function OpenBotApp() {
+  const [entry, setEntry] = useState<{ workspace: OpenBotWorkspace; session: OpenBotSession }>();
+  // errors.ts contract: authentication_required means "401, session gone, go
+  // back to sign-in". Without this, a session that dies mid-use leaves every
+  // screen on 401 loop (each answer re-triggering signOut) with no way back
+  // to the gate but the manual sign-out button.
+  useEffect(() => {
+    setOpenbotTransportDefaults({
+      onAuthExpired: () => {
+        // Revoke first, then sweep (I07): the native clear must not delete
+        // the SecureStore session while signOut still needs its cookie. The
+        // sweep ends by dropping the entry so the whole tree remounts onto
+        // the sign-in gate.
+        void signOut()
+          .then(() => clearPrivateState())
+          .catch(() => undefined)
+          .finally(() => setEntry(undefined));
+      },
+    });
+  }, []);
+  return (
+    <SafeAreaProvider>
+      <StatusBar style="dark" />
+      {entry ? (
+        <OpenBotConnected
+          workspace={entry.workspace}
+          session={entry.session}
+          onSignOut={() => {
+            // SignOutButton already revoked the server session; clear every
+            // private key — web storage plus the native SecureStore registry
+            // and PDF download cache (I07) — then drop the entry state so the
+            // whole tree (workspace snapshot included) remounts fresh for the
+            // next user.
+            void clearPrivateState().catch(() => undefined);
+            setEntry(undefined);
+          }}
+        />
+      ) : (
+        <OpenBotGate onReady={setEntry} />
+      )}
+    </SafeAreaProvider>
+  );
+}
+
+/**
+ * Provider wiring for the OpenBot runtime (C01). Web rides the browser cookie
+ * (credentials "include", no manual headers); native has no cookie jar, so the
+ * session cookie is resolved once at mount and sent as an explicit Cookie
+ * header. The provider key tracks cookie PRESENCE, never its value: a value
+ * key would remount the runtime on every rotation for nothing, while a
+ * presence flip (the only real auth change) remounts it deliberately.
+ */
+/** Provider auth wiring: web rides the browser cookie; native sends the session cookie by hand. */
+function providerAuthProps(
+  web: boolean,
+  cookie: string | null | undefined,
+): { credentials?: "include"; headers?: { Cookie: string } } {
+  if (web) return { credentials: "include" };
+  if (cookie) return { headers: { Cookie: cookie } };
+  return {};
+}
+
+function OpenBotConnected({
+  workspace,
+  session,
+  onSignOut,
+}: {
+  workspace: OpenBotWorkspace;
+  session: OpenBotSession;
+  onSignOut: () => void;
+}) {
+  // undefined = still reading SecureStore on native; the runtime does not mount
+  // until the one read settles, so it never opens an anonymous connection first.
+  const [cookie, setCookie] = useState<string | null | undefined>(web ? null : undefined);
+  // T03: minimal Tasks entry — one toggle on the shell, real navigation is a later ticket.
+  const [tasksOpen, setTasksOpen] = useState(false);
+  // K02: the own private Bot's computer preview, beside the Tasks entry.
+  const [computerOpen, setComputerOpen] = useState(false);
+  // A03: minimal Calendar entry, same toggle pattern as the Tasks entry.
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  // G06: Google account connections entry, same toggle pattern as the rest.
+  const [connectionsOpen, setConnectionsOpen] = useState(false);
+  // F04: the owner's Files entry (list + authenticated download to cache).
+  const [filesOpen, setFilesOpen] = useState(false);
+  // C02: the shell owns the channel roster and the selection. The list starts
+  // as the workspace read's server order; a created channel is merged in, and
+  // switching re-keys the chat below so each channel's useAgent thread loads
+  // independently.
+  const [channels, setChannels] = useState(workspace.channels);
+  const [selectedId, setSelectedId] = useState(session.channelId);
+  const [channelsOpen, setChannelsOpen] = useState(false);
+  const selected = channels.find((channel) => channel.id === selectedId);
+  const insets = useSafeAreaInsets();
+  const anyOverlayOpen =
+    channelsOpen || tasksOpen || calendarOpen || connectionsOpen || filesOpen || computerOpen;
+  useEffect(() => {
+    if (web) return;
+    void sessionCookie().then(setCookie, () => setCookie(null));
+  }, []);
+  if (cookie === undefined) return null;
+  return (
+    <CopilotKitProvider
+      key={cookie ? "session" : "anonymous"}
+      runtimeUrl={`${openbotUrl}/api/copilotkit`}
+      {...providerAuthProps(web, cookie)}
+    >
+      {/*
+       * Entry strip in normal flow (not absolutely positioned): it owns its
+       * safe-area top, never shares coordinates with the chat header or the
+       * overlays' own headers, fits the narrowest screens, and hides entirely
+       * while any overlay is open (each overlay keeps its own close button).
+       */}
+      {!anyOverlayOpen && (
+        <View
+          style={{
+            paddingTop: insets.top + 6,
+            paddingBottom: 2,
+            paddingHorizontal: 8,
+            flexDirection: "row",
+            justifyContent: "flex-end",
+            gap: 4,
+          }}
+        >
+          <IconButton icon={MessagesSquare} label="频道" onPress={() => setChannelsOpen(true)} />
+          <IconButton icon={SquareCheck} label="任务" onPress={() => setTasksOpen(true)} />
+          <IconButton icon={CalendarDays} label="日历" onPress={() => setCalendarOpen(true)} />
+          <IconButton icon={Plug} label="连接" onPress={() => setConnectionsOpen(true)} />
+          <IconButton icon={FolderOpen} label="文件" onPress={() => setFilesOpen(true)} />
+          <IconButton icon={Monitor} label="计算机" onPress={() => setComputerOpen(true)} />
+        </View>
+      )}
+      {/*
+       * Remount by key on channel switch (React's reset-state-with-a-key), the
+       * same deliberate-remount pattern as the provider presence key above: a
+       * new channelId tears the old useAgent down and connects the selected
+       * channel's thread fresh, so histories can never bleed across channels.
+       */}
+      <OpenBotChatScreen
+        key={selected ? selected.id : session.channelId}
+        session={selected ? sessionFor(selected) : session}
+        title={selected?.name}
+        onSignOut={onSignOut}
+      />
+      {channelsOpen && (
+        <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+          <OpenBotChannelsScreen
+            channels={channels}
+            currentId={selectedId}
+            botId={session.botId}
+            onSelect={(channel) => {
+              setSelectedId(channel.id);
+              setChannelsOpen(false);
+            }}
+            onCreated={(channel) => {
+              setChannels((prev) => mergeCreated(prev, channel));
+              setSelectedId(channel.id);
+              setChannelsOpen(false);
+            }}
+            onRenamed={(channel) => setChannels((prev) => applyRenamed(prev, channel))}
+            onArchived={(channelId) =>
+              setChannels((prev) => applyArchived(prev, channelId, new Date().toISOString()))
+            }
+            onReopened={(channelId) => setChannels((prev) => applyReopened(prev, channelId))}
+            onClose={() => setChannelsOpen(false)}
+          />
+        </View>
+      )}
+      {tasksOpen && (
+        <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+          <OpenBotTasksScreen onClose={() => setTasksOpen(false)} />
+        </View>
+      )}
+      {calendarOpen && (
+        <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+          <OpenBotCalendarScreen onClose={() => setCalendarOpen(false)} />
+        </View>
+      )}
+      {connectionsOpen && (
+        <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+          <OpenBotConnectionsScreen onClose={() => setConnectionsOpen(false)} />
+        </View>
+      )}
+      {filesOpen && (
+        <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+          <OpenBotFilesScreen onClose={() => setFilesOpen(false)} />
+        </View>
+      )}
+      {computerOpen && (
+        <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+          <OpenBotComputerScreen botId={session.botId} onClose={() => setComputerOpen(false)} />
+        </View>
+      )}
+    </CopilotKitProvider>
+  );
+}
+
+// biome-ignore lint/correctness/noUnusedVariables: legacy local flow kept in tree, unreferenced, until B04 removes it.
+function OpenMuseApp() {
   const [token, setToken] = useState("");
   const [accessKey, setAccessKey] = useState("");
   const [busy, setBusy] = useState(true);
