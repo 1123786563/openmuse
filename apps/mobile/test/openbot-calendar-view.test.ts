@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import { fetchCalendarEvents } from "../src/openbot/api.ts";
 import {
@@ -20,6 +22,17 @@ import { openbotUrl } from "../src/openbot/config.ts";
 
 const DST_START = "2026-03-08T01:30:00-08:00";
 const DST_END = "2026-03-08T03:30:00-07:00";
+
+test("a full first calendar page still records its cursor and truncation hint", () => {
+  const source = readFileSync(join(import.meta.dirname, "../src/openbot/calendar.tsx"), "utf8");
+  const compact = source.replace(/\s+/g, "");
+  assert.ok(
+    compact.includes(
+      "cursor=page.nextCursor;if(page.truncated)sawTruncated=true;if(collected.length>=MAX_EVENT_ROWS)break;",
+    ),
+    "pagination state must be recorded before the row-limit break",
+  );
+});
 
 test("LA DST fixture renders 01:30–03:30 and lasts exactly one hour", () => {
   assert.equal(renderTimedRange(DST_START, DST_END, "America/Los_Angeles"), "01:30–03:30");

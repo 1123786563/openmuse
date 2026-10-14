@@ -94,9 +94,9 @@ export function OpenBotCalendarScreen({ onClose }: { onClose: () => void }) {
         collected.push(...page.events);
         // The row cap leaves the cursor pending, so the post-loop check below
         // flags the list as truncated — nothing is silently dropped.
-        if (collected.length >= MAX_EVENT_ROWS) break;
         cursor = page.nextCursor;
         if (page.truncated) sawTruncated = true;
+        if (collected.length >= MAX_EVENT_ROWS) break;
       } while (cursor && ++pages < 50);
       // Exiting on the page cap with a cursor still pending means the list is
       // just as incomplete as a truncated page — hint it, never drop silently.

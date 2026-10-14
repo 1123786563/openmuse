@@ -121,8 +121,7 @@ export function OpenBotComputerScreen({
   onClose: () => void;
 }) {
   const [state, setState] = useState<ComputerState>(initialComputerState);
-  // Ticks only to re-evaluate the staleness label while a picture is up.
-  const [tick, setTick] = useState(0);
+  const [stale, setStale] = useState(false);
 
   useEffect(() => {
     if (state.connection === "disconnected") return; // Polling stops; only retry restarts it.
@@ -170,12 +169,15 @@ export function OpenBotComputerScreen({
   }, [state.seq, botId, intervalMs]);
 
   useEffect(() => {
-    if (state.connection !== "viewing") return;
-    const timer = setInterval(() => setTick((value) => value + 1), 1000);
+    if (state.connection !== "viewing") {
+      setStale(false);
+      return;
+    }
+    setStale(isComputerStale(state, Date.now(), intervalMs));
+    const timer = setInterval(() => setStale(isComputerStale(state, Date.now(), intervalMs)), 1000);
     return () => clearInterval(timer);
-  }, [state.connection]);
+  }, [state, intervalMs]);
 
-  const stale = isComputerStale(state, Date.now(), intervalMs);
   const source = snapshotSourceOf(state);
   const chip = stale
     ? { label: computerStaleLabel, style: chipTint.stale }
@@ -183,7 +185,6 @@ export function OpenBotComputerScreen({
         label: computerConnectionLabels[state.connection],
         style: chipTint[state.connection],
       };
-  void tick; // The tick re-renders this component; the label reads the clock directly.
 
   // The preview slot is one of three exclusive states, computed before the
   // JSX instead of a nested ternary: connecting (no picture yet), the live

@@ -196,7 +196,7 @@ export function OpenBotTasksScreen({ onClose }: { onClose: () => void }) {
           <Text style={s.heading}>{detail ? detail.kind : COPY.title}</Text>
         </View>
         <View style={styles.headerActions}>
-          <Button small busy={busy} onPress={() => void load()}>
+          <Button small busy={busy} onPress={() => void (detail ? open(detail.id) : load())}>
             {COPY.refresh}
           </Button>
           <Button small onPress={onClose}>

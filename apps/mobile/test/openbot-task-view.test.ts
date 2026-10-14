@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import { fetchTaskDetail, fetchTasks } from "../src/openbot/api.ts";
 import { openbotUrl } from "../src/openbot/config.ts";
@@ -31,6 +33,15 @@ const task: OpenBotTask = {
   createdAt: "2026-10-12T00:00:00.000Z",
   updatedAt: "2026-10-12T01:00:00.000Z",
 };
+
+test("refresh reloads the open detail instead of only the hidden task list", () => {
+  const source = readFileSync(join(import.meta.dirname, "../src/openbot/tasks.tsx"), "utf8");
+  const compact = source.replace(/\s+/g, "");
+  assert.ok(
+    compact.includes("onPress={()=>void(detail?open(detail.id):load())}"),
+    "the header Refresh action must target the currently displayed task detail",
+  );
+});
 
 test("steps sort by stable id and map every status to a zh-CN chip; failed exposes clipped errorText", () => {
   const view = normalizeTaskDetail(task);

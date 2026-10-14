@@ -154,6 +154,21 @@ test("URL hygiene: snapshotSourceOf is null after disconnect; the module holds n
     );
 });
 
+test("the staleness label reads the clock in its interval, not during full-screen render", () => {
+  const source = readFileSync(join(import.meta.dirname, "../src/openbot/computer.tsx"), "utf8");
+  const compact = source.replace(/\s+/g, "");
+  assert.ok(
+    compact.includes(
+      "setInterval(()=>setStale(isComputerStale(state,Date.now(),intervalMs)),1000)",
+    ),
+    "only the stale boolean should cause a label update",
+  );
+  assert.ok(
+    !compact.includes("conststale=isComputerStale(state,Date.now(),intervalMs);"),
+    "render must not call Date.now directly",
+  );
+});
+
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), {
     status,
