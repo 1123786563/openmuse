@@ -1,0 +1,18 @@
+OCR final-pass repair (OpenMuse mobile) — cluster B (17 findings: chat.tsx, chat-state.ts, computer.tsx, control.tsx, control-state.ts, channels.tsx, channel-actions.ts, tool-cards.ts).
+
+TARGET repo: /Users/wuyongjun/trea/openmuse/.worktrees/v4-base (branch v4/openbot-exec; 26 uncommitted files are prior repair waves — do NOT commit, stash, or reset anything).
+Findings list (authoritative, 17 blocks): /Users/wuyongjun/trea/openmuse/docs/superpowers/ledger/2026-10-12-openbot-v4-execution/ocr-mob-final-cluster-b.txt
+Context: OpenMuse-side FINAL confirming pass of the OCR review-repair loop (ledger LEDGER.md same dir). A 13:12 UTC repair round already fixed 14 high/medium findings in this app (incl. chat.tsx awaitingReply send-guard + runEnded ref suppression) — several findings may be stale or invalid; verify each against current code before acting.
+
+CHANGE: For EACH finding: (1) verify against current code; (2) if valid, implement the minimal correct fix, extending the existing suite where practical; (3) if invalid or already fixed, no code change, record disposition with file:line citation.
+
+OWNERSHIP — you may edit ONLY: apps/mobile/src/openbot/{chat.tsx,chat-state.ts,computer.tsx,control.tsx,control-state.ts,channels.tsx,channel-actions.ts,tool-cards.ts}, plus apps/mobile/test/{openbot-chat-state,openbot-computer-status,openbot-computer-state,openbot-control-state,openbot-channel-actions,openbot-channel-state,openbot-tool-cards,conversation-queue}.test.ts and new tests inside apps/mobile/test/. Never edit files outside ownership; cross-module concerns go in your report as dependencies.
+
+CONSTRAINTS: minimal diffs, match existing style, no drive-by refactors; leave everything uncommitted.
+
+ACCEPTANCE (all required):
+1. Relevant suites green: cd /Users/wuyongjun/trea/openmuse/.worktrees/v4-base && pnpm exec tsx --import ./tests/setup.ts --test apps/mobile/test/openbot-chat-state.test.ts apps/mobile/test/openbot-computer-status.test.ts apps/mobile/test/openbot-computer-state.test.ts apps/mobile/test/openbot-control-state.test.ts apps/mobile/test/openbot-channel-actions.test.ts apps/mobile/test/openbot-channel-state.test.ts apps/mobile/test/openbot-tool-cards.test.ts apps/mobile/test/conversation-queue.test.ts (+ any suite covering files you touched) — 0 fail.
+2. pnpm run typecheck — clean (root tsc + mobile tsc).
+3. bunx biome check <each file you touched> — clean.
+4. Write /Users/wuyongjun/trea/openmuse/docs/superpowers/ledger/2026-10-12-openbot-v4-execution/ocr-mob-final-disposition-cluster-b.md — table: finding (file:lines) | verdict fixed/fixed-before/invalid | action | evidence; end with totals + dependencies.
+Then send worker_done exactly once with --outcome succeeded|failed, --report-path, and --files-modified.

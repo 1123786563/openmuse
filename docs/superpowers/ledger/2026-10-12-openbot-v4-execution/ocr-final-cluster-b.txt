@@ -1,0 +1,805 @@
+# ocr-openbot-final split — cluster B: deletion / notifications / activity / personal / ops
+# source: ocr-openbot-final.txt (37 findings)
+# repo: /Users/wuyongjun/trea/OpenBot/.worktrees/v4-base (branch v4/openbot-exec)
+
+─── server/src/openmuse-activity/feed.ts:284-293 ───
+[style · low] reviewedItem 对 allowedActions 使用了三层嵌套三元表达式(awaiting_review / outcome_unknown /
+operator 分支),违反评审规范"禁止嵌套三元表达式"。可读性差,后续新增状态(如 failed 重试、expired 重提案)时容易改错分支。建议改为顺序 if/else 赋值或独立映射函数。
+
+-   const allowedActions =
+-     action.status === "awaiting_review"
+-       ? ["approve", "deny"]
+-       : // §8: an uncertain send is viewable; only an operator may reconcile,
++   let allowedActions: string[] = [];
++   if (action.status === "awaiting_review") {
++     allowedActions = ["approve", "deny"];
++   } else if (action.status === "outcome_unknown") {
++     // §8: an uncertain send is viewable; only an operator may reconcile,
+-         // never the owner, and it is never retryable from the feed.
++     // never the owner, and it is never retryable from the feed.
+-         action.status === "outcome_unknown"
+-         ? operator
+-           ? ["view", "reconcile"]
+-           : ["view"]
+-         : [];
++     allowedActions = operator ? ["view", "reconcile"] : ["view"];
++   }
+
+─── server/src/openmuse-activity/routes.ts:76-87 ───
+[bug · low] onError 的兜底分支把所有未识别异常(包括 TypeError 等代码缺陷)统一映射为 503 "Try again",语义上应为 500:503
+表示服务暂时不可用,会误导客户端重试策略(对持久性 bug 无意义重试)与监控告警分级(被归为容量/可用性问题而非代码缺陷)。同时日志只记录 error.name(如 "TypeError"),不含
+message 与堆栈,线上排障基本不可行。建议改回 500 并记录完整 error 对象(pino 会带 message/stack)。
+
+      log.error(
+        {
+          type: "openmuse-activity-route-error",
+-         error: error.name,
++         error,
+          context: { route: context.req.path },
+        },
+        "openmuse-activity-route-error",
+      );
+      return context.json(
+        { error: "The activity feed is unavailable right now. Try again." },
+-       503,
++       500,
+      );
+
+─── server/src/openmuse-activity/feed.ts:202-203 ───
+[maintainability · low] feed.decide 中非法 action 值返回 kind:"missing",被路由映射为 404 "No such activity
+item.",语义上这是调用方契约违反(参数校验错误),而非资源不存在。当前 HTTP 表面因 routes 层 zod enum 校验而不可达,但 feed 作为库 API 被其他调用方(如
+mobile-bff、未来 worker)直接复用时,参数拼写错误会得到误导性的 404,掩盖真正的 bug。建议为参数校验失败引入独立 kind(如 "bad_action"),由路由映射
+400,把 "missing" 留给真正的 id 查找失败。
+
+        if (input.action !== "approve" && input.action !== "deny")
+-         return { kind: "missing" };
++         // A caller contract violation, not a missing row: keep "missing"
++         // for the id lookup so reuse sites see their own bug, not a 404.
++         return { kind: "bad_action" };
+
+─── server/src/openmuse-activity/routes.ts:91-91 ───
+[maintainability · low] 分页上限 100 在此硬编码,与 feed.ts 导出的 ACTIVITY_MAX_LIMIT 重复。该值是 HTTP
+表面的实际截断点(parsePageLimit 会把 ?limit=500 先钳到 100),若日后调整 ACTIVITY_MAX_LIMIT 而漏改此处,路由层会继续按旧值钳制,导致 API 表面与
+feed 库内上限悄悄分叉。建议从 "./feed" 导入 ACTIVITY_MAX_LIMIT 作为 max 参数,让 §8 的页大小规则只有一处定义。
+
+-     const parsedLimit = parsePageLimit(context.req.query("limit") ?? null, 100);
++     const parsedLimit = parsePageLimit(
++       context.req.query("limit") ?? null,
++       ACTIVITY_MAX_LIMIT,
++     );
+
+─── server/src/openmuse-activity/routes.ts:139-155 ───
+[maintainability · low] POST /:id/decision 与 POST /:id/read 两个路由各自内联了一份完全相同的 missing→404 /
+wrong_type→409 / item→200 映射块(共约 12 行重复)。两处的文案与状态码必须保持同步(§8 矩阵要求同一 id
+在两个动词下答一致的错误码),重复代码是将来改错一处漏一处的典型温床。建议提取一个 outcome→Response 的小助手函数,两个路由各一行调用;helper 需要从 hono 补充导入
+type Context。
+
+      const outcome = await deps.feed.markRead(
+        context.var.actor.id,
+        context.req.param("id"),
+-     );
+-     if (outcome.kind === "missing") {
+-       return context.json({ error: "No such activity item." }, 404);
+-     }
+-     if (outcome.kind === "wrong_type") {
+-       return context.json(
+-         {
+-           error: "That decision type does not match this activity item.",
+-           code: "wrong_type",
+-         },
+-         409,
+-       );
++     );
+-     }
+-     return context.json(outcome.item);
++     return activityItemResponse(context, outcome);
+
+─── server/src/openmuse-deletion/fence.ts:16-19 ───
+[security · high] 栅栏边界已核实为残留暴露:app.ts 中 fence 仅挂载于 /api/mobile/*(顺序正确),但全库 isDisabled
+仅此一处消费——computer 流授权(server/src/computer/stream-auth.ts 的 createStreamAuthorizer 只做
+session/origin/Bot 归属检查)、/api/channels、copilot 等生产 seam 均无账号禁用检查;且删除仅写 marker、不吊销 auth 会话,已删账号持有效
+cookie 仍可继续读取/使用这些未栅栏入口(清单甚至把 channels 列为删除资源)。此处注释将其记为 D02/D03 后续,但本更新即含
+D02/D03,后续并未落地。建议:要么在本交付内为这些 seam 补等效 marker 检查,要么把"删除后桌面/渠道入口仍可用"的边界决策显式升级为带跟踪项的已知风险,而非仅以注释带过。
+
+   * MOUNT BOUNDARY RECORDED: one shared guard at the `/api/mobile/*` prefix,
+   * registered in app.ts BEFORE the mobile mounts (and after the delete route,
+   * so a repeat delete still answers). The computer and copilot seams are
+   * D02/D03's follow-ups, not fenced here.
++  *
++  * OPEN EXPOSURE (verify before general availability): until those follow-ups
++  * land, a deleted owner's still-valid session keeps reaching /api/channels,
++  * the computer screen stream and copilot — none of which consult the marker
++  * (isDisabled has exactly one consumer: this fence).
+
+─── server/src/openmuse-deletion/restore.ts:237-239 ───
+[security · medium] purge / purge-relational 路由把报告原样返回,其中 retryable[].lastError
+是底层错误原文(byteStore/client/DB 的 message)。retention.ts 的 G06 策略明确该类原因可能引用所失败的凭据,并为此提供了
+sanitizeLastError(TOKEN_SHAPED 整句替换),但它目前只应用于 cleanup 视图和 ops signals——同一份 lastError
+两条出口一处脱敏一处泄漏。建议对两处报告中的 lastError 统一经 sanitizeLastError 后再应答。
+
++     const report = await deps.purge(context.req.param("userId"));
+      return context.json({
+-       purge: await deps.purge(context.req.param("userId")),
++       purge: {
++         ...report,
++         retryable: report.retryable.map((row) => ({
++           ...row,
++           lastError: sanitizeLastError(row.lastError) ?? row.lastError,
++         })),
++       },
+      });
+
+─── server/src/openmuse-deletion/manifest.ts:297-303 ───
+[security · medium] buildManifest 应答的 resources 直接透传存储行的 lastError 原文(枚举/清理失败的底层 message)。这些行经由
+/api/mobile/openmuse-account/delete 应答给发起删除的用户本人(接线 buildManifest 后),并非仅限管理员;而同一字段在 cleanup 视图已被 G06
+显示守卫(sanitizeLastError)脱敏。同一数据两处出口标准不一致,存在底层错误原文(可能含凭据形态文本)进入客户端响应与日志的风险。建议此处同样经 sanitizeLastError。
+
+-         resources: stored.map((row) => ({
++         resources: stored.map((row) => {
++           const lastError = sanitizeLastError(row.lastError);
++           return {
+-           kind: row.kind,
++             kind: row.kind,
+-           id: row.id,
++             id: row.id,
+-           ...(row.externalKey ? { externalKey: row.externalKey } : {}),
++             ...(row.externalKey ? { externalKey: row.externalKey } : {}),
+-           state: row.state,
++             state: row.state,
+-           ...(row.lastError ? { lastError: row.lastError } : {}),
+-         })),
++             ...(lastError !== undefined ? { lastError } : {}),
++           };
++         }),
+
+─── server/src/openmuse-deletion/manifest.ts:168-171 ───
+[bug · high] channelResources 通过 ChannelStore.list 枚举 active/archived 两个分区,但 list 的查询在两个分区都带
+isNull(channels.deletedAt)——用户删除账号前软删除过的频道(softDelete 语义:row and the thread survive, every read
+filters)永远不会进入清单,后续也不会被 D08 的 channels.hardDelete 移除:其 channels 行、membership、附件及承载会话记录的 Intelligence
+thread 将在账号清除后永久留存。这与本模块"manifest is always the whole truth"的不变量矛盾,也正是 agents seam 注释里明确规避的同类失效(list
+"hides the owner's soft-deleted ones"——Bot 为此专门建了 enumerateOwner)。建议为 channels 提供同形的 owner-scoped
+enumerateOwner(忽略 deletedAt、按 membership 限定),否则完成的清单对软删除频道是假完整,§9 清除存在永久残留。
+
+-   async function channelResources(
+-     userId: string,
+-   ): Promise<OpenMuseDeletionResourceInput[]> {
+-     const actor = { id: userId, role: "user" as const };
++   channels?: Pick<ChannelStore, "enumerateOwner">; // §9 seam:含软删除行、membership 限定,与 agents 同形,替代按 list 双分区枚举
+
+─── server/src/openmuse-deletion/manifest.ts:292-296 ───
+[bug · medium] 应答中的 phase 写死为 "fenced",与真实栅栏状态脱节:生产 store 的 delete 是 insert-once(onConflictDoNothing
+后原样返回既有行,store.ts 注释"A repeat returns the existing row unchanged"),无法把 restored 标记重新拉回
+fenced;而测试契约(tests/openmuse-deletion.test.ts:446 "a repeat delete over a restored marker re-engages
+the fence")钉死的是必须重新上栅栏。在 store 该缺陷修复前,restore 后再次 delete 会走到这里:清单应答 phase:"fenced",而栅栏 isDisabled(只认
+phase="fenced")实际放行——同一次应答自我矛盾。建议从 marker.phase 派生该字段,并对 restored 阶段与 completed 一样短路处理(恢复语义,而非枚举+假
+fenced 应答)。
+
++       if (existing?.phase === "completed" || existing?.phase === "restored") {
+-       return {
++         return {
+-         userId,
++           userId,
+-         disabledAt: marker?.disabledAt.toISOString() ?? null,
+-         restoreUntil: marker?.restoreUntil?.toISOString() ?? null,
+-         phase: "fenced",
++           disabledAt: existing.disabledAt.toISOString(),
++           restoreUntil: existing.restoreUntil?.toISOString() ?? null,
++           phase: existing.phase === "completed" ? "completed" : "fenced",
++           resources: [],
++         };
++       }
+
+─── server/src/openmuse-deletion/purge-relational.ts:78-79 ───
+[bug · high] D08 的 walk/finalize 对 marker.phase 零感知:deps 只携带 Pick<OpenMuseAccountDeletionStore,
+"complete">,结构上无法在破坏性动作前检查阶段。D05 的 restore 有意保留完整清单("the manifest rows remain untouched")并把标记翻为
+restored(栅栏放行、账号复活);此后任一次 admin purge(D06 purgeFileBytes → D07 purgeConnectorGrants → 本
+walk)都会照常销毁一个活跃账号的字节/授权/关系行,且 finalize 把标记落为 completed——此后 restore 永久 410,不可挽回。purge.ts 自称 "the
+post-restoreUntil pass" 但整条 purge 链没有任何 restoreUntil/phase 校验(测试只覆盖 purge→restore 方向,没有 restore 后
+purge 的拒绝路径)。建议给 deps 增加 marker.get,并在 walk 开头拒绝 phase !== "fenced"(或 restoreUntil 未过的)账号,返回 409
+指明阶段;D06/D07 两个 walk 同样缺这道闸。
+
+    /** D08's terminal flip — the marker's phase lands `completed`. */
+-   marker: Pick<OpenMuseAccountDeletionStore, "complete">;
++   marker: Pick<OpenMuseAccountDeletionStore, "get" | "complete">;
++   // walk 开头:
++   //   const marker = await deps.marker.get(userId);
++   //   if (!marker || marker.phase !== "fenced") return { status: 409, blocked: [] };
+
+─── server/src/openmuse-deletion/purge.ts:158-159 ───
+[bug · medium] 与 purge-relational.ts 的发现同源:purge 入口没有任何 marker 阶段/restoreUntil 前置校验,注释声称的 "the
+post-restoreUntil pass" 并未被任何代码执行。restore 后的账号(标记 restored、清单被 D05 有意保留)被本 purge 清掉字节后,D08 随即可以
+finalize——构成对活跃账号的不可逆删除。建议在 walk 前统一加阶段闸(refuse phase !== "fenced" 或 restoreUntil 未过),详见
+purge-relational.ts 的同题注释。
+
+    return {
+-     purgeFileBytes: (userId: string) => walk(userId, () => true),
++     // 阶段闸:仅 fenced(且 restoreUntil 已过)的 marker 才允许进入 §9 清除。
++     purgeFileBytes: async (userId: string) => {
++       const marker = await deps.marker.get(userId);
++       if (!marker || marker.phase !== "fenced") {
++         throw new Error(`purge refused: marker for ${userId} is not fenced`);
++       }
++       return walk(userId, () => true);
++     },
+
+─── server/src/openmuse-deletion/routes.ts:55-56 ───
+[bug · high] 重复删除的围栏重建缺口:store.delete 是 insert-once,对已存在行原样返回;restore 将 phase 翻为 "restored" 后(且
+complete 后同理),再次 POST /delete 会拿到未变的标记行,而 isDisabled 只匹配 phase="fenced" —— 围栏不会重新生效,但路由仍照常执行
+shutdown/revoke/manifest 并返回 200。一旦 D05 的 admin restore 挂载,已恢复账号的二次删除会"看似成功":/api/mobile
+前缀不再拦截(账号可继续认证访问),同时其任务被取消、连接席位被撤销,处于无围栏的半删除状态,与 §9「marker 是第一动作、围栏立即可用」的契约相悖。建议:store.delete 增加对
+"restored" 行的 CAS 回写(fenced 且清空 restoreUntil)使围栏重臂,对 "completed" 墓碑则直接原样应答、不重跑撤销流程;或在路由层按 phase
+拒绝(409)。
+
+-   routes.post("/delete", async (context) => {
+-     const marker = await deps.store.delete(context.var.actor.id);
++ // store.ts — delete 对非终态行重臂围栏,completed 墓碑原样应答:
++ delete: async (userId) => {
++   const inserted = await database
++     .insert(openmuseAccountDeletions)
++     .values({ userId })
++     .onConflictDoNothing()
++     .returning();
++   if (inserted[0]) return inserted[0];
++   const reFenced = await database
++     .update(openmuseAccountDeletions)
++     .set({ phase: "fenced", restoreUntil: null })
++     .where(
++       and(
++         eq(openmuseAccountDeletions.userId, userId),
++         eq(openmuseAccountDeletions.phase, "restored"),
++       ),
++     )
++     .returning();
++   if (reFenced[0]) return reFenced[0];
++   // completed/缺失:沿用现有 read 兜底
++   ...
++ }
+
+─── server/src/openmuse-deletion/store.ts:140-151 ───
+[bug · medium] phase 语义在直接读表方被绕过:本 seam 的契约是「只有仍为 fenced 的行才拦截」,但
+openmuse-tasks/store.ts:1227、openmuse-files/store.ts:665、openmuse-connectors/store.ts:273 三处
+ownerDisabled 都直接查本表且只判行存在、不过滤 phase;它们的 restoreOwner 要么是 no-op(tasks/connectors),要么只清独立 disable
+表(files),而标记行在 restore 乃至 complete 后都作为墓碑永久保留。结果是 D05 restore 后 /api/mobile 围栏抬起(本查询放行),但
+Tasks/Files/Connectors 三个 seam 永远拒绝 —— restore 报告承诺的 liveAgain 对这些模块不成立,账号被半恢复。建议把三处 ownerDisabled
+的标记读取收敛到本 store 提供的统一 phase-aware seam(或至少同步加上 phase 过滤),避免语义分叉。
+
+-     isDisabled: async (userId) => {
++ /** 统一的 fence 查询 seam:tasks/files/connectors 的 ownerDisabled 都改走这里。 */
++ ownerDisabled(userId: string): Promise<boolean>;
++ ...
++ ownerDisabled: async (userId) => {
+-       const rows = await database
++   const rows = await database
+-         .select({ userId: openmuseAccountDeletions.userId })
++     .select({ userId: openmuseAccountDeletions.userId })
+-         .from(openmuseAccountDeletions)
++     .from(openmuseAccountDeletions)
+-         .where(
++     .where(
+-           and(
++       and(
+-             eq(openmuseAccountDeletions.userId, userId),
++         eq(openmuseAccountDeletions.userId, userId),
+-             eq(openmuseAccountDeletions.phase, "fenced"),
++         eq(openmuseAccountDeletions.phase, "fenced"),
+-           ),
++       ),
+-         );
++     );
+-       return rows.length > 0;
++   return rows.length > 0;
+-     },
++ },
+
+─── server/src/openmuse-deletion/store.ts:329-344 ───
+[bug · medium] 清单写入无分片,存在 PG 参数上限风险:insertResources 把全部资源行放进单条多行 INSERT,每行 6
+个绑定参数(manifestId/kind/id/externalKey/state/lastError),Postgres 协议单语句 65535 参数上限约支持 1.09 万行;而
+openmuse-files 的 enumerateOwner 按「每个 File 版本一行」枚举(externalKey=bytePath),大账号(上万文件版本)会直接超出上限,整条语句失败,且
+insert-once 语义下每次重试都重建同样的超大批次,D04 清单构建永远无法落地、删除流程卡在 retryable。仓库内未见现成分片工具,建议按固定批次(如 500–1000
+行/条)循环写入。
+
+      insertResources: async (manifestId, resources) => {
+-       if (resources.length === 0) return;
++       // PG wire 协议单语句 65535 个绑定参数;每行 6 个,按 1 万行封顶再留余量。
++       const BATCH = 1_000;
++       for (let i = 0; i < resources.length; i += BATCH) {
++         const batch = resources.slice(i, i + BATCH);
++         if (batch.length === 0) continue;
+-       await database
++         await database
+-         .insert(openmuseDeletionResources)
++           .insert(openmuseDeletionResources)
+-         .values(
++           .values(
+-           resources.map((resource) => ({
++             batch.map((resource) => ({
+-             manifestId,
++               manifestId,
+-             kind: resource.kind,
++               kind: resource.kind,
+-             id: resource.id,
++               id: resource.id,
+-             externalKey: resource.externalKey ?? "",
++               externalKey: resource.externalKey ?? "",
+-             state: resource.state ?? "pending",
++               state: resource.state ?? "pending",
+-             lastError: resource.lastError ?? null,
++               lastError: resource.lastError ?? null,
+-           })),
++             })),
+-         )
++           )
+-         .onConflictDoNothing();
++           .onConflictDoNothing();
++       }
+      },
+
+─── server/src/openmuse-deletion/routes.ts:68-74 ───
+[bug · medium] 多步副作用无错误处理,失败时客户端应答与服务器状态不一致:marker 落库后依次执行 shutdown → revokeExternalAccess →
+buildManifest,任一步抛出(revokeOwner 已在 google-oauth.ts:645 内部吞掉供应商错误,但其行写、shutdown 的
+shutdownOwner/cancelAwaiting/record、manifest 的 resolveGaps/insertResources 等 DB 操作均会抛出)都会以裸 500 收场
+—— 客户端看到"删除失败",实际围栏已生效、撤销可能部分完成,且 app.ts 未挂全局 onError 兜底。重试虽幂等,但调用方无从得知已完成的进度。建议对每一步单独
+try/catch,应答中携带各步骤状态(如 steps:{shutdown:"ok",revoke:"failed:…"}),让部分进度可见、可重试步骤可命名。
+
+-     const manifest = deps.buildManifest
+-       ? await deps.buildManifest(context.var.actor.id)
+-       : undefined;
++     const steps: Record<string, string> = {};
++     if (deps.shutdownOwnerWork)
++       steps.shutdown = await deps
++         .shutdownOwnerWork(context.var.actor.id)
++         .then(() => "ok")
++         .catch((error) => `failed: ${error instanceof Error ? error.message : String(error)}`);
++     if (deps.revokeExternalAccess)
++       steps.revoke = await deps
++         .revokeExternalAccess(context.var.actor.id)
++         .then(() => "ok")
++         .catch((error) => `failed: ${error instanceof Error ? error.message : String(error)}`);
++     if (deps.buildManifest)
++       steps.manifest = await deps
++         .buildManifest(context.var.actor.id)
++         .then((manifest) => {
++           stepsManifest = manifest;
++           return "ok";
++         })
++         .catch((error) => `failed: ${error instanceof Error ? error.message : String(error)}`);
+      return context.json({
+        deletion: deletionDto(marker),
+-       ...(manifest ? { manifest } : {}),
++       steps,
++       ...(stepsManifest ? { manifest: stepsManifest } : {}),
+      });
+
+─── server/src/openmuse-deletion/store.ts:124-131 ───
+[performance · low] D09 名册查询无上限:list() 全表按 disabledAt 排序返回,无 limit/keyset;而 retention.ts 的
+cleanupView 会 Promise.all 遍历每个 marker 并对其全量 listResources,标记长期累积后管理端清理视图的内存与延迟无界。仓库已有 keyset
+惯例可对齐(openmuse-notifications 的 pageByOwner before 游标、channels 的 cursor 分页),建议同样提供 limit +
+(disabledAt,userId) 游标参数。
+
+-     list: async () =>
++     list: async (page?: { limit: number; before?: { disabledAt: Date; userId: string } }) =>
+        await database
+          .select()
+          .from(openmuseAccountDeletions)
++         .where(
++           page?.before
++             ? or(
++                 gt(openmuseAccountDeletions.disabledAt, page.before.disabledAt),
++                 and(
++                   eq(openmuseAccountDeletions.disabledAt, page.before.disabledAt),
++                   gt(openmuseAccountDeletions.userId, page.before.userId),
++                 ),
++               )
++             : undefined,
++         )
+          .orderBy(
+            asc(openmuseAccountDeletions.disabledAt),
+            asc(openmuseAccountDeletions.userId),
+-         ),
++         )
++         .limit(page?.limit ?? 100),
+
+─── server/src/openmuse-deletion/routes.ts:37-37 ───
+[bug · high] 三个可选编排 seam 在生产装配中从未传入:全仓库唯一的生产挂载点 app.ts(约 1888 行)创建本路由时只传 {requireUser, store},而本 PR
+实现 D02/D03/D04 的 createOpenMuseWorkShutdown / createOpenMuseExternalAccessRevoker /
+createOpenMuseDeletionManifest 仅被测试引用,index.ts 也只接了 D09 的只读 cleanup view。结果是生产上 POST /delete
+只写围栏标记:awaiting 的 Reviewed actions 永远不会被取消、Google 连接席位不会被撤销(供应商侧对"删除"毫不知情,个人邮箱/日历授权无限期留存)、也不生成清单;且
+D05 admin restore 与 D06-D08 purge 路由同样未挂载,标记将永远停在
+"fenced"。对账号删除功能而言这是数据保护层面的实质缺口。若确属分阶段上线,请在此显式记录该决定;否则应在挂载点把三个 seam 接上。
+
++   /**
++    * WIRING STATUS (production): app.ts mounts this route with only
++    * {requireUser, store} — shutdownOwnerWork / revokeExternalAccess /
++    * buildManifest are never supplied, so D02/D03/D04 run only in tests and a
++    * production delete is fence-only (Google grants stay live, awaiting
++    * Reviewed actions stay pending, no manifest). Either wire the seams at the
++    * mount point or record the staged-rollout decision here explicitly.
++    */
+    shutdownOwnerWork?: (userId: string) => Promise<unknown>;
+
+─── server/src/openmuse-deletion/shutdown.ts:65-75 ───
+[performance · medium] 通知 emit 逐条 await:取消是账号级批量操作,cancelled 数组可能有几十上百条,这里为每条做一次串行往返,直接拉长交互式 POST
+/delete 的响应延迟(与 deps.tasks.shutdownOwner、deps.reviewed.cancelAwaiting 两个互不依赖的读写同理)。各条 emit
+相互独立且语义本就是逐条吞错,改为 Promise.all 并发发射后单条失败仍只记日志、不影响其余,行为不变、延迟从 O(N) 次往返降为一次。
+
+-     for (const taskId of tasks.cancelled) {
++     // The emits are mutually independent and each is individually best-effort:
++     // fan them out concurrently so a bulk shutdown costs one round-trip
++     // instead of one per cancelled Task.
++     await Promise.all(
++       tasks.cancelled.map(async (taskId) => {
+-       try {
++         try {
+-         await deps.emit?.({
++           await deps.emit?.({
+-           userId,
++             userId,
+-           taskId,
++             taskId,
+-           eventKind: "task.cancelled",
++             eventKind: "task.cancelled",
+-           attemptKey: "shutdown",
++             attemptKey: "shutdown",
+-           title: "Task cancelled",
++             title: "Task cancelled",
+-           detail: "Cancelled by account deletion.",
++             detail: "Cancelled by account deletion.",
+-         });
++           });
+-       } catch (error) {
++         } catch (error) {
++           log.error(
++             {
++               type: "openmuse-work-shutdown-emit-failed",
++               taskId,
++               error: error instanceof Error ? error.message : String(error),
++             },
++             "openmuse-work-shutdown-emit-failed",
++           );
++         }
++       }),
++     );
+
+─── server/src/openmuse-notifications/store.ts:318-324 ───
+[bug · medium] drizzle 行缝的 ownerDisabled 恒返回 false，§9 'disabled owner 拒绝工作' 契约在生产环境完全不生效：同批变更中
+tasks（D02，openmuse-tasks/store.ts:1227）与 files（D03，openmuse-files/store.ts:665）的行缝都直接读取
+openmuseAccountDeletions 标记表，本模块的注释 'until it exists' 已过时——D01 标记表已存在。更关键的是 app.ts 的
+openMuseAccountFence 只覆盖 /api/mobile/*，而 runner 的 emit 路径不经过该 fence：账户删除标记写入后，in-flight 任务的 emit
+仍会为被栅栏的 owner 写入通知行；路由层三处 OpenMuseOwnerDisabledError→403 分支也因此成为死路径。建议照 D02/D03 的写法读取标记表，并在文件顶部
+import { openmuseAccountDeletions } from "../openmuse-deletion/store"。
+
+      /*
+-      * The deleted-owner fence is D01's marker; until it exists every owner is
+-      * enabled in production, and tests drive the seam through their own rows.
++      * D01's marker is the deleted-owner fence — the same read D02's task
++      * rows and D03's file rows make: the owner is disabled the moment the
++      * marker row exists, and tests drive the seam through their own rows.
+       */
+-     async ownerDisabled() {
+-       return false;
++     async ownerDisabled(ownerUserId) {
++       const rows = await database
++         .select({ userId: openmuseAccountDeletions.userId })
++         .from(openmuseAccountDeletions)
++         .where(eq(openmuseAccountDeletions.userId, ownerUserId));
++       return rows.length > 0;
+      },
+
+─── server/src/openmuse-notifications/store.ts:181-189 ───
+[maintainability · low] markRead 采用先 getNotification 拉取整行、在内存校验归属、再按仅含 id 的 WHERE 执行 UPDATE
+的两步模式：需要两次数据库往返；且 UPDATE 语句不含 userId 条件，与同文件 hardDeleteNotifications 的单语句 owner-scoped 风格不一致。虽然
+userId 在行上不可变、跨 owner 标记实际不可能发生（非安全漏洞），但两步之间存在并发 hardDelete 时会产生 null→404 的瞬态边界。建议将
+markNotificationRead 改为接收 userId 并以 where(and(eq(id), eq(userId))) 单语句 UPDATE...RETURNING，markRead
+随之收敛为一次调用（幂等 coalesce 行为不变）。
+
+      async markRead(userId, id) {
+        if (await deps.rows.ownerDisabled(userId))
+          throw new OpenMuseOwnerDisabledError(userId);
+-       // Owner scope first: a foreign row is indistinguishable from a missing
+-       // one, so no mark can leak across owners.
+-       const current = await deps.rows.getNotification(id);
+-       if (!current || current.userId !== userId) return null;
+-       return deps.rows.markNotificationRead(id);
++       // Owner-scoped in the statement: a foreign row is indistinguishable
++       // from a missing one, so no mark can leak across owners.
++       return deps.rows.markNotificationRead(userId, id);
+      },
+
+─── server/src/openmuse-notifications/store.ts:300-302 ───
+[bug · low] readAt 用数据库 now() 写入，而 createdAt 由应用层注入的 deps.now() 生成：两列时钟源不一致。当数据库时钟落后于应用时钟时会出现 readAt
+早于 createdAt 的时间倒挂（DTO 把两者都序列化为 ISO 字符串返回客户端），影响展示排序的一致性；同时 store 的可注入 now 在 markRead
+路径上失效，削弱了测试对时间语义的控制。建议 markNotificationRead 接收时间参数（如 (id, at: Date)），以 coalesce(read_at, ${at}) 写入，由
+store 统一用 now() 传入，使 readAt 与 createdAt 同源。
+
+          .set({
+-           readAt: sql`coalesce(${openmuseNotifications.readAt}, now())`,
++           readAt: sql`coalesce(${openmuseNotifications.readAt}, ${at})`,
+          })
+
+─── server/src/openmuse-ops/signals.ts:155-164 ───
+[maintainability · medium] collect 的 catch 将底层异常完全丢弃:接缝读取失败只产出一条通用 missing_seam 行,错误本体既不进日志也不进
+detail。数据库中断、坏迁移、代码 bug 对运维呈现为完全相同的一句话,健康面自身的可诊断性与它的设计目标(可见性包含缺口)相悖。建议捕获 error 并将其截断后的 message 写入
+detail(该面已由 requireAdmin 双层把关,泄露面可控),或注入可选的 onError 回调交由调用方记录日志。
+
+-       } catch {
++       } catch (error) {
++         const reason =
++           error instanceof Error ? error.message.slice(0, 120) : String(error);
+          signals.push({
+            kind: "missing_seam",
+            id: "",
+            source: missingSeam(module),
+-           detail:
+-             "This seam failed to answer; its rows are not observable now.",
++           detail: `This seam failed to answer: ${reason}`,
+            at: null,
+          });
+        }
+
+─── server/src/openmuse-ops/signals.ts:167-170 ───
+[performance · low] 四个接缝读取相互独立却被逐一串行 await,整体延迟为四次查询之和;某条慢查询会不必要地拖长这个管理端点的响应。按异步规范应改用 Promise.all
+并行,结果数组可保住契约规定的接缝顺序。
+
+-     const refreshRequired = deps.refreshRequired;
+-     await collect(
+-       "openmuse-connectors",
+-       refreshRequired &&
++     // 独立接缝并行读取,结果按固定槽位收集以保持契约顺序。
++     const collectAt = async (
++       index: number,
++       module: string,
++       read: (() => Promise<OpenMuseOpsSignal[]>) | undefined,
++     ): Promise<void> => { /* 现有逻辑写入 slots[index] */ };
++     await Promise.all([
++       collectAt(0, "openmuse-connectors", connectorRead),
++       collectAt(1, "work/queue + openmuse-tasks", taskRead),
++       collectAt(2, "openmuse-reviewed-actions", reviewedRead),
++       collectAt(3, "openmuse-deletion", deletionRead),
++     ]);
+
+─── server/src/openmuse-ops/signals.ts:302-303 ───
+[performance · low] taskQueue 读取器按 kind 全量拉取 work_items(含所有已完成行及其 payload jsonb),聚合侧再用内存过滤丢弃
+finishedAt 非空的行。虽然 openmuse-task 行由每小时一次的 reap 清理(仅保留约 7 天,原审查项的"随历史线性增长"不成立),但在该窗口内每次 /signals
+仍要传输全部已结算行。finishedAt 为空不是阈值/租约语义判断,把它下推到 SQL 的 where 不会破坏"阈值留在纯聚合"的设计,却能显著减少每次调用的扫描与传输量。
+
+          .from(workItems)
+-         .where(eq(workItems.kind, OPENMUSE_TASK_KIND));
++         .where(
++           and(
++             eq(workItems.kind, OPENMUSE_TASK_KIND),
++             isNull(workItems.finishedAt),
++           ),
++         );
+
+─── server/src/openmuse-ops/signals.ts:63-67 ───
+[maintainability · low] provider 字段在读取器中被选中、在行类型中声明、在测试夹具中提供,但聚合映射从未消费它——产出的
+connector_refresh_failure 信号行不告诉运维是哪个 provider 的连接刷新失败,只能凭 id 反查。属声明未读取的死数据字段:建议在 detail 中带上
+provider(对运维有实际价值),或从类型与 select 中移除。
+
+- export type OpenMuseOpsConnectorFailureRow = {
+-   id: string;
+-   provider: string;
+-   lastError: string | null;
+- };
++           (await refreshRequired()).map((row) => ({
++             kind: "connector_refresh_failure" as const,
++             id: row.id,
++             source: SEAM_SOURCES.connections,
++             detail: `${row.provider}: ${sanitizeLastError(row.lastError) ?? OpenMUSE_REFRESH_FAILED_MESSAGE}`,
++             at: null,
++           }))
+
+─── server/src/openmuse-personal/goals.ts:165-170 ───
+[bug · high] enumerateOwner 复用 live-only 的 listByOwner(过滤 isNull(deletedAt)),而 D08 清库链路是
+manifest.buildManifest 用 enumerateOwner 生成清单、purge-relational 再按清单 id 调 hardDelete(owner,
+ids);purge.ts/retention.ts/shutdown.ts 均无 owner 级兜底清扫,且 openmuse_goals.owner_user_id 无 FK
+级联。因此用户删号前软删除的 Goal 永远进不了清单、永远不被硬删——账户删除完成后这些含个人数据的 tombstone 行永久残留,且 marker 置
+completed、清单清空后完全不可见,违背 D08 「hard-delete the owner's rows」的清除承诺。对照组:AgentProfileStore.enumerateOwner
+明确枚举 soft-deleted Bots(§9 语义:已删的也要还债)。建议为 rows seam 增加不过滤 deletedAt 的专用枚举查询(listByOwner 保留仅服务 API
+列表),或让 hardDelete 退化为 owner 全量删除。
+
+      async enumerateOwner(ownerUserId) {
+-       return (await deps.rows.listByOwner(ownerUserId)).map((goal) => ({
+-         kind: "openmuse-goal" as const,
+-         id: goal.id,
+-       }));
++       // §9 enumeration owes tombstones too: listByOwner is live-only for the
++       // API, so the manifest never names a soft-deleted row and D08 can
++       // never purge it.
++       return (await deps.rows.enumerateIdsByOwner(ownerUserId)).map(
++         (goal) => ({ kind: "openmuse-goal" as const, id: goal.id }),
++       );
+      },
+
+─── server/src/openmuse-personal/goals.ts:293-295 ───
+[security · medium] 生产 rows 的 ownerDisabled 硬编码 false,注释前提「until it exists」已失效:D01 的
+openmuse_account_deletions marker 本构建已存在,且已被 /api/mobile/* 的 openMuseAccountFence(app.ts:1893)与
+openmuse-tasks rows 的 ownerDisabled(store.ts:1227 直查 marker 表)消费。结果是本模块 store 的 §9 禁用
+guard(create/list/patch/delete)在生产永不触发;且 C07 已实际接线(index.ts:1379 openMuseToolsFor),fence 只盖
+/api/mobile,被删账户 owner 的 Bot 运行仍可经 goal_read 读到其私有 Goal——同一工具组里 task_delegate 却会被 tasks rows 的真实
+marker 检查拒绝,fence 语义不一致。建议照 tasks rows 的做法让 ownerDisabled 读取 marker 表,并为 get/goalLookupFor 读取路径补
+guard(或显式记录边界决策)。
+
+-     async ownerDisabled() {
+-       return false;
++     async ownerDisabled(ownerUserId) {
++       // D01's marker row IS the fence: the owner is disabled the moment the
++       // marker exists (same seam the /api/mobile fence and the tasks rows
++       // read).
++       const rows = await database
++         .select({ userId: openmuseAccountDeletions.userId })
++         .from(openmuseAccountDeletions)
++         .where(eq(openmuseAccountDeletions.userId, ownerUserId));
++       return rows.length > 0;
+      },
+
+─── server/src/openmuse-personal/ideas.ts:204-209 ───
+[bug · high] enumerateOwner 复用 live-only 的 listByOwner(过滤 isNull(deletedAt)),而 D08 清库链路是
+manifest.buildManifest 用 enumerateOwner 生成清单、purge-relational 再按清单 id 调 hardDelete(owner, ids);无任何
+owner 级兜底清扫,openmuse_ideas.owner_user_id 亦无 FK 级联。删号前软删除的 Idea(含 prompt/input/evidence
+等私有内容)永远进不了清单、永远不被硬删,账户删除完成后永久残留且不可见,违背 D08 清除承诺。对照 AgentProfileStore.enumerateOwner 明确枚举
+soft-deleted Bots 的 §9 语义。建议为 rows seam 增加不过滤 deletedAt 的专用枚举查询,或让 hardDelete 退化为 owner 全量删除。
+
+      async enumerateOwner(ownerUserId) {
+-       return (await deps.rows.listByOwner(ownerUserId)).map((idea) => ({
+-         kind: "openmuse-idea" as const,
+-         id: idea.id,
+-       }));
++       // §9 enumeration owes tombstones too: listByOwner is live-only for the
++       // API, so the manifest never names a soft-deleted row and D08 can
++       // never purge it.
++       return (await deps.rows.enumerateIdsByOwner(ownerUserId)).map(
++         (idea) => ({ kind: "openmuse-idea" as const, id: idea.id }),
++       );
+      },
+
+─── server/src/openmuse-personal/ideas.ts:180-183 ───
+[bug · medium] accept 是 check-then-act:findIdea 校验 status、getTask 校验归属后,updateIdea 的 WHERE 仅 (owner,
+id, deletedAt IS NULL),无状态前置条件、无事务。并发交错(withdraw 在 accept 的校验与写入之间提交)会把已 withdrawn 的 Idea 改回
+accepted 并写入 taskId——withdrawn 终态被复活、状态回退,违背模块头「a state change lands atomically / withdrawn
+不能再被接受」的承诺;Task 归属校验与写入之间同样存在 TOCTOU 窗口(反向交错因 withdraw 幂等而无碍)。建议给 rows.updateIdea 增加可选状态前置条件(UPDATE
+... WHERE status IN ('pending','accepted')),零行返回映射为 missing,由单条条件 UPDATE 保证状态机。
+
+        const idea = await deps.rows.updateIdea(ownerUserId, id, {
+          status: "accepted",
+          taskId,
++         // Only a live pending/accepted Idea may accept: a concurrent
++         // withdraw wins the write and this accept answers "missing"
++         // instead of resurrecting the withdrawn terminal state.
++         whereStatusIn: ["pending", "accepted"],
+        });
+
+─── server/src/openmuse-personal/ideas.ts:335-337 ───
+[security · medium] 生产 rows 的 ownerDisabled 硬编码 false,注释前提「until it exists」已失效:D01 marker 表本构建已存在,已被
+/api/mobile/* fence(app.ts:1893)与 openmuse-tasks rows 的 ownerDisabled(store.ts:1227 直查 marker)消费。本模块
+store 的禁用 guard 在生产永不触发;C07 已实际接线(index.ts:1379),fence 不盖 Bot 运行时,被删账户 owner 的 Bot 仍可经 idea_read 读到已
+withdrawn 的 Idea 之外的私有数据,而同组 task_delegate 会被 tasks 的真实 marker 检查拒绝——fence 语义不一致。建议照 tasks rows 做法令
+ownerDisabled 读取 marker 表,并为 get/ideaLookupFor 读取路径补 guard(或显式记录边界决策)。
+
+-     async ownerDisabled() {
+-       return false;
++     async ownerDisabled(ownerUserId) {
++       // D01's marker row IS the fence: the owner is disabled the moment the
++       // marker exists (same seam the /api/mobile fence and the tasks rows
++       // read).
++       const rows = await database
++         .select({ userId: openmuseAccountDeletions.userId })
++         .from(openmuseAccountDeletions)
++         .where(eq(openmuseAccountDeletions.userId, ownerUserId));
++       return rows.length > 0;
+      },
+
+─── server/src/openmuse-personal/memories.ts:164-169 ───
+[bug · high] enumerateOwner 复用 live-only 的 listByOwner(过滤 isNull(deletedAt)),而 D08 清库链路是
+manifest.buildManifest 用 enumerateOwner 生成清单、purge-relational 再按清单 id 调 hardDelete(owner, ids);无任何
+owner 级兜底清扫,openmuse_memories.owner_user_id 亦无 FK 级联。删号前软删除的 Memory(text
+为原样私有内容)永远进不了清单、永远不被硬删,账户删除完成后永久残留且不可见,违背 D08 清除承诺。对照 AgentProfileStore.enumerateOwner 明确枚举
+soft-deleted Bots 的 §9 语义。建议为 rows seam 增加不过滤 deletedAt 的专用枚举查询,或让 hardDelete 退化为 owner 全量删除。
+
+      async enumerateOwner(ownerUserId) {
+-       return (await deps.rows.listByOwner(ownerUserId)).map((memory) => ({
+-         kind: "openmuse-memory" as const,
+-         id: memory.id,
+-       }));
++       // §9 enumeration owes tombstones too: listByOwner is live-only for the
++       // API, so the manifest never names a soft-deleted row and D08 can
++       // never purge it.
++       return (await deps.rows.enumerateIdsByOwner(ownerUserId)).map(
++         (memory) => ({ kind: "openmuse-memory" as const, id: memory.id }),
++       );
+      },
+
+─── server/src/openmuse-personal/memories.ts:307-309 ───
+[security · medium] 生产 rows 的 ownerDisabled 硬编码 false,注释前提「until it exists」已失效:D01 marker 表本构建已存在,已被
+/api/mobile/* fence(app.ts:1893)与 openmuse-tasks rows 的 ownerDisabled(store.ts:1227 直查 marker)消费。本模块
+store 的禁用 guard 在生产永不触发;C07 已实际接线(index.ts:1379),fence 不盖 Bot 运行时,被删账户 owner 的 Bot 仍可经 memory_read
+原样读到其私有 Memory,而同组 task_delegate 会被 tasks 的真实 marker 检查拒绝——fence 语义不一致。建议照 tasks rows 做法令
+ownerDisabled 读取 marker 表,并为 get/memoryLookupFor 读取路径补 guard(或显式记录边界决策)。
+
+-     async ownerDisabled() {
+-       return false;
++     async ownerDisabled(ownerUserId) {
++       // D01's marker row IS the fence: the owner is disabled the moment the
++       // marker exists (same seam the /api/mobile fence and the tasks rows
++       // read).
++       const rows = await database
++         .select({ userId: openmuseAccountDeletions.userId })
++         .from(openmuseAccountDeletions)
++         .where(eq(openmuseAccountDeletions.userId, ownerUserId));
++       return rows.length > 0;
+      },
+
+─── server/src/openmuse-ops/signals.ts:306-309 ───
+[bug · high] workItems.payload 是未标注 $type 的 jsonb 列(db/schema/work.ts:89),drizzle 会将其推断为
+unknown;`row.payload?.taskId` 在 unknown 上直接取属性,`tsc --noEmit`(server/package.json 的 typecheck 脚本)会报
+TS18046,无法通过类型检查。仓库内所有对 drizzle 行 payload 的消费都先做断言再访问(activity.ts 的 `hop.payload as
+HandoffPayload`、work/queue.ts 的 `(updated.payload ?? {}) as Record<string,
+unknown>`、openmuse-reviewed-actions/proposal.ts 的 `payload as Record<string,
+unknown>`),此处是唯一例外。建议按仓库惯例先断言再访问(payload 列 notNull,断言安全)。
+
+-       return rows.map((row) => ({
++       return rows.map((row) => {
++         const payload = row.payload as Record<string, unknown>;
++         return {
+-         key: row.key,
++           key: row.key,
+-         taskId:
+-           typeof row.payload?.taskId === "string" ? row.payload.taskId : null,
++           taskId: typeof payload.taskId === "string" ? payload.taskId : null,
++           runAt: row.runAt,
++           claimedBy: row.claimedBy,
++           leaseUntil: row.leaseUntil,
++           finishedAt: row.finishedAt,
++         };
++       });
+
+─── server/src/openmuse-ops/signals.ts:84-87 ───
+[maintainability · medium] ownerUserId 在读取器的 select 与该行类型中声明,但聚合映射从未消费:产出的 uncertain_reviewed_action
+信号行只带 attemptId/actionId 与 reconciliation,运维无法从健康面得知该未决动作的归属用户,字段本身是死数据。这与已确认的 provider
+死字段属同一类问题(该确认项仅覆盖 connector 行,此处是未被覆盖的另一实例)。建议要么在 detail 中带上 owner(该面已有 requireUser + requireAdmin
+双层把关,暴露可控,且对运维有实际价值),要么从 select 与类型中一并移除。
+
+  export type OpenMuseOpsUncertainActionRow = {
+    actionId: string;
+-   ownerUserId: string;
+    createdAt: Date;
+
+─── server/src/openmuse-personal/tools.ts:80-87 ───
+[bug · medium] openmuse_task_delegate 直接调用 store.create,绕过了 O04 的每用户活跃 Task 配额(ACTIVE_TASKS_PER_USER
+= 100)。该配额只在 HTTP 路由 openmuse-tasks/routes.ts:371(create 前查 store.activeTasks)强制执行,store 层并不检查;而本工具经
+loadToolsForActor(index.ts:1379)对私有 Bot 的每次运行都可用,且每次 create 都会向工作队列 offer 一个完整的 headless agent
+运行。模型跨 turn 持续调用 task_delegate(单次运行上限 8 个 tool step)即可把 owner 推到远超 100 个活跃 Task 的配额之外,每个 Task
+都产生一次真实的 agent 运行成本——这正是 O04 配额要防的场景。建议给 tasks 的 Pick 增加 "activeTasks",create
+前做与路由一致的上限检查,超限时像路由那样以拒绝字符串回答(而非抛错),让模型得到可读的配额语义。
+
+        async ({ task_summary, idempotency_key }) => {
++         if ((await tasks.activeTasks(ownerUserId)) >= ACTIVE_TASKS_PER_USER) {
++           return `${REFUSAL_MARKER} The owner's active Task quota is full; tell the person delegation is unavailable rather than retrying.`;
++         }
+          const { task } = await tasks.create({
+            ownerUserId,
+            botId: agentId,
+            kind: "agent",
+            prompt: task_summary,
+            idempotencyKey: idempotency_key ?? null,
+          });
+
+─── server/src/openmuse-personal/memories.ts:110-113 ───
+[bug · low] decodeCursor 只验证 Number.isSafeInteger,但 JS Date 的有效范围是 ±8.64e15 ms;构造光标如
+"9007199254740991|x" 可通过本验证却在 new Date(time) 得到 Invalid Date。该值随后进入 pageByOwner 的 lt(createdAt,
+cursor) 绑定,驱动序列化 Invalid Date 时抛错,路由的 guard 分支只捕获 OpenMuseOwnerDisabledError,最终以 500 而非模块承诺的 400("A
+malformed cursor answers null, so the route can refuse it as a 400")响应。建议在返回前校验日期有效性。
+
+    const time = Number(cursor.slice(0, separator));
+    const id = cursor.slice(separator + 1);
+-   if (!Number.isSafeInteger(time) || id === "") return null;
+-   return { createdAt: new Date(time), id };
++   const createdAt = new Date(time);
++   if (
++     !Number.isSafeInteger(time) ||
++     id === "" ||
++     Number.isNaN(createdAt.getTime())
++   )
++     return null;
++   return { createdAt, id };
+

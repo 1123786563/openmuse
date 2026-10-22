@@ -1,0 +1,1872 @@
+Review complete: 115 finding(s) across 34 selected item(s).
+
+─── apps/mobile/src/openbot/client.ts:63-64 ───
+[bug · medium] 20 秒固定超时（AbortSignal.timeout）同样作用于 openbotFetchBinary 的二进制路径：计算机截图轮询、文件与 PDF
+字节流下载都在此超时约束下，弱网或大文件会在传输中途被硬性中止，且用户端表现为与真实网络故障相同的 network 错误、无法区分。同时 catch
+把包括调用方主动取消（AbortError）在内的一切 fetch 异常统一包装成 network；目前仅 computer.tsx 靠 controller.signal.aborted
+自行甄别，其余调用点一旦引入取消即会误报“无法连接”。建议：二进制/大响应放宽或移除超时；catch 中先识别取消（init.signal?.aborted 或 error.name ===
+"AbortError"）原样上抛再分类。另请留意 node:test 通过不代表 Hermes 真机具备 AbortSignal.any/timeout，建议真机验证一次。
+
+-   const timeout = AbortSignal.timeout(20_000);
+-   const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
++   } catch (error) {
++     if (init.signal?.aborted) throw error; // 调用方主动取消：原样上抛，不算网络故障
++     throw new OpenBotError("network", "无法连接 OpenBot 服务，请检查网络后重试。");
++   }
+
+
+─── apps/mobile/src/openbot/client.ts:98-109 ───
+[style · low] 该状态码映射链最深达 5 层嵌套三元，违反评审清单“禁止嵌套三元表达式”规则，可读性与维护成本差。建议提取为 switch 辅助函数或查表实现。
+
+-   const code =
+-     response.status === 401
+-       ? "authentication_required"
+-       : response.status === 403
+-         ? "refused"
+-         : response.status === 404
+-           ? "not_found"
+-           : response.status === 408 || response.status >= 500
+-             ? isWrite
+-               ? "outcome_unknown"
+-               : "unavailable"
+-             : "invalid_input";
++ function statusToErrorCode(status: number, isWrite: boolean): OpenBotErrorCode {
++   switch (status) {
++     case 401:
++       return "authentication_required";
++     case 403:
++       return "refused";
++     case 404:
++       return "not_found";
++     default:
++       if (status === 408 || status >= 500) return isWrite ? "outcome_unknown" : "unavailable";
++       return "invalid_input";
++   }
++ }
+
+
+─── apps/mobile/src/openbot/client.ts:106-109 ───
+[maintainability · low] 409 与 400/415 等一起落入兜底的 invalid_input，而 errors.ts 将 invalid_input
+定义为“调用方错误（坏路径或缺 ID）”。409 实际承载冲突语义：reopenChannel 对未归档频道、control/take 对租约失效、sendComputerInput 对 seq
+过期都返回 409。当前 control.tsx 是按 error.status 判断 403/409（行为正确），但 errors.ts 头部明确说明后续消费方按 code 分支，一旦有人按
+code 处理就会把“租约已失效”误判为调用方 bug。建议为 409 增加独立错误码（如 conflict），或在 errors.ts 中显式记录“409 归
+invalid_input、消费方必须走 status”的约定。
+
+
+
+─── apps/mobile/src/openbot/api.ts:438-442 ───
+[maintainability · low] 注释写明租约只接受单调递增 seq（缺省即 409 且输入从未送达），但类型却把 seq 声明为可选，类型契约与服务器硬约束不一致。当前唯一调用点
+control.tsx dispatch 始终传入 attempt.seq，无现行为故障，但把 seq 改为必填可让编译器阻止未来调用方漏传导致的整类 409 故障。
+
+- export function sendComputerInput(
+-   botId: string,
+-   input: ComputerInput & { seq?: number },
+-   signal?: AbortSignal,
+- ): Promise<OpenBotComputerInputResult> {
++   input: ComputerInput & { seq: number },
+
+
+─── apps/mobile/src/openbot/api.ts:445-447 ───
+[maintainability · low] 空 ID 校验在返回 Promise 的函数体内同步 throw，`.catch()`
+链式消费者捕获不到（异常会同步抛出）。实际暴露面已存在：control.tsx:173 以 sendComputerInput(...).catch(fail) 消费，一旦 botId
+为空将直接在事件处理器中抛未捕获异常，而非走 notice 展示（其余调用点均为 await+try/catch 所以暂未触发）。建议这类函数统一改为 async 函数，使校验失败始终表现为
+rejected Promise。
+
++ export async function sendComputerInput(
++   botId: string,
++   input: ComputerInput & { seq: number },
++   signal?: AbortSignal,
++ ): Promise<OpenBotComputerInputResult> {
++   const id = botId.trim();
++   if (!id) throw new OpenBotError("invalid_input", "缺少 Bot ID。");
+    const { kind, ...gesture } = input;
+-   return openbotFetch(
+-     `/api/computers/${encodeURIComponent(id)}/human/${kind}`,
++   return openbotFetch(/* … */);
++ }
+
+
+─── apps/mobile/src/openbot/api.ts:104-107 ───
+[maintainability · low] renamedChannelSchema 与上方 createdChannelSchema 定义完全相同；另外“trim + 空值抛
+invalid_input”的样板在本文件约 10 个函数中重复出现。建议提取共享的 channel 响应 schema 与 requireId 辅助函数，降低两处定义漂移的风险。
+
+- /** PATCH /api/channels/:id 200 body: the renamed channelDto row. */
+- const renamedChannelSchema = z.object({
++ /** POST 201 与 PATCH 200 共用：{ channel: channelDto }。 */
++ const channelResponseSchema = z.object({
+    channel: workspaceSchema.shape.channels.element,
+  });
+
+
+─── apps/mobile/src/openbot/auth.ts:75-82 ───
+[style · low] 错误文案映射使用 3 层嵌套三元（下方 signUpWithEmail 同样模式），违反评审清单“禁止嵌套三元表达式”规则。建议提取为 switch 或条件→文案的映射表。
+
+-       reason:
+-         error.code === "INVALID_EMAIL_OR_PASSWORD"
+-           ? "邮箱或密码不正确。"
+-           : error.code === "EMAIL_PASSWORD_DISABLED" || /not enabled/i.test(error.message ?? "")
+-             ? "此部署未开放邮箱密码登录。"
+-             : error.code === "sso_required"
+-               ? "此部署要求通过企业登录（SSO）。"
+-               : error.message?.slice(0, 120) || "登录失败，请稍后重试。",
++ function signInErrorCopy(code?: string, message?: string): string {
++   switch (code) {
++     case "INVALID_EMAIL_OR_PASSWORD":
++       return "邮箱或密码不正确。";
++     case "EMAIL_PASSWORD_DISABLED":
++       return "此部署未开放邮箱密码登录。";
++     case "sso_required":
++       return "此部署要求通过企业登录（SSO）。";
++     default:
++       return message?.slice(0, 120) || "登录失败，请稍后重试。";
++   }
++ }
+
+
+─── apps/mobile/src/openbot/auth.ts:31-32 ───
+[maintainability · low] “openmuse” scheme 在此与 api.ts connectGoogle 的默认参数 returnUri =
+"openmuse://connections" 各硬编码一份（app.json 中另有声明），scheme 变更时需人工同步多处。建议在 config.ts 导出统一常量（如
+openbotScheme）供两处引用。
+
+-     expoClient({
+-       scheme: "openmuse",
++ // config.ts
++ export const openbotScheme = "openmuse";
++ 
++ // auth.ts
++ scheme: openbotScheme,
+
+
+─── apps/mobile/src/openbot/auth.ts:17-26 ───
+[maintainability · low] web 分支的 tokenStorage 适配器提供了同步 getItem/setItem 及 *Async 变体，但缺少同步
+removeItem/deleteItem，与 SecureStore 分支及（推测的）插件 Storage 接口面不对称。两个分支各自猜测 expoClient
+实际调用的方法集合，且该对象没有对插件声明的 Storage 类型做标注、无编译期约束——若插件在 web 上调用未实现的同步删除接口，登出/token 清理会抛错并被 signOut 的 catch
+吞掉，仅表现为清理不彻底、难以定位。建议按 @better-auth/expo 声明的 storage 接口为该对象补类型标注，确认方法集合完整（注释中提到的参照模块不在本仓库，无法直接比对）。
+
+- const tokenStorage = isWeb
+-   ? {
+-       getItem: (key: string) => localStorage.getItem(key),
+-       setItem: (key: string, value: string) => localStorage.setItem(key, value),
+-       getItemAsync: (key: string) => Promise.resolve(localStorage.getItem(key)),
+-       setItemAsync: (key: string, value: string) =>
+-         Promise.resolve(localStorage.setItem(key, value)),
+-       deleteItemAsync: (key: string) => Promise.resolve(localStorage.removeItem(key)),
+-     }
++ const tokenStorage: ExpoClientStorage = isWeb
++   ? { /* …同步 get/set + 同步 remove + *Async… */ }
+    : SecureStore;
+
+
+─── apps/mobile/src/openbot/email-signin.tsx:189-191 ───
+[style · low] 多处静态样式以内联对象书写（本处、busy 指示块、底部切换按钮等），违反评审清单“内联样式仅限动态样式”的要求。建议静态样式收入 StyleSheet.create
+或复用共享的 s 样式模块（openbot 其他屏幕已是该模式）。
+
++ const styles = StyleSheet.create({
++   fieldError: { color: colors.danger, fontSize: 12, marginTop: -6 },
++ });
++ 
+  function FieldError({ text }: { text: string }) {
+-   return <Text style={{ color: colors.danger, fontSize: 12, marginTop: -6 }}>{text}</Text>;
++   return <Text style={styles.fieldError}>{text}</Text>;
+  }
+
+
+─── apps/mobile/App.tsx:102-108 ───
+[bug · medium] onAuthExpired 只做了服务端注销和私有状态清扫,没有复位 OpenBotApp 的 entry 状态,也没有更新 OpenBotConnected 的
+cookie 快照:cookie 仅在挂载时读取一次(useEffect []),provider key 永远停留在 "session"、Cookie 头保持过期值。而全仓只有 gate.tsx
+在启动阶段消费 authentication_required(各功能屏捕获后仅 setError 展示消息),因此本文件注释声称的 "any 401 ... UI flips back to
+sign-in" 并不会发生——会话过期后用户停留在已失效界面,REST 每次请求重读 cookie 已为 null、chat 走过期头,两条传输路径行为还不一致,唯一出口是手动点
+SignOut。建议让该回调同时驱动 UI 复位(例如注册一个可变句柄由 OpenBotApp 在挂载时注入 setEntry(undefined)),或复用 onSignOut 的既有路径回闸门。
+
++ // 模块级可变句柄
++ let onSessionExpired: () => void = () => undefined;
++ 
++ setOpenbotTransportDefaults({
++   platform: web ? "web" : "native",
++   getCookie: sessionCookie,
+    onAuthExpired: () => {
+-     // Revoke first, then sweep (I07): the native clear must not delete the
+-     // SecureStore session while signOut still needs its cookie.
+      void signOut()
+        .then(() => clearPrivateState())
+        .catch(() => undefined);
++     onSessionExpired(); // 复位 entry,让 UI 重新挂载 OpenBotGate
+    },
++ });
++ 
++ function OpenBotApp() {
++   const [entry, setEntry] = useState<{ workspace: OpenBotWorkspace; session: OpenBotSession }>();
++   useEffect(() => {
++     onSessionExpired = () => setEntry(undefined);
++     return () => {
++       onSessionExpired = () => undefined;
++     };
++   }, []);
++   // ...
+
+
+─── apps/mobile/App.tsx:192-196 ───
+[style · low] 嵌套三元表达式直接违反评审清单"禁止嵌套三元";该表达式决定鉴权凭据的装配路径(web cookie vs native 显式头),分支遗漏代价高,建议提取为具名函数用
+if/else 显式组装。
+
+-       {...(web
+-         ? { credentials: "include" as const }
+-         : cookie
+-           ? { headers: { Cookie: cookie } }
+-           : {})}
++ function providerAuth(web: boolean, cookie: string | null) {
++   if (web) return { credentials: "include" as const };
++   if (cookie) return { headers: { Cookie: cookie } };
++   return {};
++ }
++ 
++ // 使用处
++ // {...providerAuth(web, cookie)}
+
+
+─── apps/mobile/App.tsx:287-288 ───
+[maintainability · low] OpenMuseApp 在整个 apps/mobile 内没有任何引用点,是仅靠 biome-ignore 压制告警的整段旧登录/本地流程死代码。虽有
+B04 移除计划的注释,但在树内它会随依赖与词条演进继续腐化(其独占的 imports、titles 词条也无法清理),并误导后续阅读。建议本次 PR 直接删除,或移入独立 legacy
+文件并注明移除条件。
+
+
+
+─── apps/mobile/App.tsx:270-272 ───
+[maintainability · low] 六个功能入口的"全屏 overlay 或角标按钮"两态渲染高度重复,且用 right: 32/96/160/224/288/352
+等魔法数字内联绝对定位——在窄屏(如 320pt 宽)上 right: 352 的文件按钮会被推出屏幕外。同时按钮文案("频道""任务""日历""连接""文件""计算机")为硬编码中文,而同文件
+titles 一律走 t() 词条体系,风格不一致。建议:将六入口收敛为 [{icon, label, screen}] 配置统一映射渲染;布局改用容器内行排列或经计算/SafeArea
+定位替代逐个硬编码偏移;文案复用 t() 或与 openbot 屏一致的 COPY 常量。
+
+-         <View style={{ position: "absolute", top: 6, right: 352 }}>
+-           <IconButton icon={FolderOpen} label="文件" onPress={() => setFilesOpen(true)} />
+-         </View>
++ const ENTRIES = [
++   { id: "computer", icon: Monitor, label: t("navComputer"), open: computerOpen, setOpen: setComputerOpen, screen: <OpenBotComputerScreen ... /> },
++   // ...
++ ] as const;
++ 
++ // 渲染:一个 overlay 容器 + 行内按钮,不再逐个写 position: "absolute"
+
+
+─── apps/mobile/App.tsx:99-101 ───
+[maintainability · low] 在模块顶层执行 setOpenbotTransportDefaults 属于 import 副作用:App.tsx
+无法被隔离加载或单测(node:test 导入即改写全局传输默认值),web 端 HMR 下模块重复求值还会多次注册。同时该闭包在模块作用域捕获不到任何组件状态,正是 401 后无法复位 UI
+的结构性原因(见另一条意见)。建议把传输引导移入显式初始化函数或独立模块,并留出注入 UI 复位回调的口子。
+
++ // src/openbot/transport-boot.ts
++ export function bootOpenbotTransport(hooks: { onSessionExpired?: () => void }): void {
+- setOpenbotTransportDefaults({
++   setOpenbotTransportDefaults({
+-   platform: web ? "web" : "native",
++     platform: Platform.OS === "web" ? "web" : "native",
+-   getCookie: sessionCookie,
++     getCookie: sessionCookie,
++     onAuthExpired: () => {
++       void signOut().then(() => clearPrivateState()).catch(() => undefined);
++       hooks.onSessionExpired?.();
++     },
++   });
++ }
+
+
+─── apps/mobile/src/openbot/config.ts:55-57 ───
+[maintainability · low] 两个问题:1) parseEndpoint 在模块加载时执行,EXPO_PUBLIC_OPENBOT_URL 一旦非法,应用会在 import
+阶段直接抛错崩溃,用户只看到白屏/红屏而非可引导的错误提示,建议惰性解析或捕获后走受控错误态;2) 该常量与上方 resolveOpenbotUrl
+重复实现了"环境变量优先、平台默认兜底"的同一逻辑,后续调整兜底规则需双处同步。可让模块常量直接复用 resolveOpenbotUrl。
+
+  export const openbotEndpoint = parseEndpoint(
+-   process.env.EXPO_PUBLIC_OPENBOT_URL?.trim() || defaultBaseUrl(currentOS()),
++   resolveOpenbotUrl(currentOS(), process.env.EXPO_PUBLIC_OPENBOT_URL),
+  );
+
+
+─── apps/mobile/package.json:30-30 ───
+[bug · medium] 在 expo ~54.0.0 的应用中,新增的七个 expo-* 包全部落在 ^57.x 版本带,与同文件既有 SDK 54 依赖带(expo-file-system
+~19、expo-document-picker/expo-sharing ~14、expo-status-bar
+~3)严重偏离,且其中多个是含原生代码的模块(secure-store/crypto/network/constants)。pnpm-lock 虽以 expo@54.0.37 为 peer
+成功解析、无硬冲突,但 JS 层与 SDK 54 dev-client 原生壳不匹配时会在运行时报"找不到原生模块"类崩溃;^ 前缀还允许小版本漂移进一步放大风险。另外 expo-crypto 与
+expo-device 在源码中无任何 import,也未出现在 @better-auth/expo@1.7.1 的 peer 解析链中,需确认是否确有必要引入。建议合并前用 npx expo
+install --check(或对照 SDK 54 bundledNativeModules.json)校准版本,确需保留时改用 ~ 固定并补充与 @better-auth/expo 的兼容性说明。
+
+
+
+─── apps/mobile/src/openbot/types.ts:185-190 ───
+[maintainability · low] googleConnectionStatuses 与导出类型 GoogleConnectionStatus 在整个 apps/mobile
+内(含测试)没有任何消费点:连接屏对 status 只透传展示,并未用这组枚举做收窄或映射,属于声明未用的死代码。注释称"留作收窄用",但实际不存在收窄逻辑。建议删除,或在连接屏真正落地(如把未知
+status 归一为"未知"展示的映射函数)后再保留。
+
+
+
+─── apps/mobile/src/openbot/api.ts:140-142 ───
+[bug · low] archiveChannel/reopenChannel 是本文件中唯二跳过「trim + 空值拒绝」本地校验的写操作端点。模块约定（errors.ts）将
+invalid_input 定义为调用方 bug 信号，其余约 10 个函数都对 ID 做了守卫；这里空/纯空白 channelId 会原样拼出 /api/channels//archive 这类必然
+404 的路径，白白消耗一次网络往返，且错误被映射为 not_found（语义上是「外部频道的拒绝」），UI 无法与真正的越权 404 区分。建议与兄弟函数保持一致补上守卫；也可与既有的提取共享
+requireId 辅助函数（async 化）方案合并落地，reopenChannel 同样处理。
+
+- export function archiveChannel(channelId: string, signal?: AbortSignal): Promise<void> {
++ export async function archiveChannel(channelId: string, signal?: AbortSignal): Promise<void> {
++   const id = channelId.trim();
++   if (!id) throw new OpenBotError("invalid_input", "缺少频道 ID。");
+    return openbotFetch(
+-     `/api/channels/${encodeURIComponent(channelId)}/archive`,
++     `/api/channels/${encodeURIComponent(id)}/archive`,
+
+
+─── apps/mobile/App.tsx:238-246 ───
+[bug · medium] 六个入口按 JSX 书写顺序互为兄弟节点,绝对定位兄弟按文档顺序叠放:任一全屏 overlay 打开后(如 tasksOpen 的任务屏,根节点是不透明
+colors.canvas 背景),排在其后的日历/连接/文件/计算机入口按钮仍渲染在最上层且可点击,视觉上悬浮在 overlay 屏头部区域;误触会在当前 overlay 之上再叠开一层,而前一
+overlay 的 open 状态被保留,形成多层堆叠。只有最后一个 sibling(computer)打开时才无此问题。建议将六个布尔态收敛为单一 activeOverlay
+状态,同一时刻只允许一层全屏内容。
+
+-       {tasksOpen ? (
+-         <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+-           <OpenBotTasksScreen onClose={() => setTasksOpen(false)} />
+-         </View>
+-       ) : (
+-         <View style={{ position: "absolute", top: 6, right: 96 }}>
+-           <IconButton icon={SquareCheck} label="任务" onPress={() => setTasksOpen(true)} />
+-         </View>
+-       )}
++   const [activeOverlay, setActiveOverlay] = useState<
++     "channels" | "tasks" | "calendar" | "connections" | "files" | "computer" | null
++   >(null);
++   // 渲染时:activeOverlay === name ? <Overlay/> : <EntryButton/>,overlay 互斥,切换即替换。
+
+
+─── apps/mobile/src/openbot/types.ts:78-83 ───
+[maintainability · low] messageAcceptedSchema 与 OpenBotMessageAccepted 在全仓(含 api.ts 与 openbot-*
+测试)没有任何消费点,属于声明未用的死代码;注释称由 I03 消费,但在该路径落地前它会随服务器契约漂移而腐化。建议本次删除,待发送消息的实现需要时再随用随加。
+
+- /** POST /api/delivery/conversations/:id/messages 202 body (consumed by I03). */
+- export const messageAcceptedSchema = z.object({
+-   queued: z.boolean().optional(),
+-   id: z.string().optional(),
+- });
+- export type OpenBotMessageAccepted = z.infer<typeof messageAcceptedSchema>;
++ // 删除以上声明;I03 实现发送消息时再在 types.ts 与 api.ts 同步补回。
+
+
+─── apps/mobile/src/openbot/config.ts:15-17 ───
+[bug · low] 校验显式拒绝凭据/query/fragment,却对 path 不设防:配置
+EXPO_PUBLIC_OPENBOT_URL=https://example.com/openbot 能通过校验,但 resolveOpenbotUrl/openbotUrl 均取
+.origin,子路径被静默截断为 https://example.com,所有 API 请求会打到错误的根路径且无任何提示。建议对非 "/" 的 pathname
+一并抛错(与既有错误信息风格一致),或显式支持并保留 base path。
+
+    if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
+      throw new Error("EXPO_PUBLIC_OPENBOT_URL must not carry credentials, query, or fragment.");
++   if (endpoint.pathname !== "/" && endpoint.pathname !== "")
++     throw new Error("EXPO_PUBLIC_OPENBOT_URL must be an origin URL without a base path.");
+    return endpoint;
+
+
+─── apps/mobile/src/openbot/chat.tsx:173-173 ───
+[bug · medium] onRunFailed 回调直接访问 error.message，而同文件 onRunErrorEvent 用的是防御式的
+event?.message，两者风格不一致；若 SDK 在失败路径传入空 error 将抛 TypeError，中断 fail() 的后续逻辑（错误提示与 stopFlow pending
+复位）。先例 apps/mobile/src/chat.tsx:452 对 error 也做了 instanceof Error 防御包裹。fail(message?: string) 本身已支持
+undefined，改为 error?.message 即可。
+
+-       onRunFailed: ({ error }) => fail(error.message),
++       onRunFailed: ({ error }) => fail(error?.message),
+
+
+─── apps/mobile/src/openbot/chat.tsx:248-249 ───
+[bug · medium] stopAgent 返回可拒绝的 Promise（先例 apps/mobile/src/chat.tsx:458-465 以 await + try/catch
+调用并在失败时提示 stopFailed），此处裸调用：拒绝时成为 unhandled rejection，且 stopFlow.pending 已被 reducer
+置位且无回滚路径——「停止中…」按钮将保持禁用，reducer 会拒绝再次点击，只能寄希望于后续终端事件兜底。建议补 .catch 回滚 pending 并提示错误，与 send 中 runAgent
+的 .catch 对齐。
+
+      setStopFlow(next);
+-     copilotkit.stopAgent({ agent });
++     copilotkit.stopAgent({ agent }).catch(() => {
++       setStopFlow((prev) => (prev.pending ? { ...prev, pending: false } : prev));
++       setError(COPY.errorTitle);
++     });
+
+
+─── apps/mobile/src/openbot/chat.tsx:149-152 ───
+[bug · medium] connectAgent 失败被静默吞掉，注释声称「surfaced as … a retryable send」但实际既无恢复重试入口、restoring
+期间也不阻断发送。先例 apps/mobile/src/chat.tsx 的对应处理是：失败记入 historyError 提供重试（historyAttempt 触发重连），且 send 以
+!loaded 直接 return 阻断发送。当前实现下用户会在空记录、历史未恢复的 agent 上直接发消息，与持久 Thread 状态不一致。建议记录恢复失败并暴露重试（可通过 attempt
+state 重新触发本 effect），恢复完成前禁用发送。
+
+-       .catch(() => undefined) // surfaced as an empty transcript plus a retryable send, not a crash
+-       .finally(() => {
+-         if (active) setRestoring(false);
+-       });
++       .catch((e: unknown) => {
++         if (!active) return;
++         setRestoreError(e instanceof Error ? e.message : String(e)); // 呈现恢复失败 + 重试入口，恢复成功前阻断发送
++       })
+
+
+─── apps/mobile/src/openbot/chat.tsx:253-258 ───
+[bug · low] send 失败后 retry 只把 lastSent 放回输入框，但失败回合已通过 addMessage 加入的用户气泡仍留在 agent.messages
+中：重发后转写会出现两条内容相同的用户消息，且失败的那条没有任何失败标记。注释只解释了「把话还给用户」的草稿设计，未覆盖重复气泡。建议在失败路径（send 的 catch 与 run
+失败订阅）回滚本回合的乐观用户消息（可参照先例的 agent.setMessages），或与产品确认保留失败气泡为预期行为。
+
+
+
+─── apps/mobile/src/openbot/chat.tsx:200-202 ───
+[bug · low] streaming 启发式在 run in flight 但新回合首个 assistant token 尚未到达时，lastAssistant
+指向的是上一轮的历史回复，会把旧气泡误标为流式中（渲染「▍」光标），直到新 assistant 消息出现才纠正。建议仅当末尾 assistant 消息位于本轮 user 消息之后时才标记
+streaming。
+
+-         // The runtime has no streaming field in this SDK version; the trailing
+-         // assistant row is mid-stream exactly while a run is in flight.
+-         isStreaming: index === lastAssistant && agent.isRunning,
++         // 只标记属于当前回合的末尾 assistant 消息（位于本轮 user 消息之后）。
++         isStreaming: index === lastAssistant && agent.isRunning && index > lastUser,
+
+
+─── apps/mobile/src/openbot/chat.tsx:266-275 ───
+[style · low] 多处与动态值无关的静态内联样式（头部行布局、ScrollView 的 contentContainerStyle、各 chip 的 padding
+行、底部输入行等），违反「内联样式仅用于动态样式」规范。文件已有 styles StyleSheet，建议将这些静态布局下沉为常量。
+
+
+
+─── apps/mobile/src/openbot/tool-cards.ts:185-193 ───
+[style · low] 四层嵌套三元表达式（?? 内再嵌三层），违反团队「禁止嵌套三元表达式」规范，可读性差且后续扩展状态易改错。建议改为 status→kind 查找表。
+
++   const OUTCOME_KINDS: Partial<Record<ToolEventStatus, ToolCardKind>> = {
++     start: "tool_start",
++     error: "tool_error",
++     result: "tool_result",
++   };
+    const kind: ToolCardKind =
+-     named ??
+-     (event.status === "start"
+-       ? "tool_start"
+-       : event.status === "error"
+-         ? "tool_error"
+-         : event.status === "result"
+-           ? "tool_result"
+-           : "unknown");
++     named ?? (event.status ? OUTCOME_KINDS[event.status] : undefined) ?? "unknown";
+
+
+─── apps/mobile/src/openbot/chat-state.ts:78-80 ───
+[maintainability · low] 全仓检索显示 historyKey 仅被 test/openbot-chat-state.test.ts 引用；其文档注释声称「Used ONLY
+for optimistic echo … while a run is in flight」，但 chat.tsx 并未基于它实现任何本地回显存储（乐观回显已由 agent.addMessage
+提供）。注释描述的用途在屏幕上不存在，属未接线的遗留导出。若乐观回显方案已废弃，建议删除该导出及注释承诺；若计划接线，建议补充 TODO 标注。
+
+
+
+─── apps/mobile/src/openbot/stream-resume.ts:68-68 ───
+[documentation · low] 注释开头的「ponytail:」一词与上下文语义明显不符（该段讨论的是 containment 而非 id
+排序），疑为笔误或遗留词，影响可读性，建议核对原意后删除或修正。
+
+
+
+─── apps/mobile/src/openbot/channel-state.ts:53-55 ───
+[bug · medium] sessionFor 与 selectedIdentity 都直接取 channel.agentIds[0]，但类型契约并不保证非空：workspaceSchema 中
+agentIds 是 z.array(nonempty)（允许空数组）。一旦出现 agentIds 为空的行（如服务端数据异常），botId/runtimeAgentId 会以 undefined
+混入 string 类型继续流转，聊天会以 undefined 身份建立会话，故障点会被推迟到运行时深层。建议在 schema 上加 .min(1)
+收紧契约，或在此处对空数组做显式守卫（selectedIdentity 存在同样的取值模式）。
+
+  export function sessionFor(channel: WorkspaceChannel): OpenBotSession {
+-   return {
+-     botId: channel.agentIds[0],
++   const botId = channel.agentIds[0];
++   if (botId == null) throw new Error(`频道 ${channel.id} 缺少 Bot，无法进入会话。`);
++   return { botId, channelId: channel.id, threadId: channel.threadId };
+
+
+─── apps/mobile/src/openbot/channels.tsx:186-188 ───
+[bug · medium] 归档分区的频道行仍是无条件可点击的 Pressable，且 shell 侧 App.tsx 的 onSelect 只做
+setSelectedId(channel.id)，对 archivedAt 没有任何拦截。在“已归档”视图点按归档频道会把会话切换到已归档
+thread，本地“当前频道”状态与服务端归档状态不一致，还可能继续向归档频道发消息。建议归档行禁用选中（或降级为只读展示）。
+
+                  accessibilityLabel={channel.name}
++                 disabled={archivedRow}
+                  onPress={() => onSelect(channel)}
+-                 style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
++                 style={({ pressed }) => ({ opacity: pressed && !archivedRow ? 0.7 : 1 })}
+
+
+─── apps/mobile/src/openbot/channels.tsx:167-168 ───
+[bug · low] 在“已归档”视图内恢复最后一个归档频道后，此按钮因 partition.archived.length > 0 变为 false 而消失，但 showArchived 仍为
+true：页面滞留在空的归档列表上（只显示 archivedEmpty 文案），没有返回活跃列表的入口，只能关闭整个屏幕。建议按钮的渲染条件同时包含 showArchived。
+
+-         {partition.archived.length > 0 && (
++         {(showArchived || partition.archived.length > 0) && (
+            <Button small onPress={() => setShowArchived((value) => !value)}>
+
+
+─── apps/mobile/src/openbot/channels.tsx:212-216 ───
+[bug · low] 创建流程（busy）与行操作（busyId）两套互斥状态彼此不感知：create 进行中行操作按钮仍可点按，行操作进行中“新建频道”也仍可点按，两组请求的
+setChannels 回调会交错执行。虽因按 id 合并大概率幂等，但无谓扩大了竞态面。建议两个状态互相参与对方的 disabled 条件。
+
+                  <Button
+                    small
+-                   disabled={busyId !== null}
++                   disabled={busyId !== null || busy}
+                    onPress={() =>
+                      void runAction(channel.id, async () => {
+
+
+─── apps/mobile/src/openbot/channel-actions.ts:27-27 ───
+[bug · low] 控制字符判断只覆盖 U+0000–U+001F 与 DEL（U+007F），漏掉 C1 控制区（U+0080–U+009F），与注释“UI
+无法渲染的名字一律拒绝”的意图不完全一致，零宽/方向控制类字符也可能被放过显示异常的重命名输入。建议把判断扩展到 C1 区间。
+
+-   if (chars.some((char) => char < " " || char === "\u007f"))
++   if (chars.some((char) => char < " " || (char >= "\u007f" && char <= "\u009f")))
+
+
+─── apps/mobile/src/openbot/channels.tsx:215-225 ───
+[bug · medium] 归档动作完全不考虑 currentId：当前正在使用的频道也能被直接归档。App.tsx 的 onArchived 只调用 applyArchived
+原地盖章、selectedId 保持不变，归档后该行移入已归档分区（活跃视图中"当前"高亮随行消失），但底部聊天仍以 sessionFor(该归档频道) 的身份继续挂在归档 thread
+上——用户关闭本屏后会在毫不知情的情况下继续向已归档频道收发消息；而下一次 workspace 冷启动读取时活跃分区不含归档行，selected 回退到私有 Bot
+会话，前后行为不一致。这与"点按归档行切会话"是不同的入口，建议归档当前频道时禁用按钮（最小改动），或在 onArchived 契约中联动 shell 切走选择。
+
++                 <Button
++                   small
++                   disabled={busyId !== null || (!archivedRow && channel.id === currentId)}
+                    onPress={() =>
+                      void runAction(channel.id, async () => {
+                        if (archivedRow) {
+                          await reopenChannel(channel.id);
+                          onReopened(channel.id);
+                        } else {
+                          await archiveChannel(channel.id);
+                          onArchived(channel.id);
+                        }
+                      })
+                    }
++                 >
+
+
+─── apps/mobile/src/openbot/channels.tsx:172-176 ───
+[other · low] 空态文案只覆盖了已归档分区：活跃列表为空时（工作区尚无任何频道，或在活跃视图把最后一个频道归档后）正文区域完全空白，仅剩底部"新建频道"按钮，与已归档视图有
+archivedEmpty 提示不对称，用户可能困惑频道去哪了。建议为活跃分区补充对称的空态提示。
+
+-         {visible.length === 0 && showArchived && (
++         {visible.length === 0 && (
+            <Text style={[s.muted, { textAlign: "center", marginTop: 16 }]}>
+-             {COPY.archivedEmpty}
++             {showArchived ? COPY.archivedEmpty : COPY.activeEmpty}
+            </Text>
+          )}
++         // COPY 中补充：activeEmpty: "还没有频道，点击下方新建。"
+
+
+─── apps/mobile/src/openbot/chat.tsx:260-262 ───
+[bug · medium] 滚动跟随依赖 [rows.length, toolRows.length]，在流式场景失效：同一 assistant 消息持续 append token
+时行数不变，effect 不触发，长回复流式期间视口停留在首 token 位置、新内容不可见（首 token 才滚一次）。另外缺少「用户已上滑」守卫——阅读历史时任何新行/tool
+卡到达都会被强制拉回底部。先例 apps/mobile/src/chat.tsx:509-518 恰好解决了这两点：onScroll 维护 followLatest（距底 <100px
+才跟随），scrollToEnd 挂在 onContentSizeChange（内容尺寸增长即触发，覆盖流式 append）。建议照搬该方案。
+
+-   useEffect(() => {
+-     list.current?.scrollToEnd({ animated: false });
+-   }, [rows.length, toolRows.length]);
++   const followLatest = useRef(true);
++ 
++   // 流式 append 只增长内容尺寸、不改行数，跟随需挂在 onContentSizeChange；
++   // followLatest 由 onScroll 维护（距底 <100px 才跟随），避免上滑读历史被拉回。
++   // <ScrollView
++   //   ref={list}
++   //   scrollEventThrottle={100}
++   //   onScroll={({ nativeEvent: { contentOffset, contentSize, layoutMeasurement } }) => {
++   //     followLatest.current =
++   //       contentSize.height - contentOffset.y - layoutMeasurement.height < 100;
++   //   }}
++   //   onContentSizeChange={() => {
++   //     if (followLatest.current) list.current?.scrollToEnd({ animated: false });
++   //   }}
++   // >
+
+
+─── apps/mobile/src/openbot/tool-cards.ts:158-159 ───
+[bug · low] renderSummary 不感知事件状态：classifyToolEvent 对 named kind 的 in-flight（status:"start"）卡同样走
+renderSummary(kind, payload)，而 computer_screenshot 在此硬编码返回「已获取屏幕截图」——调用尚未解析时 start
+卡就声称动作已完成，违背模块自身声明的「Neutral is the honest default: no outcome is claimed the event did not
+report」原则，短暂误导用户。建议将 status 传入 renderSummary（或 start 状态统一回落到中性摘要）。
+
+      case "computer_screenshot":
+-       return "已获取屏幕截图";
++       // start 卡尚未拿到截图，不能声称已获取。
++       return status === "start" ? "正在截取屏幕…" : "已获取屏幕截图";
++     // 相应地 renderSummary 需增加 status 参数，classifyToolEvent 调用处传入 event.status。
+
+
+─── apps/mobile/src/openbot/chat.tsx:166-166 ───
+[bug · low] SDK 错误消息为空白时，fail() 把 error 兜底设为 COPY.errorTitle，而渲染处是
+`{COPY.errorTitle}（{error}）`，会输出「这条消息没有发出去（这条消息没有发出去）」自我重复。建议 fail 只存原始 message（空则 null），渲染处再对 null
+兜底。
+
+-       setError(message?.trim() || COPY.errorTitle);
++       setError(message?.trim() || null); // 空消息存 null，渲染处统一兜底
++       // 渲染处：{error ? `${COPY.errorTitle}（${error}）` : COPY.errorTitle}
+
+
+─── apps/mobile/src/openbot/stop-state.ts:26-27 ───
+[maintainability · low] terminalOf 在生产代码中无调用者（全仓引用仅本文件、openbot-stop-state.test.ts 与工单文档）：chat.tsx
+的终端结果是在 onRunFinishedEvent 里内联映射（interrupt→stopped，否则 completed），并未把 run_stopped/run_completed
+事件流喂给该 seam。模块头注释「the screen feeds what it observes into these seams」对 terminalOf 不成立，与已确认的
+historyKey 未接线属同一模式；C04 工单规划的「Pure seam terminalOf + Chat UI wiring」只落地了后半。建议标注 TODO 说明接线计划（若后续会让
+run 事件流走该折叠逻辑），否则删除导出。
+
++ // TODO: 尚未接线 — chat.tsx 目前在 onRunFinishedEvent 内联推导终端结果，
++ // 本折叠逻辑仅测试引用；接线取消时应删除。
+  export function terminalOf(events: readonly RunEvent[]): TerminalOutcome | null {
+    for (const event of events) {
+
+
+─── apps/mobile/src/openbot/stream-resume.ts:42-45 ───
+[maintainability · low] dedupeByEventId 在生产代码中无调用者（全仓引用仅本文件、openbot-stream-resume.test.ts 与
+checkpoint 文档）：chat.tsx 调用 createRenderSet().applyBatch(...) 且丢弃返回值，转写渲染的是 agent.messages 全量，去重实际由
+React key + runtime 消息 id 唯一性承担。C05 工单规划的「the dedupe seam wraps transcript construction」未实现，注释「Pure
+§3 core」描述的是一条屏幕未走的路径——与已确认的 historyKey/terminalOf 未接线属同一模式。建议标注 TODO 说明接线计划，否则删除导出。
+
++ // TODO: 尚未接线 — chat.tsx 的 applyBatch 返回值被丢弃，转写直接渲染
++ // agent.messages（靠 React key 去重）；本便捷包装仅测试引用，接线取消时应删除。
+  export function dedupeByEventId(
+    received: readonly StreamEvent[],
+    rendered: readonly StreamEvent[],
+  ): StreamEvent[] {
+
+
+─── apps/mobile/src/openbot/calendar.tsx:137-141 ───
+[bug · high] EventRow 对服务器数据零容错：types.ts 的 zod schema 只把 start/end 校验为非空字符串、timeZone 为可选字符串（不校验 RFC
+3339 格式与时区合法性），脏数据会直接进入渲染链路并抛 RangeError——instantOf→zonedWallMs 中 new Intl.DateTimeFormat(..., {
+timeZone }) 对非法时区抛 "Invalid time zone"；timeLabel/dayLabel 对 Invalid Date 抛 "Invalid time
+value"；renderAllDay 的 .toISOString() 同样抛错。单个坏事件会导致整个日历屏渲染崩溃，且重试只会拉回同一份数据、无法自愈。建议在本行渲染逻辑外层 try/catch
+降级（回退展示原始 start/end 字符串），或在 api/types 层对日期与时区做格式校验/归一化。
+
+  function EventRow({ event, zone }: { event: OpenBotCalendarEvent; zone: string }) {
++   try {
+-   const resolved = zoneOf(event.start, event.timeZone || zone);
++     const resolved = zoneOf(event.start, event.timeZone || zone);
+-   const range = event.allDay
++     const range = event.allDay
+-     ? renderAllDay(event.start, event.end)
++       ? renderAllDay(event.start, event.end)
+-     : renderTimedRange(event.start, event.end, zone, resolved.zone);
++       : renderTimedRange(event.start, event.end, zone, resolved.zone);
++     /* …正常渲染… */
++   } catch {
++     // 脏数据兜底：单条坏事件只降级本行，不拖垮整个列表。
++     return (
++       <View style={styles.card}>
++         <Text style={s.heading}>{event.title || event.id}</Text>
++         <Text style={s.small}>
++           {event.start} – {event.end}
++         </Text>
++       </View>
++     );
++   }
+
+
+─── apps/mobile/src/openbot/calendar.tsx:142-143 ───
+[bug · medium] durationHours 返回原始浮点小时并在此直接拼接：20/50 分钟等常见时长会渲染成 " · 0.3333333333333333 小时"
+这类长小数，影响所有非整/半小时事件的可读性（测试只断言 durationHours 的精确数值，未约定展示格式，格式化责任在渲染层）。建议换算为分钟展示或固定保留位数。
+
+    const hours = event.allDay ? 0 : durationHours(event.start, event.end, resolved.zone);
+-   const duration = hours > 0 ? ` · ${hours} 小时` : "";
++   const minutes = Math.round(hours * 60);
++   let duration = "";
++   if (minutes >= 60) {
++     const h = Math.floor(minutes / 60);
++     const rest = minutes % 60;
++     duration = ` · ${h}${rest > 0 ? ` 小时 ${rest} 分` : " 小时"}`;
++   } else if (minutes > 0) {
++     duration = ` · ${minutes} 分钟`;
++   }
+
+
+─── apps/mobile/src/openbot/calendar.tsx:121-125 ───
+[bug · medium] 错误态与加载态未互斥：首次加载失败时 error 非空且 events 仍为 null，JSX 会同时渲染错误横幅和"正在加载日程…"的
+ActivityIndicator，向用户传达矛盾状态。建议仅在 !error && events === null
+时展示加载视图（与下方列表分支的结构调整可一并处理，见嵌套三元条目）。注：files.tsx/tasks.tsx 也存在同样的并存模式，建议模块内统一修复。
+
+-         {events === null ? (
++         {events === null && !error ? (
+            <View style={{ flexDirection: "row", gap: 10, alignItems: "center", padding: 8 }}>
+              <ActivityIndicator size="small" color={colors.blueDark} />
+              <Text style={s.muted}>{COPY.loading}</Text>
+            </View>
+
+
+─── apps/mobile/src/openbot/calendar.tsx:126-130 ───
+[style · low] events === null ? … : events.length === 0 ? … : …
+构成嵌套三元表达式，违反评审规范"不允许嵌套三元表达式"，也挤压了错误/加载互斥调整的空间。建议把"空列表/列表体"提取为具名渲染组件或改用 if/else 结构。
+
+-         ) : events.length === 0 ? (
+-           <Text style={s.muted}>{COPY.emptyList}</Text>
+-         ) : (
+-           events.map((event) => <EventRow key={event.id} event={event} zone={zone} />)
+-         )}
++ // 模块级具名组件，JSX 中仅保留两态：
++ function EventListBody({ events, zone }: { events: OpenBotCalendarEvent[]; zone: string }) {
++   if (events.length === 0) return <Text style={s.muted}>{COPY.emptyList}</Text>;
++   return <>{events.map((event) => <EventRow key={event.id} event={event} zone={zone} />)}</>;
++ }
++ // 渲染处：
++ // {events === null && !error ? <LoadingRow /> : events && <EventListBody events={events} zone={zone} />}
+
+
+─── apps/mobile/src/openbot/calendar.tsx:129-129 ───
+[bug · low] 以 key={event.id} 渲染列表：zod schema 仅保证 id 非空（types.ts 中 id: nonempty），并不保证唯一——DTO 注释表明服务端按
+"start 再 id" 排序，跨日历可能出现重复 id，重复 key 会触发 React 警告并导致节点复用错乱。建议用 calendarId 复合（必要时再拼索引）作兜底，或在 api 层去重。
+
+-           events.map((event) => <EventRow key={event.id} event={event} zone={zone} />)
++           events.map((event, index) => (
++             <EventRow key={`${event.calendarId}:${event.id}:${index}`} event={event} zone={zone} />
++           ))
+
+
+─── apps/mobile/src/openbot/calendar.tsx:113-115 ───
+[style · low] 大量静态样式以对象字面量内联（头部工具栏、ScrollView 的
+contentContainerStyle、此错误文案等），违反"内联样式仅限动态样式"的规范；文件内已有 styles/chipBase 可承接。其中错误文案样式与
+files.tsx/tasks.tsx 已提取的 styles.errorText 重复，建议统一提取到 StyleSheet.create 复用。
+
+-             <Text style={{ color: colors.danger, fontSize: 13, lineHeight: 19 }}>
+-               {COPY.errorTitle}（{error}）
+-             </Text>
++ // styles 中：errorText: { color: colors.danger, fontSize: 13, lineHeight: 19 }
++ <Text style={styles.errorText}>{COPY.errorTitle}（{error}）</Text>
+
+
+─── apps/mobile/src/openbot/calendar.tsx:62-70 ───
+[maintainability · low] ±31 天固定窗口以裸表达式内联（31 * 86_400_000），虽有 ponytail 注释，仍属业务窗口硬编码；建议提取为具名常量并标注 A02
+日/周分页替换计划，便于统一调整与单测引用。
+
++ /** ponytail: 固定 ±31 天窗口；A02 落地日/周分页后移除。 */
++ const CALENDAR_WINDOW_DAYS = 31;
++ const WINDOW_MS = CALENDAR_WINDOW_DAYS * 86_400_000;
++ // …
+-       const now = Date.now();
++ const now = Date.now();
+-       setEvents(
++ setEvents(
+-         (
++   (
+-           await fetchCalendarEvents({
++     await fetchCalendarEvents({
+-             timeMin: new Date(now - 31 * 86_400_000).toISOString(),
+-             timeMax: new Date(now + 31 * 86_400_000).toISOString(),
++       timeMin: new Date(now - WINDOW_MS).toISOString(),
++       timeMax: new Date(now + WINDOW_MS).toISOString(),
+-           })
++     })
+-         ).events,
++   ).events,
+-       );
++ );
+
+
+─── apps/mobile/src/openbot/calendar-view.ts:100-103 ───
+[bug · medium] 对跨天 timed 事件仍只输出 "HH:mm–HH:mm"（纯时间、不含日期），calendar.tsx 再拼接 " · 48 小时" 式时长后，用户无法区分"当天 2
+小时会议"与"跨两天事件"，多天场景展示语义失真。权威测试（openbot-calendar-view.test.ts）未覆盖跨天 timed fixture；若 §4
+规范确实只约定时间标签，建议至少在 JSDoc 明示调用方需自行处理跨天，或跨天时在标签中带上日期。
+
+    const from = instantOf(start, interpretZone);
+    const to = instantOf(end, interpretZone);
+    const label = timeLabel(from, zone);
+-   return from === to ? label : `${label}–${timeLabel(to, zone)}`;
++   if (from === to) return label;
++   // 跨天时带日期，避免与单日事件混淆。
++   if (dayKey(from, zone) !== dayKey(to, zone)) {
++     return `${dayLabelOf(from, zone)} ${label}–${dayLabelOf(to, zone)} ${timeLabel(to, zone)}`;
++   }
++   return `${label}–${timeLabel(to, zone)}`;
+
+
+─── apps/mobile/src/openbot/calendar-view.ts:51-52 ───
+[bug · low] `${iso}Z` 解析失败时的回退 Date.parse(iso) 在部分宽松引擎会按设备本地时区解释非标准字符串，直接违背文件头"stored instant
+不随用户移动而改变"的契约；解析彻底失败时返回 NaN 并静默流入 timeLabel/durationHours（最终抛 Invalid time value 或渲染出
+NaN）。建议去掉设备时区回退、统一按 UTC 墙钟解释，解析失败时显式抛出可定位的错误，交由渲染层做脏数据兜底。
+
+    const wall = Date.parse(`${iso}Z`);
+-   if (zone === undefined || !Number.isFinite(wall)) return Date.parse(iso);
++   if (!Number.isFinite(wall)) {
++     // 不回退设备时区：无法解析的输入应显式失败，而不是让 instant 随设备移动。
++     throw new RangeError(`unparseable calendar instant: ${iso}`);
++   }
+
+
+─── apps/mobile/src/openbot/calendar-view.ts:24-25 ───
+[maintainability · low] parts.find(...)?.value 在对应 part 缺失或为非数字时经 Number() 静默得到 NaN，会一路污染 offsetMs
+与两遍候选时刻的计算且无任何告警，直到渲染层才以 Invalid time value 暴露，难以定位。建议对解析结果做 Number.isFinite
+校验，缺失时显式抛出带上下文的错误（便于发现平台/ICU 差异）。
+
+-   const get = (type: Intl.DateTimeFormatPartTypes) =>
+-     Number(parts.find((part) => part.type === type)?.value);
++   const get = (type: Intl.DateTimeFormatPartTypes) => {
++     const value = Number(parts.find((part) => part.type === type)?.value);
++     if (!Number.isFinite(value)) {
++       throw new RangeError(`Intl formatToParts missing "${type}" for zone ${zone}`);
++     }
++     return value;
++   };
+
+
+─── apps/mobile/src/openbot/control.tsx:168-174 ───
+[bug · high] dispatch 闭包捕获渲染期的 state,而 setState(attempt.state) 异步提交、sendComputerInput 为
+fire-and-forget:快速连续输入(双击画面、连点"键入"——busy 不覆盖输入路径)会在重渲染提交前用同一 state 重复计算 seq,两次请求携带相同 seq。api.ts
+契约表明租约只接受"领先于最后已交付序号"的输入,重复 seq 将被服务端 409 拒绝,继而 fail() 将其判为租约失效,触发 controlInputRefused 把仍持有效租约的用户误踢入
+refused 终态(显示"控制已断开,本次输入未发送。")并丢弃输入。建议用 ref 同步持有租约门控与 seq(或以函数式更新串行化派发),保证 seq 单调分配不重不漏。
+
+-   const dispatch = (input: ComputerInput) => {
+-     const attempt = attemptControlInput(state);
+-     if (!attempt.ok) return; // The guard already refused it: nothing leaves.
++   const stateRef = useRef(state);
++   const dispatch = (input: ComputerInput): boolean => {
++     const attempt = attemptControlInput(stateRef.current);
++     if (!attempt.ok) return false; // The guard already refused it: nothing leaves.
++     stateRef.current = attempt.state; // 同步推进,连发输入 seq 不重复
+      setNotice(null);
+      setState(attempt.state);
+      sendComputerInput(botId, { ...input, seq: attempt.seq }).catch(fail);
++     return true;
+    };
+
+
+─── apps/mobile/src/openbot/control.tsx:124-130 ───
+[bug · medium] fail() 被所有租约操作共用,却把任何 403/409 一律路由到 controlInputRefused:对 request(策略 403
+拒绝)、cancel(请求已被领取或已过期 409)、release(租约已不存在 409)、take(409)等非输入操作,界面被强行推入 refused
+终态、inputRefused=true,并显示"控制已断开,本次输入未发送。"——文案描述的是输入被拒,实际发生的是租约操作失败,误导用户;cancel
+失败还会让等待中的请求从界面消失。建议仅在输入派发路径应用 isLateInputRefusal 的租约失效分类,其余操作按自身语义处理(notice、回到 viewing/requesting
+等)。
+
+-   const fail = (error: unknown) => {
+-     if (error instanceof OpenBotError && isLateInputRefusal(error.status ?? 0)) {
++   const fail = (error: unknown, fromInput: boolean) => {
++     if (
++       fromInput &&
++       error instanceof OpenBotError &&
++       isLateInputRefusal(error.status ?? 0)
++     ) {
+        setState((prev) => controlInputRefused(prev, error.status ?? 0));
+        return;
+      }
+      setNotice(error instanceof Error ? error.message : COPY.failed);
+    };
+
+
+─── apps/mobile/src/openbot/control.tsx:115-119 ───
+[bug · low] 卸载清理只处理 controlling 阶段:处于 requesting 的等待请求不会被 cancel,服务端租约将悬挂至过期才回收;同时 dispatch 的
+fire-and-forget sendComputerInput 明明支持 signal 参数却未传入,组件卸载后输入请求仍可能发出。建议清理时对 requesting + leaseId 追加
+cancelComputerControl(now.botId, now.leaseId)(api.ts 中签名已支持),并为输入请求接入中止机制。
+
+      () => () => {
+        const now = latest.current;
+-       if (now.phase !== "controlling" || !now.leaseId) return;
++       if (!now.leaseId) return;
++       if (now.phase === "controlling")
+-       void releaseComputerControl(now.botId, now.leaseId).catch(() => {});
++         void releaseComputerControl(now.botId, now.leaseId).catch(() => {});
++       else if (now.phase === "requesting")
++         void cancelComputerControl(now.botId, now.leaseId).catch(() => {});
+      },
+
+
+─── apps/mobile/src/openbot/control.tsx:252-255 ───
+[bug · low] onPress 先 dispatch 后无条件 setText("\"\""):当 attemptControlInput
+本地拒绝(ok:false,例如租约刚被判失效、重渲染尚未提交)时输入并未发出,但用户键入的文字仍被清空,造成无提示的内容丢失。建议让 dispatch
+返回是否实际受理,仅在实际发出后清空输入框(可与 seq 门控同步化的修复一并处理)。
+
+                onPress={() => {
+-                 dispatch({ kind: "type", text });
+-                 setText("");
++                 if (dispatch({ kind: "type", text })) setText("");
+                }}
+
+
+─── apps/mobile/src/openbot/control.tsx:112-113 ───
+[bug · low] 组件函数体内直接改写 ref(latest.current 赋值)属渲染期副作用:并发渲染下未提交的渲染也会推进 latest.current,卸载清理可能读到从未提交的
+phase/leaseId;StrictMode 双渲染下同样违反"渲染期不读写 ref"的约定。建议移入 useEffect(() => { latest.current = {...}; })
+中同步。
+
+    const latest = useRef({ phase: state.phase, leaseId: state.leaseId, botId });
++   useEffect(() => {
+-   latest.current = { phase: state.phase, leaseId: state.leaseId, botId };
++     latest.current = { phase: state.phase, leaseId: state.leaseId, botId };
++   }, [state.phase, state.leaseId, botId]);
+
+
+─── apps/mobile/src/openbot/control.tsx:42-50 ───
+[maintainability · low] chipBase 与 computer.tsx 中同名对象逐字节重复(组外的 calendar/connections/tasks
+也有各自副本),card/errorText 样式亦与 computer.tsx 重复,后续调整芯片或卡片样式需多处同步、易发生漂移。建议提取到共享模块(如 ../ui 或 openbot
+公共样式文件)统一引用。
+
+
+
+─── apps/mobile/src/openbot/computer.tsx:130-132 ───
+[bug · medium] setViewport 无条件写入,绕过了 computerViewed 的轮次守卫,与上方注释"viewport
+与画面跟踪同一轮次"的约定不符:任何被守卫丢弃的旧轮次响应仍会改写 viewport,一旦发生乱序,控制面板点击坐标换算将基于与显示画面不一致的尺寸,把点击发到错误位置;且断开时 viewport
+从不清空,仅靠 image 为 null 间接兜底。建议将截图尺寸并入 computerViewed 同一守卫转移(或在接受该轮次后再写 viewport),断开时一并清空。
+
+
+
+─── apps/mobile/src/openbot/computer.tsx:200-202 ───
+[style · low] 预览区渲染使用链式嵌套三元表达 loading→source→无画面 三个分支,违反"禁止嵌套三元表达式"检查项,可读性差。建议拆为组件内具名渲染函数,或提前用
+if/else 计算分支元素后再嵌入 JSX。
+
+-         {state.connection === "connecting" && !state.image ? (
++   const renderPreview = () => {
++     if (state.connection === "connecting" && !state.image)
++       return (
+-           <View style={{ flexDirection: "row", gap: 10, alignItems: "center", padding: 8 }}>
++         <View style={{ flexDirection: "row", gap: 10, alignItems: "center", padding: 8 }}>
+-             <ActivityIndicator size="small" color={colors.blueDark} />
++           <ActivityIndicator size="small" color={colors.blueDark} />
++           <Text style={s.muted}>{COPY.loading}</Text>
++         </View>
++       );
++     if (source)
++       return (
++         <Image accessibilityLabel={COPY.previewLabel} source={{ uri: source }} style={styles.preview} resizeMode="contain" />
++       );
++     return (
++       <View style={[styles.preview, { alignItems: "center", justifyContent: "center" }]}>
++         <Text style={s.muted}>{COPY.noPreview}</Text>
++       </View>
++     );
++   };
+
+
+─── apps/mobile/src/openbot/control-state.ts:117-117 ───
+[maintainability · low] controlSignedOut 在整个代码库无任何生产调用点(全库检索仅测试文件 openbot-control-state.test.ts 与
+docs 证据文档引用),构成未消费的死代码导出。若登出流程(App.tsx 登出注册表)本应消费它,请接入实际调用;否则应删除该导出及其对应测试用例。
+
+
+
+─── apps/mobile/src/openbot/calendar.tsx:69-70 ───
+[bug · medium] load() 只消费第一页的 events，端点返回的 nextCursor 与 truncated 被静默丢弃（api.ts 明确该端点分页且 schema
+携带这两个字段）。当 ±31 天窗口内事件数超过服务端单页上限时，列表会静默不完整，用户得不到任何提示。A02 负责的是日/周分页 UI，但取尽当前窗口（循环跟随 nextCursor，遇到
+truncated 停止或提示）属于本屏数据完整性职责，建议在此补齐。
+
+-         ).events,
+-       );
++       const collected: OpenBotCalendarEvent[] = [];
++       let cursor: string | null = null;
++       do {
++         const page = await fetchCalendarEvents({ timeMin, timeMax, cursor });
++         collected.push(...page.events);
++         cursor = page.nextCursor;
++       } while (cursor); // 或对 page.truncated 给出"结果被截断"提示
++       setEvents(collected);
+
+
+─── apps/mobile/src/openbot/calendar-view.ts:13-14 ───
+[performance · low] zonedWallMs / timeLabel / dayLabel 每次调用都重新构造 Intl.DateTimeFormat。对每个 naive timed
+事件行，渲染期会触发 instantOf×2（每次最多 3 次 zonedWallMs 调用）加 timeLabel×2，即每行约 8 次以上的 formatter
+构造；Intl.DateTimeFormat 构造是 JS 中公认的昂贵操作，且每次刷新/重渲染都全部重复。建议按 options 缓存模块级 formatter 实例（与文件头引用的 ui.tsx
+timeLabel 通用做法一致）。
+
++ const formatterCache = new Map<string, Intl.DateTimeFormat>();
++ const cachedFormatter = (locale: string, options: Intl.DateTimeFormatOptions) => {
++   const key = `${locale}|${JSON.stringify(options)}`;
++   let fmt = formatterCache.get(key);
++   if (!fmt) formatterCache.set(key, (fmt = new Intl.DateTimeFormat(locale, options)));
++   return fmt;
++ };
++ 
+  function zonedWallMs(instant: number, zone: string): number {
+-   const parts = new Intl.DateTimeFormat("en-US", {
++   const parts = cachedFormatter("en-US", { /* …同原有 options… */ }).formatToParts(new Date(instant));
+
+
+─── apps/mobile/src/openbot/control.tsx:199-208 ───
+[bug · low] requesting 阶段存在死端：api.ts 的 computerControlSchema 将 request 声明为 nullish
+可选，controlRequestSent 也显式接受 null leaseId，但本屏在 leaseId 为 null 时 take/cancel 均被 `!state.leaseId`
+禁用，而重新请求按钮只在 viewing/released/refused/expired 渲染——一旦 POST /control/request 的应答未携带 request.id（schema
+明确允许），用户在本屏内没有任何取消或重试出口，只能退出重进。建议在 leaseId 为 null 时回落到可再次发起请求的相位并给出提示。
+
+-       {state.phase === "requesting" && (
+-         <View style={{ flexDirection: "row", gap: 10 }}>
+-           <Button small disabled={busy || !state.leaseId} onPress={take}>
+-             {COPY.take}
+-           </Button>
+-           <Button small disabled={busy || !state.leaseId} onPress={cancel}>
+-             {COPY.cancel}
+-           </Button>
+-         </View>
+-       )}
++       const body = await requestComputerControl(botId);
++       setState((prev) => {
++         const next = controlRequestSent(prev, body.request?.id ?? null, body.reason);
++         // 应答未携带 request id 时无从 take/cancel：回落并保留重试出口，避免困死在等待阶段。
++         return next.leaseId ? next : { ...controlReleased(prev), message: COPY.failed };
++       });
+
+
+─── apps/mobile/src/openbot/computer-state.ts:129-135 ───
+[maintainability] computerFailed 缺少与 computerViewed 对称的"已断开"守卫：computerViewed 在 disconnected
+时直接返回原状态（终态不可隐式复活），而 computerFailed 只要 round >= seq 就接受转移——对已 disconnected 的状态以相同 round 再次调用会覆盖已记录的
+reason/message，破坏终态幂等。当前 computer.tsx 的副作用生命周期（abort 早退 + seq 不变不重跑）使该路径暂时不可达，但本模块是导出的纯状态机接缝（注释声明供
+node:test 及后续工单复用），建议补齐守卫与 computerViewed 保持一致。
+
+  export function computerFailed(
+    state: ComputerState,
+    round: number,
+    reason: ComputerDisconnectReason,
+    message?: string,
+  ): ComputerState {
+-   if (round < state.seq) return state;
++   if (state.connection === "disconnected" || round < state.seq) return state;
+
+
+─── apps/mobile/src/openbot/connections.tsx:103-104 ───
+[security · medium] authorizationUrl 由服务端返回且仅通过 nonempty 校验（types.ts 的
+googleConnectStartedSchema），此处未做任何 scheme/host 检查就直接 Linking.openURL。若后端配置错误、被篡改或链路被劫持返回
+http://、intent:// 或其他自定义 scheme，系统会拉起任意应用或页面，用户可能在伪造授权页输入凭据。建议打开前至少校验 https:// 前缀（可选再校验预期授权域名）。
+
+        const { authorizationUrl } = await connectGoogle(provider);
++       if (!/^https:\/\//i.test(authorizationUrl)) {
++         throw new OpenBotError("invalid_response", "授权地址不是安全的 https 链接，已阻止打开。");
++       }
+        await Linking.openURL(authorizationUrl);
+
+
+─── apps/mobile/src/openbot/connections.tsx:105-109 ───
+[security · medium] OpenBotError.message 来自 client.ts 中服务端响应体的 error 字段（截取 500
+字符的服务端文本），这里直接拼入并渲染，完全绕过了 connection-status.ts 专门防止凭据泄漏的 sanitizeConnectionError 守卫。lastError
+与该错误文案同源（同一后端的错误句），若服务端错误句携带响应体、内部 URL 或令牌片段将被原样展示，违背「失败方向是隐藏而非泄漏」的设计意图。建议三处 catch 的文案统一先过
+sanitizeConnectionError（或按 error code 映射为固定文案）。
+
+      } catch (e) {
+-       setError(e instanceof OpenBotError ? `${COPY.openFailed}（${e.message}）` : String(e));
++       const raw = e instanceof OpenBotError ? e.message : String(e);
++       const safe = sanitizeConnectionError(raw) ?? "未知错误";
++       setError(e instanceof OpenBotError ? `${COPY.openFailed}（${safe}）` : safe);
+      } finally {
+        setBusy(false);
+      }
+
+
+─── apps/mobile/src/openbot/connections.tsx:92-97 ───
+[bug · medium] 数据加载存在并发竞态：挂载 useEffect 与 AppState active 都会触发 load()（部分平台/RN
+版本冷启动会叠加为两次并发请求），手动刷新、disconnect 后重取也可能与 AppState 触发的刷新并发；load/disconnect 均直接
+setRows(最后到达的响应)，无请求序号或 AbortController 保护，响应乱序时旧数据会覆盖新数据（如 disconnect 后回前台又显示「已连接」）。注释声称「the same
+pattern the legacy workspace refresh uses」，但 agent-workspace.tsx 实际带有 polling 在途守卫和 requestVersion
+过期丢弃机制，此处均缺失；fetchGoogleConnections 支持的 AbortSignal 也未使用。
+
+-   useEffect(() => {
+-     const listener = AppState.addEventListener("change", (state) => {
+-       if (state === "active") void load();
+-     });
+-     return () => listener.remove();
+-   }, [load]);
++   // 请求序号守卫：只采纳最后一次发起的响应，乱序到达的旧响应直接丢弃。
++   const requestSeq = useRef(0);
++   const load = useCallback(async () => {
++     const seq = ++requestSeq.current;
++     setBusy(true);
++     setError(null);
++     try {
++       const next = normalizeConnections((await fetchGoogleConnections()).connections);
++       if (seq === requestSeq.current) setRows(next);
++     } catch (e) {
++       if (seq === requestSeq.current) setError(e instanceof OpenBotError ? e.message : String(e));
++     } finally {
++       setBusy(false);
++     }
++   }, []);
+
+
+─── apps/mobile/src/openbot/connection-status.ts:46-46 ───
+[bug · low] slice(0, ERROR_MAX_LENGTH) 按 UTF-16 code unit 截断，若错误句包含 emoji
+等增补平面字符，会拆散代理对产生乱码/非法字符串（测试用例「拒」为 BMP 字符，未覆盖该场景）。建议按码点截断，如 Array.from(lastError).slice(0,
+ERROR_MAX_LENGTH).join("")。另注：TOKEN_SHAPED 的过宽匹配在注释中已声明为有意取舍且有测试固化，无需改动。
+
+-   return lastError.length <= ERROR_MAX_LENGTH ? lastError : lastError.slice(0, ERROR_MAX_LENGTH);
++   return lastError.length <= ERROR_MAX_LENGTH
++     ? lastError
++     : Array.from(lastError)
++         .slice(0, ERROR_MAX_LENGTH)
++         .join("");
+
+
+─── apps/mobile/src/openbot/connections.tsx:208-216 ───
+[style · low] 此处使用嵌套三元表达式（外层条件的 else 分支又是一个条件表达式），违反项目「禁止嵌套三元」的规范。建议先用辅助函数把 status 映射为动作，再以单个条件渲染按钮。
+
+-       {row.status === "disconnected" || row.status === "revoked" ? (
+-         <Button small busy={busy} style={{ alignSelf: "flex-start" }} onPress={onConnect}>
+-           {COPY.connect}
+-         </Button>
+-       ) : row.status === "connected" || row.status === "refresh_required" ? (
+-         <Button small danger busy={busy} style={{ alignSelf: "flex-start" }} onPress={onDisconnect}>
+-           {COPY.disconnect}
++       {action && (
++         <Button
++           small
++           danger={action === "disconnect"}
++           busy={busy}
++           style={{ alignSelf: "flex-start" }}
++           onPress={action === "connect" ? onConnect : onDisconnect}
++         >
++           {action === "connect" ? COPY.connect : COPY.disconnect}
+          </Button>
+-       ) : null}
++       )}
+
+
+─── apps/mobile/src/openbot/connections.tsx:116-117 ───
+[maintainability · low] 重复代码：normalizeConnections((await fetchGoogleConnections()).connections) 在
+load 与 disconnect 中逐字重复；三处 async 回调的 try/catch/setError/setBusy 样板结构也高度雷同。建议提取公共的 refreshConnections
+辅助函数统一「拉取+归一化」路径，避免后续维护时遗漏脱敏或竞态保护。
+
+-       await disconnectGoogle(provider);
+-       setRows(normalizeConnections((await fetchGoogleConnections()).connections));
++   const refreshConnections = useCallback(
++     async () => setRows(normalizeConnections((await fetchGoogleConnections()).connections)),
++     [],
++   );
++   // 之后 load 与 disconnect 的成功路径都调用 refreshConnections()。
+
+
+─── apps/mobile/src/openbot/connections.tsx:150-153 ───
+[style · low] 大量静态内联样式（头部两行布局、此 ScrollView 的 contentContainerStyle、loading 行、卡片内部 gap
+布局等），按项目规范静态样式应移入 StyleSheet.create（动态样式除外）。注：已核实引用的 ui
+token（colors.sky/blueDark/orange/danger、s.between/error/small/heading/muted、Mascot、Button）均已在 ui.tsx
+中定义导出，无未定义引用问题。
+
+-       <ScrollView
+-         contentContainerStyle={{ paddingHorizontal: 18, paddingVertical: 12, flexGrow: 1 }}
+-         keyboardShouldPersistTaps="handled"
+-       >
++       <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
++ // 并在 styles 中补充：
++ //   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 18, paddingTop: 8, paddingBottom: 4 },
++ //   scrollContent: { paddingHorizontal: 18, paddingVertical: 12, flexGrow: 1 },
+
+
+─── apps/mobile/src/openbot/file-cache.ts:165-167 ───
+[bug · medium] ensureCached 缺少按目标的并发互斥：F04 列表下载（files.tsx 的 fetchBytes）与 F07 预览（pdf-view-state.ts 的
+openPdfVersion）都会对同一 fileId 调用本函数，派生出相同的 `<id>.<ext>` 目标路径与共享的 `<target>.part` 临时路径。两个并发调用交错
+writeFileAsync 后竞争 moveAsync，可能把另一个调用方的半成品字节改名落盘，再写入一条版本号自洽的 meta；而 meta.sha256 仅取自 ETag
+响应头、从未对落盘字节重算，此后 classifyCache 永远判 hit，损坏字节将一直呈现给用户（打开展示伪造 size/SHA-256，F07 渲染损坏 PDF）。建议按 target
+路径做在途锁（串行化或合并并发请求），确保同一文件同一时刻只有一个 下载→写盘→改名→写 meta 流程。
+
++ /** 按 target 串行化同一文件的下载，避免 .part 交错写与竞争改名。 */
++ const locks = new Map<string, Promise<unknown>>();
++ 
++ function withLock<T>(key: string, job: () => Promise<T>): Promise<T> {
++   const release = (locks.get(key) ?? Promise.resolve())
++     .catch(() => undefined)
++     .then(job);
++   locks.set(key, release);
++   return release.finally(() => {
++     if (locks.get(key) === release) locks.delete(key);
++   });
++ }
++ 
++ export function ensureCached(file: CacheableFile, ctx: EnsureCachedContext) {
+    const target = deriveCachePath(ctx.cacheDirectory, file.id, extensionFor(file));
+-   const metaPath = cacheMetaPathFor(target);
+-   const temp = `${target}.part`;
++   return withLock(target, () => ensureCachedOnce(file, ctx, target));
++ }
+
+
+─── apps/mobile/src/openbot/file-cache.ts:170-172 ───
+[bug · medium] 命中判定只读 meta sidecar 的 versionId，不校验字节文件是否仍存在。登出清扫（pdfCachePaths）虽整树同删，但 OS 可对
+cacheDir 逐文件回收：meta `<path>.json` 残留而字节被单独清掉时，本函数返回指向不存在文件的 hit，files.tsx 的“打开”/F07
+渲染只在后续读文件时才以不明错误失败，用户侧表现为按钮显示“已缓存”却不可用。建议命中时对字节文件做一次轻量存在性探测（如给 CacheFileSystem 增加
+hasFileAsync/infoAsync），缺失即按 miss 重新下载。
+
+    const cached = await readMeta(fs, metaPath);
+-   if (cached && classifyCache(cached.versionId, file.versionId) === "hit")
+-     return { status: "hit", path: target, meta: cached };
++   if (cached && classifyCache(cached.versionId, file.versionId) === "hit") {
++     // meta 残留但字节被系统单独回收时按 miss 重新下载，避免返回悬空路径。
++     if (await fs.hasFileAsync(target)) return { status: "hit", path: target, meta: cached };
++   }
+
+
+─── apps/mobile/src/openbot/files.tsx:92-93 ───
+[performance · medium] responseToBase64 将整个文件同时驻留内存至少三份（arrayBuffer 的 Uint8Array、binary 字符串、base64
+字符串，writeAsStringAsync 落盘时还有一次解码副本），且没有任何大小上限。pdf-view.tsx（F07）复用本函数，F04 下载与 F07 预览两条路径共享同一峰值；Hermes
+上大 PDF/图片（几十 MB 级）存在 OOM 或严重卡顿风险，全量 string 拼接也无法流式化。建议在转换前按 byteLength 设上限并抛出友好的
+OpenBotError，长期可考虑走原生流式适配器。
+
++ /** Hermes 全量驻留内存（bytes + binary + base64 多份副本），超限直接拒绝。 */
++ const MAX_CACHE_FILE_BYTES = 64 * 1024 * 1024;
++ 
+  export async function responseToBase64(response: Response): Promise<string> {
+    const bytes = new Uint8Array(await response.arrayBuffer());
++   if (bytes.byteLength > MAX_CACHE_FILE_BYTES)
++     throw new OpenBotError("refused", "文件过大，无法在本地缓存后打开。");
+
+
+─── apps/mobile/src/openbot/files.tsx:146-147 ───
+[bug · low] download 未接入任何中止机制：组件卸载后在途下载仍继续拉取字节并回调 setRows，白白消耗流量与内存（responseToBase64
+的大文件内存峰值同样滞留）。api.downloadFile 本身已支持 signal 参数（computer.tsx 也有 AbortController + useEffect
+清理的成熟范例），建议为每行持有 AbortController、卸载时统一 abort，并以 signal.aborted 屏蔽卸载后的 setState。
+
+-       if (!adapter) return;
+-       setRows((prev) => ({ ...prev, [file.id]: { phase: "downloading" } }));
++   const controllers = useRef(new Map<string, AbortController>());
++   useEffect(() => {
++     const pending = controllers.current;
++     return () => pending.forEach((c) => c.abort());
++   }, []);
++ 
++   // download 内：
++   const controller = new AbortController();
++   controllers.current.set(file.id, controller);
++   try {
++     const response = await downloadFile(file, controller.signal);
++     // …转 base64、写缓存…
++   } finally {
++     controllers.current.delete(file.id);
++   }
+
+
+─── apps/mobile/src/openbot/files.tsx:118-119 ───
+[maintainability · low] rows 仅为本次挂载的内存状态，且 file-cache.ts 未导出读取磁盘 meta 的接口（readMeta
+私有）：重新进入文件页后，已缓存文件仍显示“请先下载”，需再点一次下载、闪现“下载中”后才能经 ensureCached 命中，缓存状态展示不一致。建议在 file-cache.ts
+导出只读探测（readMeta + classifyCache 封装），并在 load() 拉到列表后水合 rows。
+
+-   const [files, setFiles] = useState<OpenBotFile[] | null>(null);
+-   const [rows, setRows] = useState<Record<string, RowState>>({});
++ // file-cache.ts 导出：
++ export async function readCachedMeta(
++   file: CacheableFile,
++   ctx: Pick<EnsureCachedContext, "cacheDirectory" | "fileSystem">,
++ ): Promise<CachedFileMeta | null> {
++   const metaPath = cacheMetaPathFor(deriveCachePath(ctx.cacheDirectory, file.id, extensionFor(file)));
++   const meta = await readMeta(ctx.fileSystem, metaPath);
++   return meta && classifyCache(meta.versionId, file.versionId) === "hit" ? meta : null;
++ }
++ 
++ // files.tsx 的 load() 拉到列表后水合：
++ for (const file of page.files) {
++   const meta = adapter ? await readCachedMeta(file, adapter) : null;
++   if (meta) hydrated[file.id] = { phase: "cached", meta };
++ }
++ setRows(hydrated);
+
+
+─── apps/mobile/src/openbot/files.tsx:250-254 ───
+[style · low] 行内下载状态渲染使用两级链式三元（cached → downloading → 默认
+Pressable），违反“禁止嵌套三元”规范，可读性差；另外头部与卡片的布局仍大量使用静态内联 style 对象，宜并入文件顶部已有的 styles StyleSheet 常量。建议把“按
+phase 取操作节点”的分支抽成模块级 renderItem 风格的辅助函数，消除 JSX 内的嵌套三元。
+
+-                   {row.phase === "cached" ? (
+-                     <Text style={styles.action}>{COPY.cached}</Text>
+-                   ) : row.phase === "downloading" ? (
+-                     <Text style={styles.actionBusy}>{COPY.downloading}</Text>
+-                   ) : (
++ function downloadAction(
++   file: OpenBotFile,
++   row: RowState,
++   adapter: boolean,
++   onDownload: () => void,
++ ) {
++   if (row.phase === "cached") return <Text style={styles.action}>{COPY.cached}</Text>;
++   if (row.phase === "downloading")
++     return <Text style={styles.actionBusy}>{COPY.downloading}</Text>;
++   return (
++     <Pressable
++       accessibilityRole="button"
++       accessibilityLabel={COPY.download}
++       disabled={!adapter}
++       onPress={onDownload}
++     >
++       <Text style={adapter ? styles.action : styles.actionDisabled}>{COPY.download}</Text>
++     </Pressable>
++   );
++ }
+
+
+─── apps/mobile/src/openbot/connections.tsx:74-80 ───
+[bug · medium] 本文件三处 catch 均未区分 OpenBotError code。会话过期时 fetchGoogleConnections 抛出
+authentication_required（client.ts 401 映射），用户只看到通用的「连接状态没有读取出来」+ 重试按钮，但重试注定继续
+401，本屏内没有任何回到登录的出口；api.ts:209 的注释也声称该路由 401 会「the gate flips back」，实际本屏并未体现。同组的 computer.tsx 对同一
+code 专门显示「登录已过期」。建议 catch 中用 isAuthFailure（errors.ts）分支给出会话过期的明确文案，或触发登出/回到登录流程。
+
+-   const load = useCallback(async () => {
+-     setBusy(true);
+-     setError(null);
+-     try {
+-       setRows(normalizeConnections((await fetchGoogleConnections()).connections));
+      } catch (e) {
++       if (isAuthFailure(e)) {
++         setError("登录已过期，请重新登录后再查看连接状态。");
++       } else {
+-       setError(e instanceof OpenBotError ? e.message : String(e));
++         setError(e instanceof OpenBotError ? e.message : String(e));
++       }
++     }
+
+
+─── apps/mobile/src/openbot/connections.tsx:164-168 ───
+[bug · medium] rows === null 同时承担「尚未加载」和「加载中」两种含义：初次 load 失败时 error 已设置但 rows 仍为 null，错误横幅（含重试）会和
+ActivityIndicator +「正在读取连接状态…」同时渲染，且 busy=false 后 spinner 依然无限转圈，呈现自相矛盾的常驻加载态。建议仅在「无错误」时渲染 loading
+块（rows?.map 兜底 null 判断），失败态只保留错误横幅 + 重试。
+
+-         {rows === null ? (
++         {rows === null && !error && (
+            <View style={{ flexDirection: "row", gap: 10, alignItems: "center", padding: 8 }}>
+              <ActivityIndicator size="small" color={colors.blueDark} />
+              <Text style={s.muted}>{COPY.loading}</Text>
+            </View>
++         )}
++         {rows?.map((row) => (
++           <ConnectionCard
++             key={row.provider}
++             row={row}
++             busy={busy}
++             onConnect={() => void connect(row.provider)}
++             onDisconnect={() => void disconnect(row.provider)}
++           />
++         ))}
+
+
+─── apps/mobile/src/openbot/connections.tsx:103-106 ───
+[bug · low] api.ts 对 connectGoogle 的文档明确说明：POST 为写操作，408/5xx 会以 outcome_unknown
+落地（授权在服务端可能已经发起）。而此处对一切失败统一展示 COPY.openFailed「没有打开授权页面，请重试」——在 outcome_unknown
+场景下这是客户端无法断言的陈述，且「请重试」可能诱导用户重复发起授权。建议按 code === "outcome_unknown" 分支给出「结果未知，请刷新确认」类文案。
+
+-       const { authorizationUrl } = await connectGoogle(provider);
+-       await Linking.openURL(authorizationUrl);
+      } catch (e) {
++       if (e instanceof OpenBotError && e.code === "outcome_unknown") {
++         setError("连接结果未知，请刷新连接状态确认，避免重复发起授权。");
++       } else {
+-       setError(e instanceof OpenBotError ? `${COPY.openFailed}（${e.message}）` : String(e));
++         setError(e instanceof OpenBotError ? `${COPY.openFailed}（${e.message}）` : String(e));
++       }
++     }
+
+
+─── apps/mobile/src/openbot/connection-status.ts:10-15 ───
+[maintainability · low] §4 的四个状态键在此手写一份，connections.tsx 的 statusChip 和动作分支又各手写一份，共三处平行维护；types.ts 导出
+googleConnectionStatuses 的注释明确说「Kept as a set for narrowing only」，但目前没有任何窄化收益——将来新增一个 §4
+状态时这里不会产生编译错误，只会静默渲染成「未知」加灰色芯片。建议用 satisfies 对 GoogleConnectionStatus 做编译期穷举校验（保留 Record<string,
+string> 的开放索引，未知服务端值仍走 ?? 回退），connections.tsx 的 statusChip 同理。
+
++ import type { GoogleConnection, GoogleConnectionStatus, GoogleConnections } from "./types";
++ 
+  export const connectionStatusLabels: Record<string, string> = {
+    connected: "已连接",
+    refresh_required: "需要刷新",
+    disconnected: "已断开",
+    revoked: "已撤销",
+- };
++ } satisfies Record<GoogleConnectionStatus, string>;
+
+
+─── apps/mobile/src/openbot/files.tsx:151-157 ───
+[bug · high] F04 下载路径缺少 F07 同款的字节校验：openPdfVersion（pdf-view-state.ts:155）在落盘前用 etagMatchesVersion 拒绝
+ETag 摘要与所选版本 sha256 不符的字节（"Never render stale bytes" 协议），而这里把未校验的响应字节直接交给 ensureCached，meta 以列表行的
+versionId 贴标签。当"列表行过期 + /content 返回更新版本字节"竞争发生（F07 头注释明确视为现实场景）时，新版本字节会被标记为旧 versionId 写入与 F07
+共享的缓存槽 <id>.<ext>；此后 F07 按旧版本打开时 classifyCache 命中，把新版本字节当"原件"渲染，击穿 F07 声明的 stale-render
+不变量。OpenBotFile 已携带 sha256，etagMatchesVersion 已导出，建议在此对齐 F07 的守卫。
+
+            fetchBytes: async () => {
+              const response = await downloadFile(file);
+-             return {
++             const result = {
+                base64: await responseToBase64(response),
+                etag: response.headers.get("etag"),
+              };
++             // 与 F07 openPdfVersion 同款守卫：ETag 摘要须等于列表行声明的
++             // sha256，否则竞争窗口内落盘的字节会以旧 versionId 污染共享缓存槽。
++             if (!etagMatchesVersion(result.etag, file))
++               throw new OpenBotError(
++                 "invalid_response",
++                 "服务端返回的字节不属于当前版本，已拒绝缓存。",
++               );
++             return result;
+            },
+
+
+─── apps/mobile/src/openbot/files.tsx:270-272 ───
+[bug · low] row.phase === "failed" 分支用错误文本整体替换了操作行，连带隐藏了"打开预览"入口。但 canPdfPreview 只依赖 mimeType，F07
+预览通过 openPdfVersion 独立拉取字节，与本行的 F04 下载成败无关；一次瞬时网络失败（如离线点下载）后 PDF
+预览入口即消失，直到重试成功或重挂载才恢复。建议错误文本与操作行并存，而非互斥替换。
+
+-                 {row.phase === "failed" ? (
++                 <View style={{ flexDirection: "row", gap: 16, alignItems: "center" }}>
++                   <Pressable
++                     accessibilityRole="button"
++                     accessibilityLabel={COPY.open}
++                     disabled={row.phase !== "cached"}
++                     onPress={() => open(file)}
++                   >
++                     <Text style={row.phase === "cached" ? styles.action : styles.actionDisabled}>
++                       {row.phase === "cached" ? COPY.open : COPY.notCached}
++                     </Text>
++                   </Pressable>
++                   {canPdfPreview(file) && (
++                     <Pressable
++                       accessibilityRole="button"
++                       accessibilityLabel={COPY.preview}
++                       onPress={() => setPreview(file)}
++                     >
++                       <Text style={styles.action}>{COPY.preview}</Text>
++                     </Pressable>
++                   )}
++                 </View>
++                 {row.phase === "failed" && (
+                    <Text style={styles.errorText}>{row.message}</Text>
+-                 ) : (
++                 )}
+
+
+─── apps/mobile/src/openbot/file-cache.ts:118-119 ───
+[maintainability · low] ETag 摘要解析正则（sha256:<64hex>，可选引号）在本模块与 pdf-view-state.ts 的
+etagMatchesVersion（第 126 行）各维护一份，格式演进（如服务端改发弱 ETag W/"sha256:…"）时需双处同步修改，存在漂移风险。本函数目前是模块私有，建议导出并让
+F07 的 etagMatchesVersion 基于它实现，单一事实源。
+
+- /** Extracts the digest from the content route's ETag (`"sha256:<hex>"`). */
+- function sha256FromEtag(etag: string | null): string | null {
++ /** Extracts the digest from the content route's ETag (`"sha256:<hex>"`); exported for F07's etagMatchesVersion to reuse. */
++ export function sha256FromEtag(etag: string | null): string | null {
+
+
+─── apps/mobile/src/openbot/gate.tsx:155-156 ───
+[bug · medium] COPY.sessionNotLanded 提示永远不会展示：此处通过 setNotice 设置"登录已受理但会话未能建立"，随后进入 signin 阶段，但登录视图
+JSX 只渲染 Mascot、欢迎标题、副标题和 EmailSignInForm，没有任何 notice/ErrorNotice 出口（notice
+仅在加载视图渲染）。用户邮箱登录后若会话未落地，只会看到登录表单毫无反馈，无法得知需要重试。建议在登录视图中渲染 notice。
+
+-           setNotice(justSignedIn ? COPY.sessionNotLanded : "");
+-           setState((prev) => entryPhaseReducer(prev, { type: "auth-failed" }));
++           <Text style={[s.muted, { textAlign: "center" }]}>{COPY.welcomeSubtitle}</Text>
++           <ErrorNotice error={notice} />
++           <EmailSignInForm onSignedIn={() => void load(true)} />
+
+
+─── apps/mobile/src/openbot/gate.tsx:98-101 ───
+[bug · medium] load 缺少进行中守卫：重试按钮的 onPress={() => void load()} 可被快速连点，两个入口序列会并发执行。且正常路径通过局部变量
+sequence 镜像状态机、catch 路径用函数式 setSeq(prev) 更新，两种模式交错时第二个 load 的局部镜像从 initialEntrySequence 起步，与第一个 load
+遗留的组件状态脱节，会导致 seq 状态机被交叉应用事件而错乱，并重复调用 provisionOpenMuseBot 与 onReady。建议加 in-flight
+引用守卫（useRef，注意补导入）或在校验进行中禁用重试按钮。
+
++   const running = useRef(false);
+    const load = useCallback(
+      async (justSignedIn = false) => {
++       if (running.current) return;
++       running.current = true;
++       try {
+-       setState({ phase: "checking", error: false });
++         setState({ phase: "checking", error: false });
+-       setSeq(initialEntrySequence);
++         setSeq(initialEntrySequence);
++         // ... 原流程，catch 分支保持函数式 setSeq(prev => ...)
++       } finally {
++         running.current = false;
++       }
++     },
++     [onReady],
++   );
+
+
+─── apps/mobile/src/openbot/gate.tsx:213-215 ───
+[bug · low] COPY.checking（"正在检查登录状态…"）不可达：load 开头 setSeq(initialEntrySequence) 使 seq.phase 固定为
+"provisioning"，因此在真正的会话检查阶段（fetchMe 期间）渲染的是 STEP_COPY.provisioning（"正在准备你的专属 OpenMuse
+Bot…"），误导用户当前进度；而 `?? COPY.checking` 兜底分支实际不可达（seq.phase 为 signin 时走登录视图，为 error 时走
+COPY.loadStuck，其余值均在 STEP_COPY 中）。建议按 state.phase 显式区分 checking 文案。
+
+-       <Text style={s.muted}>
+-         {failure ? COPY.loadStuck : (STEP_COPY[seq.phase] ?? COPY.checking)}
+-       </Text>
++ function gateCopy(state: GateState, seq: EntrySequenceState): string {
++   if (state.phase === "checking") return COPY.checking;
++   return STEP_COPY[seq.phase] ?? COPY.loading;
++ }
++ 
++ // 渲染处：
++       <Text style={s.muted}>{failure ? COPY.loadStuck : gateCopy(state, seq)}</Text>
+
+
+─── apps/mobile/src/openbot/gate.tsx:67-74 ───
+[maintainability · low] 在 React Native 环境中 sessionStorage 恒为 undefined，persistSession 是永久空操作：原生端
+OpenBot 入口会话（botId/conversationId）从不持久化，每次冷启动都要重新走 provision→workspace→conversation 全流程。此处 catch
+注释把无存储描述为"私有模式"等边缘情况，与原生端的常态不符，容易误导后续维护者。服务端供给幂等（I02）可避免数据副作用，但建议要么在原生端接入等价持久化（如 SecureStore 并纳入
+private-state 注册表），要么在注释中明确"原生端设计上不持久化入口会话"。
+
+
+
+─── apps/mobile/src/openbot/pdf-view.tsx:112-120 ───
+[bug · high] 版本 chips 在下载进行中仍可点击（仅 Button 经 busy 禁用，ui.tsx 确认 disabled=disabled||busy）：用户在 open
+进行中点选另一版本时 select() 会清空 openedPath，但此次 in-flight open 完成后仍无条件
+setOpenedPath(path)，把旧版本的本地路径写回——出现「chips 选中 B、渲染的却是 A
+的字节」的错标视图，违背本模块「渲染字节与所选版本一致」的目标（错误分支同理：旧请求的失败文案/清缓存会挂在用户新选的版本下）。建议发起时用 ref 记录本次请求的版本号或递增代数，完成时仅当仍与当前
+selectedId 一致才写回 openedPath；或在 opening 期间禁用版本 chips。
+
++       const requestId = ++openGeneration.current; // useRef(0)：open 发起时递增
+        const { path } = await openPdfVersion(file, selected, {
+          cacheDirectory: adapter.cacheDirectory,
+          fileSystem: adapter.fileSystem,
+          fetchBytes: async () => {
+            const response = await downloadFileVersion(file, selected.versionId);
+            return { base64: await responseToBase64(response), etag: response.headers.get("etag") };
+          },
+        });
++       if (openGeneration.current !== requestId) return; // 期间已切换版本，丢弃过期结果
+        setOpenedPath(path);
+
+
+─── apps/mobile/src/openbot/pdf-view-state.ts:143-147 ───
+[bug · high] 缓存槽按 file.id 派生（单槽只存一个版本，且 ensureCached 的字节与 sidecar 共享同一个 `<path>.part` 临时路径），而此流程没有任何
+in-flight 串行化：files.tsx 关闭预览即卸载组件但不取消进行中的下载，且 Files 屏的「预览」入口在下载中也未禁用。用户在下载进行中关闭后重开再点「打开预览」（或 Files
+屏下载与预览打开并发）会对同一槽并发调用 ensureCached：A/B 两版本交错执行
+writeFileAsync(.part)→moveAsync→writeFileAsync(meta)，可产生「B 的字节 + A 的 versionId sidecar」——此后对 A 的请求
+classifyCache 判为命中，完全绕过 fetchBytes 与 ETag 校验直接渲染 B 的字节，击穿本模块「绝不渲染陈旧字节」的核心不变量；且失败一方的
+clearVersionCache 还会误删另一方刚写入的合法副本。建议在此处（消费方层面）为缓存槽增加按派生路径去重的 in-flight Promise 互斥，或让缓存路径包含
+versionId。
+
+
+
+─── apps/mobile/src/openbot/pdf-view-state.ts:75-85 ───
+[bug · medium] 降级条目混淆了两个版本身份：按 F06 ticket 与 F07 checkpoint 记录的契约（填充后文件行 versionId 翻转到填充版本、sha256
+保持原件哈希、/content 返回最新版本字节），这里用「原件的 sha256 + 填充版本的 versionId」伪造了一个「原件」条目。后果一：未缓存时 open 的 ETag
+校验必然失配，已填充文件在降级模式下永远无法预览，且错误文案「服务端返回的字节不属于所选版本」未提示真实原因（版本路由缺失 + 文件已被填充）。后果二（更严重）：若用户此前在 Files
+屏下载过该文件（ensureCached 以 file.versionId 写入填充字节），此处 openPdfVersion 按 versionId 判缓存命中、跳过 fetchBytes 与
+ETag 校验，直接把填充版本字节渲染为「原件」并展示原件哈希——恰是模块头部声称不可能发生的错标渲染。建议降级条目改为「当前版本」语义（按响应自身 ETag
+校验并展示所得摘要），或无法确认时禁用打开入口并说明原因。另注：本文件头部注释「file row keeps the ORIGINAL's hash」与 types.ts
+openBotFileSchema 注释「the current version's size/SHA-256」对文件行 sha256 的描述相互矛盾，需统一为 §5 契约原文。
+
+
+
+─── apps/mobile/src/openbot/pdf-view.tsx:83-89 ───
+[style · low] 嵌套三元表达式（not_found → OpenBotError → String(e)
+三层），违反本项目「禁止嵌套三元表达式」的评审规范，可读性差。建议提取为具名的错误文案映射函数或改用 if/else。
+
+-       setListHint(
+-         e instanceof OpenBotError && e.code === "not_found"
+-           ? COPY.listUnavailable
+-           : e instanceof OpenBotError
+-             ? e.message
+-             : String(e),
+-       );
++ function listHintFor(e: unknown): string {
++   if (e instanceof OpenBotError) {
++     return e.code === "not_found" ? COPY.listUnavailable : e.message;
++   }
++   return String(e);
++ }
++ // ...
++       setListHint(listHintFor(e));
+
+
+─── apps/mobile/src/openbot/pdf-view.tsx:138-147 ───
+[style · low] 文件已建立 styles StyleSheet（chips/errorText），但头部行、ScrollView contentContainerStyle、加载行、版本
+chips 容器及各静态 marginTop 等纯静态样式仍大量内联，违反「内联样式仅限动态样式」的规范，且每次渲染都重建样式对象。建议与已有的 chips 样式一并提取到 StyleSheet。
+
+
+
+─── apps/mobile/src/openbot/pdf-view.tsx:93-97 ───
+[bug · low] loadVersions 的异步请求缺少取消/忽略防护：组件卸载后晚到的响应仍会执行 setVersions/setSelectedId/setListHint（React
+18 下虽无害但属遗留竞态），且 fetchFileVersions 明确支持 signal 参数却未传入。同模块 chat.tsx 已有既定惯例（`let active = true; ...
+return () => { active = false; }`），建议按惯例补齐清理函数，或传入 AbortController.signal 并在清理时 abort。
+
+    useEffect(() => {
+-     void loadVersions();
++     let active = true;
++     void loadVersions(active ? undefined : undefined); // 或传入 AbortController.signal
+      setOpenedPath(null);
+      setError(null);
++     return () => {
++       active = false;
++     };
+    }, [loadVersions]);
+
+
+─── apps/mobile/src/openbot/gate.tsx:217-226 ───
+[bug · medium] 非重试失败（retryable 为 false，如 workspace_inconsistent、invalid_response）时，重试与「返回登录页」按钮都嵌在
+failure?.retryable 条件内被一并隐藏，界面只剩转圈加错误文案，没有任何可操作出口，形成死胡同。而 gate-state.ts 的 COPY.workspaceInconsistent
+文案明确指示「请退出登录后重试」，此界面却不提供对应入口，用户只能杀掉应用。另外
+COPY.loadStuck（"工作区暂时无法加载，你的登录仍然有效"）在非重试场景下语义矛盾（不是暂时性问题）。建议将「返回登录页」从 retryable 守卫中提出来（failure
+存在即渲染），仅让重试按钮依赖 retryable；非重试场景也不要复用 loadStuck 文案。
+
+        {failure?.retryable && (
+-         <>
+-           <Button small onPress={() => void load()}>
++         <Button small onPress={() => void load()}>
+-             {COPY.retry}
++           {COPY.retry}
+-           </Button>
++         </Button>
++       )}
++       {failure && (
+-           <Pressable onPress={() => setState({ phase: "signin", error: false })}>
++         <Pressable onPress={() => setState({ phase: "signin", error: false })}>
+-             <Text style={[s.small, { color: colors.blueDark }]}>{COPY.backToSignin}</Text>
++           <Text style={[s.small, { color: colors.blueDark }]}>{COPY.backToSignin}</Text>
+-           </Pressable>
++         </Pressable>
+-         </>
+        )}
+
+
+─── apps/mobile/src/openbot/pdf-view.tsx:199-203 ───
+[bug · low] 错误文案把「打开预览」按钮标签原样拼进括号，渲染为「服务端返回的字节不属于所选版本，已拒绝显示。（打开预览）」，读起来像错误信息的一部分，对用户没有任何可操作含义。其它
+OpenBot 屏的既定惯例是「错误标题（错误详情）+ 重试按钮」（见 files.tsx:212-220：`{COPY.errorTitle}（{error}）` + `{COPY.retry}`
+按钮），本屏声明的 `retry: "重试"` 恰好从未渲染——疑似本想提供重试入口却写成了拼接按钮标签。
+
+          {error && (
+-           <Text style={[styles.errorText, { marginTop: 8 }]}>
+-             {error}（{COPY.open}）
++           <View style={[s.error, { marginTop: 8 }]}>
++             <Text style={styles.errorText}>
++               {COPY.open}失败（{error}）
+-           </Text>
++             </Text>
++             <Button small onPress={() => void open()}>
++               {COPY.retry}
++             </Button>
++           </View>
+          )}
+
+
+─── apps/mobile/src/openbot/pdf-view.tsx:23-26 ───
+[maintainability · low] 死代码：`retry` 在本文件中从未被引用（其它每个 OpenBot 屏都用它渲染重试按钮，唯独此屏不用），`opening`
+更是全仓库无任何引用。错误分支实际渲染的是 `（{COPY.open}）`（按钮标签），进一步印证这两个键是被遗漏的意图残留。若按重试按钮方案修复错误展示，`retry` 会被消费；`opening`
+应删除（打开按钮已用 `busy={opening}` 呈现进行态，标签无需切换）。
+
+    retry: "重试",
+    loadingVersions: "正在加载版本…",
+    open: "打开预览",
+-   opening: "正在获取 PDF…",
+
+
+─── apps/mobile/src/openbot/pdf-view-state.ts:126-127 ───
+[maintainability · low] 与 file-cache.ts:119-123 的 `sha256FromEtag` 逐字重复维护同一份 ETag 解析正则
+`/^"?sha256:([0-9a-fA-F]{64})"?$/`。两处独立副本极易漂移——例如日后为弱
+ETag（`W/"sha256:…"`）或大小写/空白变体放宽匹配时只改其一，就会出现「缓存侧认可、预览侧拒绝」的不一致校验。建议从 file-cache.ts 导出
+`sha256FromEtag`，此处基于它实现。
+
+-   const match = /^"?sha256:([0-9a-fA-F]{64})"?$/.exec(etag.trim());
+-   return match !== null && match[1].toLowerCase() === version.sha256.toLowerCase();
++ export function etagMatchesVersion(etag: string | null, version: { sha256: string }): boolean {
++   // 复用 file-cache.ts 导出的唯一 ETag→摘要解析，避免正则双份漂移。
++   const digest = sha256FromEtag(etag);
++   return digest !== null && digest === version.sha256.toLowerCase();
++ }
+
+
+─── apps/mobile/src/openbot/tasks.tsx:80-91 ───
+[bug · medium] load 以 detail 为 useCallback 依赖且被 useEffect 监听，形成刷新风暴与竞态：(1) open 设置 detail 后 load
+引用变化 → effect 重跑 → 全列表重拉，且此处 if (detail) 还会再次 fetchTaskDetail——打开一个任务实际发出 3 个请求（open 1 次 + 列表 1 次 +
+详情重复 1 次），onBack 关闭详情又触发一次全列表重拉，造成冗余网络开销与 busy 闪烁；(2) 刷新期间用户点击"返回任务列表"（setDetail(null)）后，此处若 detail
+闭包仍非空，在途的 fetchTaskDetail 响应会把详情页"复活"；(3) 屏随 onClose 卸载后（App.tsx 条件挂载）在途请求的 setState 无清理。对比
+calendar/connections 等屏 load 均为稳定 [] 依赖。建议：初始/手动刷新只拉列表，详情由 open 单独按需加载；在途响应落地前比对序号或目标 id，卸载时中止请求。
+
+    const load = useCallback(async () => {
+      setBusy(true);
+      setError(null);
+      try {
+        setTasks((await fetchTasks()).tasks);
+-       if (detail) setDetail(await fetchTaskDetail(detail.id));
+      } catch (e) {
+        setError(e instanceof OpenBotError ? e.message : String(e));
+      } finally {
+        setBusy(false);
+      }
+-   }, [detail]);
++   }, []);
+
+
+─── apps/mobile/src/openbot/tasks.tsx:97-107 ───
+[bug · medium] open 缺少过期请求防护：client.ts 仅有 20s 超时 AbortSignal，无请求序号或去重机制。快速连续点击不同任务时多个
+fetchTaskDetail 并发在途，响应乱序返回时 setDetail 会展示与点击不符的任务详情；此外点击后立即返回列表，在途响应同样会把详情页复活。建议引入单调递增序号（或
+AbortController）丢弃过期响应。
+
++   const openSeq = useRef(0);
+    const open = useCallback(async (id: string) => {
++     const seq = ++openSeq.current;
+      setBusy(true);
+      setError(null);
+      try {
+-       setDetail(await fetchTaskDetail(id));
++       const task = await fetchTaskDetail(id);
++       if (seq === openSeq.current) setDetail(task);
+      } catch (e) {
+-       setError(e instanceof OpenBotError ? e.message : String(e));
++       if (seq === openSeq.current) setError(e instanceof OpenBotError ? e.message : String(e));
+      } finally {
+-       setBusy(false);
++       if (seq === openSeq.current) setBusy(false);
+      }
+    }, []);
+
+
+─── apps/mobile/src/openbot/tasks.tsx:148-150 ───
+[style · low] 三层嵌套三元表达式（详情/加载中/空列表/列表）违反"禁止嵌套三元"规范，分支意图不直观且后续维护易错。建议提取为具名变量或辅助渲染函数，用 if/else 逐一返回。
+
+-         {detail ? (
+-           <TaskDetailBody task={detail} onBack={() => setDetail(null)} />
+-         ) : tasks === null ? (
++         {renderBody()}
+
+
+─── apps/mobile/src/openbot/task-view.ts:42-42 ───
+[style · low] 嵌套三元比较器违反"禁止嵌套三元"规范，可读性差。建议改写为显式 if 提前返回，语义不变。
+
+- const byId = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
++ const byId = (a: { id: string }, b: { id: string }) => {
++   if (a.id < b.id) return -1;
++   if (a.id > b.id) return 1;
++   return 0;
++ };
+
+
+─── apps/mobile/src/openbot/task-view.ts:77-80 ───
+[maintainability · low] result 与 evidenceIds 归一化产出后在 tasks.tsx 渲染中从未读取（步骤行仅消费
+status/statusLabel/title/id/errorText，证据区直接渲染 view.evidence 行而非按 evidenceIds 关联）；权威测试
+openbot-task-view.test.ts 也未直接断言这两个字段（"reload dedupe"用例的 deepEqual 是归一化结果自比较，删除字段仍会通过）。注意
+TaskDetailView.status 是被消费的（taskChip[view.status]），勿一并移除。若两者为后续步骤-证据关联渲染预留契约，请补充注释说明；否则应删除以免误导维护者。
+
+    /** Failed steps only, clipped to 200 chars; never fabricated from a result. */
+    errorText?: string;
+-   result?: string;
+-   evidenceIds: string[];
+
+
+─── apps/mobile/src/openbot/tasks.tsx:193-195 ───
+[maintainability · low] 直接把 `task.updatedAt` 的原始 ISO-8601 字符串（如
+"2026-10-12T01:00:00.000Z"）渲染给用户，与本应用其余界面的时间展示惯例不一致——screens.tsx、details.tsx、computer-workspace.tsx
+均通过 `../ui` 导出的 `relativeDate`/`dateLabel`/`timeLabel` 做本地化格式化。建议改用 `relativeDate(task.updatedAt)`（或
+`dateLabel`）保持一致。
+
+        <Text style={[s.small, { marginBottom: 8 }]}>
+-         {view.taskId} · {task.updatedAt}
++         {view.taskId} · {relativeDate(task.updatedAt)}
+        </Text>
+
+
+─── apps/mobile/src/openbot/tasks.tsx:161-162 ───
+[other · low] `accessibilityLabel={task.id}` 会覆盖 Pressable 子节点的可访问性合并朗读内容，屏幕阅读器只会念出原始任务 id，丢失卡片上的
+kind 标题与状态徽标信息。建议在 label 中组合 kind、状态文案与 id，或去掉覆盖让子 Text 自动合并朗读。
+
+                accessibilityRole="button"
+-               accessibilityLabel={task.id}
++               accessibilityLabel={`${task.kind} ${taskStatusLabels[task.status]} ${task.id}`}
+
+
+─── apps/mobile/src/openbot/private-state.ts:167-171 ───
+[bug · high] SecureStore 键删除是整条清理链路中唯一没有错误隔离的环节：任一 deleteItemAsync 抛出都会让 clearPrivateState 整体
+reject。而全部三个调用方（App.tsx:106、App.tsx:134、gate.tsx:154）都以 .catch(() => undefined) 吞掉拒绝——一次瞬态失败后，剩余
+SecureStore 私有键与全部 PDF 缓存文件都不会被清理，共享设备上残留上一用户的会话 Cookie 与 session
+数据，且没有任何信号提示清理中断。下方文件删除已经示范了正确的模式（失败收集进 failedDeletes 并继续），键删除应与之对齐：捕获单键失败计入报告（如为 NativeClearReport
+增加 failedKeys 字段），保证其余键和 PDF 缓存继续清理。
+
+      for (const key of secureStore.keys()) {
+        if (!isNativePrivate(key)) continue;
++       try {
+-       await secureStore.deleteItemAsync(key);
++         await secureStore.deleteItemAsync(key);
+-       removedKeys.push(key);
++         removedKeys.push(key);
++       } catch {
++         failedKeys.push(key); // NativeClearReport 增加 failedKeys，供调用方重试/上报
++       }
+      }
+
+
+─── apps/mobile/src/openbot/private-state.ts:87-87 ───
+[maintainability · medium] 此处逐字符重写了 auth.ts:33 传给 Better Auth Expo 插件的 storagePrefix
+表达式，测试也只是把同一表达式抄第三遍来"钉住"两者。本批变更同时新增了 auth.ts（本就是一次一行的接入），完全可以由 auth.ts 直接 import
+本模块导出的前缀作为单一事实来源；靠注释加等值测试维系的三处副本，任何一侧改动字面量或 host 归一化规则，sweep
+都会静默失配——原生私有键永远无法命中且无报错，登出后设备残留会话数据。建议导出该常量并让 auth.ts 消费，消除跨模块重复业务逻辑。
+
+- const secureStorePrefix = `openmuse-openbot-${openbotEndpoint.host.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
++ /** Single source: auth.ts 的 expoClient storagePrefix 应改为导入此常量。 */
++ export const secureStorePrefix = `openmuse-openbot-${openbotEndpoint.host.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+
+
+─── apps/mobile/src/openbot/private-state.ts:118-119 ───
+[maintainability · medium] 目录名 "openmuse-files" 与 file-cache.ts:14 的 FILES_CACHE_DIR
+是两份各自硬编码的字面量（后者注释自称 "the exact tree I07's pdfCachePaths sweeps"，耦合已被代码自身承认但未消除）。两处一旦分叉，pdfCachePaths
+返回空数组，登出后敏感 PDF 及 sidecar 元数据残留在设备缓存，清理端无从感知。两个模块都是无 react-native/expo 静态依赖的纯模块（file-cache.ts 仅依赖
+errors.ts），可安全互相导入；建议由 file-cache.ts 导出该常量供此处复用，或抽到共享常量模块，消除对字面量巧合的依赖。
+
+- /** Directory under the native cache where F04/F07 land PDF downloads. */
+- const PDF_CACHE_DIR = "openmuse-files";
++ import { FILES_CACHE_DIR } from "./file-cache"; // file-cache.ts 导出共享常量
++ 
++ /** Directory under the native cache where F04/F07 land file downloads. */
++ const PDF_CACHE_DIR = FILES_CACHE_DIR;
+
+
+─── apps/mobile/src/openbot/private-state.ts:200-203 ───
+[maintainability · medium] 后缀集合 {_cookie, _session_data} 与 8 个 .N 分片上限（约 14 KB jar）是对 Better Auth
+Expo 插件内部键命名与分片行为的双重假设：一旦 cookie jar 超限产生 .8
+及之后的分片键，或插件版本调整命名规则，这些私有键将游离于候选清单之外，清空时被静默遗漏——SecureStore
+本身无法枚举，事后也无从发现。建议至少把分片上限提为具名常量并注明其依据的插件版本，理想方案是在测试中用真实插件写入行为校验该假设，或随插件升级提供可枚举 API 时替换这套推导。
+
++ /** 与 @better-auth/expo 的分片行为对齐；插件升级时需重新确认。 */
++ const MAX_COOKIE_CHUNKS = 8;
++ 
+      for (const suffix of ["_cookie", "_session_data"]) {
+        names.push(`${prefix}${suffix}`);
+-       for (let i = 0; i < 8; i++) names.push(`${prefix}${suffix}.${i}`);
++       for (let i = 0; i < MAX_COOKIE_CHUNKS; i++) names.push(`${prefix}${suffix}.${i}`);
+      }
+
+
+─── apps/mobile/src/openbot/private-state.ts:127-133 ───
+[bug · medium] readDirectoryAsync 的任何异常都被当作"目录不存在"吞掉，瞬态 IO 错误与目录缺失不可区分：一次瞬时故障会让枚举静默返回空列表，sweep 无声退化为
+no-op，调用方拿到 failedDeletes=[] 会误判"已清空"。这与 deleteAsync 失败进入 failedDeletes
+的可观测设计不一致，在共享设备场景下会掩盖隐私残留。建议按错误码区分"目录不存在"与其他失败，或将枚举阶段失败同样上报到返回报告/日志。
+
+    let names: string[];
+    try {
+      names = await fs.readDirectoryAsync(dir);
+-   } catch {
+-     // Absent or unreadable directory: nothing lives there to clear.
++   } catch (e) {
++     // 仅目录不存在可静默跳过；其余失败需上报，避免瞬态错误让 sweep 无声失效。
++     if (!isDirectoryNotFound(e)) throw e;
+      return;
+    }
+
+
+─── apps/mobile/src/openbot/private-state.ts:174-180 ───
+[performance · low] 这些文件删除彼此独立，逐个 await 串行执行；SecureStore 键删除循环与 collectFiles 中逐个 await 的 infoAsync
+同理。按异步规范，独立操作可用 Promise.all 并行，在包含大量缓存文件的目录下能明显缩短登出清空的耗时。
+
+-     for (const path of await pdfCachePaths(fileSystem)) {
+-       try {
+-         await fileSystem.deleteAsync(path, { idempotent: true });
+-       } catch {
+-         failedDeletes.push(path);
+-       }
+-     }
++     const paths = await pdfCachePaths(fileSystem);
++     const results = await Promise.allSettled(
++       paths.map((path) => fileSystem.deleteAsync(path, { idempotent: true })),
++     );
++     results.forEach((result, i) => {
++       if (result.status === "rejected") failedDeletes.push(paths[i]);
++     });
+
+
+─── apps/mobile/src/openbot/private-state.ts:121-123 ───
+[maintainability · low] 该 joinUri 与 file-cache.ts:51-53 的实现逐字重复（同样的endsWith("/")三元拼接）。两个模块都是无
+react-native/expo 静态依赖的纯模块，可安全互相导入；建议由 file-cache.ts 导出该辅助函数供本模块复用（可与已确认的 FILES_CACHE_DIR
+常量共享一并处理），避免后续第三个消费方出现时再复制一份，分叉后两模块对同一路径的拼接行为可能不一致。
+
+- function joinUri(dir: string, name: string): string {
++ // file-cache.ts:
++ export function joinUri(dir: string, name: string): string {
+    return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
+  }
++ 
++ // private-state.ts:
++ import { joinUri } from "./file-cache";
+
+
+─── apps/mobile/src/openbot/private-state.ts:169-170 ───
+[maintainability · low] removedKeys 语义失真：生产适配器的 keys() 固定返回全部派生候选（每前缀 2 个基础键 + 16 个 .N
+分片），其中绝大多数并不存在；deleteItemAsync 对缺失键是本文件自述的 no-op，但键仍被无条件计入 removedKeys。NativeClearReport 自述记录 "What
+clearNativePrivateState did"，按此契约调用方/审计方无法区分"实际清除的键"与"本就不存在的候选键"（登出审计或后续重试调用方会被误导）。建议仅收录确认存在的键：给
+SecureStoreLike 增加可选的存在性探测（如 getItemAsync/containsKeyAsync，注入的测试桩可如实返回），或在报告/注释中明确 removedKeys 实为
+attemptedKeys。
+
++ for (const key of secureStore.keys()) {
++   if (!isNativePrivate(key)) continue;
++   // 仅在适配器能确认键存在时才计入 removedKeys（注入桩可如实枚举；
++   // 原生适配器可用 getItemAsync 探测存在性）。
++   if (secureStore.hasItemAsync && !(await secureStore.hasItemAsync(key))) continue;
+-       await secureStore.deleteItemAsync(key);
++   await secureStore.deleteItemAsync(key);
+-       removedKeys.push(key);
++   removedKeys.push(key);
++ }
+

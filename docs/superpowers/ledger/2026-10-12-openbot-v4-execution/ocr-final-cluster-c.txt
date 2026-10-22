@@ -1,0 +1,722 @@
+# ocr-openbot-final split — cluster C: tasks / finance / documents / files
+# source: ocr-openbot-final.txt (42 findings)
+# repo: /Users/wuyongjun/trea/OpenBot/.worktrees/v4-base (branch v4/openbot-exec)
+
+─── server/src/openmuse-documents/routes.ts:170-173 ───
+[bug · medium] fill 路由自带的 1,000,000 字节 bodyLimit 在生产挂载下不可达:app.ts:1913 先把 mobile-bff 挂到
+/api/mobile(其 routes.ts:75 注册 routes.use("*", bodyLimit({ maxSize: 8_192 }))),app.ts:1981 才把本路由挂到
+/api/mobile/openmuse-files——按 Hono 注册顺序,家族 8KB 限制先于本路由的终态处理器执行,>8KB 的 fill body 会先收到家族限制的通用
+413。后果:(a) 本模块允许单字段 10,000 字符(§5),两个字段的长文本合法填表(约 20KB)会被 8KB 家族限制拒绝,与自身预算矛盾;(b)
+OPENMUSE_MAX_FILL_BODY_BYTES 及其自定义 413 文案成为死代码。app.ts:1978 注释只说明 body-less 的 inspect 不受家族限制影响,反证
+fill/transfer 确实被它包裹。建议像 openMuseFiles 子应用那样把本路由挂载到家族限制之前(mobile-bff 内、routes.use("*", bodyLimit)
+之前),或承认 8KB 现实并同步缩小常量与注释。
+
+─── server/src/openmuse-documents/transfer.ts:58-58 ───
+[bug · medium] MAX_LEDGER_ENTRIES=5000 的"体积余量"论断与接缝真实上限矛盾:按 2 空格缩进序列化,单条目约 300–600 字节(transferKey
+路由侧上限即 200 字符,versionId/fileId/path 各数十字节),5000 条约 1.5–3MB,远超 transfer.ts 头部注释自己引用的工作区写上限 1,000,000
+字节;更要命的是同一 WorkspaceLimits 的文本读上限仅 64,000 字节(agent-computer
+DEFAULT_WORKSPACE_LIMITS.readBytes,读超限即截断)——台账超过约 150–200 条后 read 返回截断的 JSON,readLedger 解析失败降级为空,下一次
+ledgerBytes 会用仅含当前条目的新台账整体覆写,静默清空全部重放历史;逼近写上限后每次传输的台账写都失败,成功路径进 catch 删工件并
+503,正是注释声称要避免的"一次膨胀导致所有后续传输永久失败"。建议按最小接缝上限(64KB 读)估算条目上界(数百条量级)或压缩条目格式,并修正注释的算术。
+
+- const MAX_LEDGER_ENTRIES = 5_000;
++ /**
++  * The bound must fit the seam's SMALLEST cap, not the write cap: the
++  * workspace text read truncates at 64,000 bytes, and one entry serializes to
++  * roughly 300-600 bytes (transferKey alone is up to 200 characters). Past a
++  * few hundred entries a truncated read degrades to an empty ledger and the
++  * next write erases every replay record; past the 1,000,000-byte write cap
++  * every future transfer's ledger write fails and the transfer wedges on 503.
++  */
++ const MAX_LEDGER_ENTRIES = 200;
+
+─── server/src/openmuse-documents/routes.ts:114-125 ───
+[bug · medium] onError 把所有未识别异常一律归为 503"稍后再试",但加载守卫只覆盖 PDFDocument.load 阶段:createPdfFieldExtractor 的
+doc.getForm()/getFields() 与 fill 适配器的
+getTextField().setText()/getCheckBox().check()/doc.save()(pdf-lib 默认重算字段外观)在畸形
+AcroForm(加载可通过、字段遍历/外观更新/保存才失败)上会抛 pdf-lib 原生错误,未被包装成 PdfRefusalError,最终落到这里——本属 400
+的文档问题被当作服务端故障记录,并诱导客户端对永远不可能成功的请求重试。另外日志只记 error.name,丢失 message/stack,排障信息不足。建议:将提取/填充阶段的意外异常归类为
+pdf_malformed(422/400),并记录 message 与 stack。
+
+      log.error(
+        {
+          type: "openmuse-documents-route-error",
+-         error: error.name,
++         error:
++           error instanceof Error ? `${error.name}: ${error.message}` : error,
++         stack: error instanceof Error ? error.stack : undefined,
+          context: { route: context.req.path },
+        },
+        "openmuse-documents-route-error",
+-     );
+-     return context.json(
+-       { error: "Documents are unavailable right now. Try again." },
+-       503,
+      );
+
+─── server/src/openmuse-documents/transfer.ts:190-191 ───
+[bug · low] 窄竞态:两个不同 transferKey 对同一 fileId+versionId 并发 transfer,会在彼此写入前列举 taken 而派生出同一个
+`<versionId>-1.pdf`;后完成方若工件写成功而台账写失败,进入此 catch 执行 remove(path),会删除先完成方已记 complete 的共享工件——其后的 replay
+将返回一个磁盘上已不存在的路径。建议 remove 前确认没有其他 complete 条目占用同一路径(或让派生路径掺入 transferKey 派生后缀)。另注:工作区 list 有 500
+条截断(listEntries),"截断列表也不会导致覆盖"的注释对台账之外、截断窗口之外的 Bot 同名文件并不成立。
+
++     const pathHeldByOtherComplete = Object.entries(ledger).some(
++       ([key, entry]) =>
++         key !== transferKey &&
++         entry.status === "complete" &&
++         entry.path === path,
++     );
++     if (!pathHeldByOtherComplete) {
+-     await filesystem.remove(path).catch(() => {});
++       await filesystem.remove(path).catch(() => {});
+-     ledger[transferKey] = { fileId, versionId, path, status: "failed", at };
++     }
+
+─── server/src/openmuse-documents/fill.ts:55-55 ───
+[security · low] typed 用普通对象字面量承载攻击者可控的字段名:上传 PDF 的 AcroForm 字段名可以是 "__proto__",validateFill 通过后
+`typed[name] = value` 触发的是原型 setter 而非自有属性赋值,该字段被静默丢弃(201 响应的 values 中也缺失,客户端无从察觉)。同批次 transfer.ts 的
+readLedger 已用 Object.create(null) 防御同一问题("a transferKey like '__proto__' must be an ordinary
+key"),此处应保持一致。
+
+-   const typed: TypedPdfFillValues = {};
++   const typed = Object.create(null) as TypedPdfFillValues;
+
+─── server/src/openmuse-documents/routes.ts:55-59 ───
+[maintainability · low] 用户可见消息硬编码了 inspect.ts 的 MAX_PDF_PAGES=500,双处维护:调整页数上限时此消息会失真。建议导入常量引用。
+
+      case "pdf_too_many_pages":
+        return {
+          status: 422,
+-         error: `This PDF has ${error.pageCount} pages; the limit is 500.`,
++         error: `This PDF has ${error.pageCount} pages; the limit is ${MAX_PDF_PAGES}.`,
+        };
+
+─── server/src/openmuse-documents/routes.ts:210-217 ───
+[bug · low] 空 values 对象可通过校验:validateFill 返回 {} 后 applyFill 仍完整加载并保存(pdf-lib 默认重算字段外观),随后
+appendVersion 落一条与父版本等价的新版本行——徒增版本噪声并扩大 stale-parent 409 的竞争面。建议要求至少一个字段值,空对象直接 400。
+
+        const values = (body as { values?: unknown } | null)?.values;
+        if (
+          typeof values !== "object" ||
+          values === null ||
+-         Array.isArray(values)
++         Array.isArray(values) ||
++         Object.keys(values).length === 0
+        ) {
+          return context.json({ error: "The fill needs a values object." }, 400);
+        }
+
+─── server/src/openmuse-documents/inspect.ts:12-12 ───
+[maintainability · low] PDF 尺寸常量定义在 openmuse-files/routes.ts(路由文件)中,被本模块(inspect.ts、documents
+routes.ts)跨模块导入,模块间形成了对路由文件的依赖,常量宜下沉到共享层(如 openmuse-files/store 或独立常量模块)。另外 loadPdfDocument 中 new
+Uint8Array(bytes) 会对最大 10MiB 的入参再整拷贝一份,而 bytes 已来自 byteStore 的独占读取,pdf-lib 亦不修改入参,防御性收益有限,叠加
+Buffer.from(subarray) 的头部拷贝,大 PDF 每次检查/填充多耗一份内存,可考虑直接传原引用。
+
+─── server/src/openmuse-files/store.ts:702-713 ───
+[security · high] [high] `versionsByOwner` 过滤 `isNull(deletedAt)`,而它唯一的服务对象是
+`enumerateOwner`(删除清单的枚举源)。F03 删除是墓碑式:字节刻意保留、注释明确写 "D06's deletion manifest owns the physical
+purge"。但若用户先删文件(墓碑)、再触发账号删除,这些文件的 externalKey 不会进入 manifest;D06 的 purge 只遍历 manifest 资源行(purge.ts
+`listResources`),D08 也没有 openmuse-file 接缝——结果是墓碑文件的字节 blob
+与含个人元数据的行在账号删除完成后永久残留(部署前提是本地字节根无清扫任务),违背删除保证。修复:`versionsByOwner` 只被 `enumerateOwner` 消费,直接去掉
+`deletedAt` 过滤即可让墓碑文件进入清除范围。
+
+-         .from(openmuseFileVersions)
+-         .innerJoin(
+-           openmuseFiles,
+-           eq(openmuseFileVersions.fileId, openmuseFiles.id),
+-         )
+-         .where(
+-           and(
+-             eq(openmuseFiles.ownerUserId, ownerUserId),
+-             isNull(openmuseFiles.deletedAt),
+-           ),
+-         )
+-         .orderBy(desc(openmuseFileVersions.createdAt));
++         .where(eq(openmuseFiles.ownerUserId, ownerUserId))
+
+─── server/src/openmuse-files/store.ts:733-740 ───
+[bug · medium] [medium] `hardDeleteFile` 先删 versions 再删 file 行,两条语句未包事务,与本文件 `insertFileWithVersion`
+"有行无版本即毒行" 的原子性原则自相矛盾。失败窗口的后果不止暂时的:若在两步之间失败且 manifest 随后被重建(模块 gap 的既定恢复路径),`enumerateOwner` 经
+`versionsByOwner` 的 versions→files 联查将枚举不到这个只剩 file 行的文件,purge 的两个阶段都只遍历 manifest
+资源行,该元数据行将永久逃过清除(与账号删除的清除保证冲突)。建议与 `insertFileWithVersion` 同样包进 `database.transaction`。
+
+-       await database
+-         .delete(openmuseFiles)
+-         .where(
++       await database.transaction(async (tx) => {
++         await tx.delete(openmuseFileVersions).where(
++           inArray(
++             openmuseFileVersions.fileId,
++             tx.select({ id: openmuseFiles.id }).from(openmuseFiles).where(
++               and(
++                 eq(openmuseFiles.ownerUserId, ownerUserId),
++                 eq(openmuseFiles.id, fileId),
++               ),
++             ),
++           ),
++         );
++         await tx.delete(openmuseFiles).where(
+            and(
+              eq(openmuseFiles.ownerUserId, ownerUserId),
+              eq(openmuseFiles.id, fileId),
+            ),
+          );
++       });
+
+─── server/src/openmuse-files/store.ts:481-484 ───
+[bug · medium] [medium] "stale-parent" 并发契约实际未被强制:这里是先 `latestVersion` 再 `byteStore.put` +
+`insertVersion` 的非原子 check-then-act,而 `parentVersionId`/`values` 未持久化(schema 中
+`openmuse_file_versions` 无对应列),DB 层也无唯一约束兜底。两个并发 fill 可同时通过校验并双双落库、双双返回 201,后写者按 `createdAt` 胜出,先到
+fill 的字节被静默遮蔽——documents/routes.ts 中 "the loser wrote nothing (the store refused)" 的注释在此竞态下不成立。建议持久化
+`parent_version_id` 并加 `(file_id, parent_version_id)` 唯一索引(或改单条条件 INSERT),让输家在 DB 层失败后回退为
+"stale-parent"。
+
++       // DB 兜底(需迁移):持久化 parent_version_id 后以
++       // UNIQUE (file_id, parent_version_id) 让并发输家在插入时失败,
++       // catch 中返回 "stale-parent",兑现上述并发契约。
+        const latest = await rows.latestVersion(input.fileId);
+        if (latest === null || latest.versionId !== input.parentVersionId) {
+          return "stale-parent";
+        }
+
+─── server/src/openmuse-files/store.ts:380-381 ───
+[performance · medium] [medium] N+1:`list` 对每行调用 `dtoOf`,后者各自触发一次 `rows.latestVersion`,一页最多发出
+limit+1 次查询(默认 25、上限 100)。虽有 `openmuse_file_versions_file_idx` 索引兜底,但这仍是移动 BFF
+主列表路径上随页大小线性放大的查询数。建议在行接缝增加批量方法(如 `latestVersionsForFileIds(ids)`,SQL 用 `DISTINCT ON (file_id) ...
+ORDER BY file_id, created_at DESC`)一次取回,`list` 内联组装 DTO。
+
+        const stored = await rows.listByOwner(ownerUserId, options);
+-       return { files: await Promise.all(stored.map(dtoOf)) };
++       const latest = await rows.latestVersionsForFileIds(
++         stored.map((file) => file.id),
++       );
++       return {
++         files: stored.map((file) =>
++           dtoOfWithVersion(file, latest.get(file.id)),
++         ),
++       };
+
+─── server/src/openmuse-files/routes.ts:147-151 ───
+[bug · low] [low] 上传分支对 `part.name` 只校验 1-255 长度,未套用 PATCH /:id rename 中拒绝路径分隔符与 `\0` 的同一
+refine,同一字段两条路径规则不一致。尤其 `\0`:校验发生在 `byteStore.put` 之前才能避免 "字节已落盘、行插入因 NUL 失败" 留下孤儿 blob 并向客户端返回误导性
+503;统一在解析处应用与 rename 相同的规则即可同时消除两分支漂移。
+
+        const name = z
+          .string()
+          .min(1, "The file needs a name.")
+          .max(255)
++         .refine(
++           (value) => !/[\\/]/.test(value) && !value.includes("\0"),
++           "The name may not contain path separators.",
++         )
+          .parse(part.name.trim());
+
+─── server/src/openmuse-files/routes.ts:162-167 ───
+[maintainability · low] [low] `%PDF-` 魔数判定在 upload(`every` 全等)与 gmail 导入(取反 `some`
+加长度检查)两处重复实现且写法不一致,日后易漂移(如有人只改其中一处的长度判断)。建议抽取共享 helper,两处复用。
+
+-       const isPdf =
+-         mimeType === PDF_MIME ||
+-         (bytes.length >= PDF_MAGIC.length &&
+-           bytes
+-             .subarray(0, PDF_MAGIC.length)
+-             .every((byte, index) => byte === PDF_MAGIC[index]));
++ function hasPdfMagic(bytes: Uint8Array): boolean {
++   return (
++     bytes.length >= PDF_MAGIC.length &&
++     PDF_MAGIC.every((byte, index) => bytes[index] === byte)
++   );
++ }
+
+─── server/src/openmuse-files/routes.ts:306-306 ───
+[bug · low] [low] ETag 为裸值 `sha256:...`,RFC 7232 要求 entity-tag
+带双引号;仓库内既有惯例也都是带引号的(channels/attachments.ts 的 `\"${id}\"`、openmuse-mail/routes.ts 的
+`\"${answer.sha256}\"`)。严格缓存/代理在 If-None-Match 再验证时可能无法与裸值匹配,建议对齐惯例加引号。
+
+-         ETag: `sha256:${owned.versionSha256}`,
++         ETag: `"sha256:${owned.versionSha256}"`,
+
+─── server/src/openmuse-documents/routes.ts:242-247 ───
+[bug · medium] 此分支的 409 语义依赖 appendVersion 的 check-then-insert
+具有原子性,但该保证并不成立:openmuse-files/store.ts 的 insertVersion 是普通 INSERT,schema 中 openmuse_file_versions 仅有
+versionId 主键(parentVersionId 列尚未落库,更无 (fileId, parent_version_id) 唯一约束),latestVersion 只是 ORDER BY
+createdAt DESC LIMIT 1。两个并发 fill 可以都在对方 insert 前读到同一 latest 而双双落库——恰恰造成本注释声称已避免的版本链分叉(双方都收到
+201);分叉后文件的"当前版本"(latestVersion 无次级排序键)在两条记录间不确定,后续 fill 携带的 parentVersionId 随之漂移,409
+机制对真正并发的场景失效。建议在 store 侧以唯一部分索引或事务内 CAS 兜底(唯一冲突转译为 "stale-parent"),并为 latestVersion 增加
+tiebreaker;至少应修正此处注释,勿再声称 "the store refused"。
+
+        if (version === "stale-parent") {
+          /*
+-          * The append lost the race: another fill landed between this route's
+-          * read and its append. The loser wrote nothing (the store refused), so
+-          * the answer names the fork rather than silently creating one.
++          * The append lost a race that had already committed. Note: two fills
++          * whose appends overlap in flight can BOTH land (the store's
++          * latest-check and insert are not atomic and carry no unique
++          * constraint on the parent chain), silently forking the version chain
++          * this answer claims to prevent.
+           */
+
+─── server/src/openmuse-documents/routes.ts:190-200 ───
+[bug · low] 尺寸护栏读取的是 owned.file.size,但 store 的 appendVersion 只写版本行、从不更新文件行的 size(该值恒为首次上传大小)。pdf-lib
+保存时会重算字段外观,一次成功的 fill 完全可能产出超过 10MiB 的派生版本并成为 latest:此后 inspect/fill/transfer 会通过这里的 413
+检查(元数据仍是旧尺寸),随后 loadPdfDocument 内部的 bytes.length > OPENMUSE_MAX_PDF_BYTES 分支抛 pdf_malformed,客户端收到
+400 "That file is not a readable PDF." 而非 413——状态码与文案双重误导,且这个超限的 latest 版本从此无法再被本流程打开。建议在
+owned.read() 之后按实际字节数(bytes.byteLength)做同一护栏(三处路由同样处理),并在 append 侧为派生字节设置上限。
+
+─── server/src/openmuse-documents/routes.ts:114-121 ───
+[maintainability · low] 兜底日志只记录 error.name,丢掉了 message 与堆栈。本 onError 把一切未识别异常统一归为 503
+"稍后再试",这条日志是唯一的故障现场:pdf-lib 在 getFields() 遍历、字段外观重算或 doc.save() 阶段抛出的原生错误(畸形
+AcroForm)在这里只剩一个错误类名,线上无从定位。建议直接传入 error 对象(pino 会序列化 message 与 stack),或至少附上 message 与 stack 字段。
+
+      log.error(
+        {
+          type: "openmuse-documents-route-error",
+-         error: error.name,
++         error,
+          context: { route: context.req.path },
+        },
+        "openmuse-documents-route-error",
+      );
+
+─── server/src/openmuse-files/store.ts:485-490 ───
+[security · medium] fill 版本追加完全绕过聚合配额,且被取代的旧版本 blob 永不清理:`sumBytesByOwner` 只统计
+`openmuse_files.size`(原始上传大小),`appendVersion` 每次追加 ≤10 MiB 的新版本字节落盘,追加次数无上限。上方文档声称 "bounded by the
+PDF ceiling per version"——那只限定单个版本,不限定总量,与 `OpenMuseFileQuotaError` 文档承诺的 "this bounds the owner's
+total stored bytes" 自相矛盾:用户上传一个 10 MiB PDF 后可无限次触发 fill,把配额声称要保护的本地 byte root 逐一塞满。建议:为版本行增加 size
+并纳入配额统计,或对单文件版本数/版本总字节设上限,或在新版本落库后清理被取代的旧版本。
+
+-       const versionId = randomUUID();
+-       const bytePath = openMuseFileByteKey(
+-         input.ownerUserId,
+-         input.fileId,
+-         versionId,
+-       );
++       // Count version bytes toward the owner quota (add a size column to
++       // openmuse_file_versions and include it in sumBytesByOwner), or prune
++       // superseded versions once a new one lands.
+
+─── server/src/openmuse-files/routes.ts:379-379 ───
+[security · medium] `POST /import/gmail-attachment`(以及同样解析 JSON 的 `PATCH /:id`)没有
+bodyLimit,`context.req.json()` 会把请求体全量缓冲进内存后才被 zod 拒绝。本仓库路由模块的既有惯例都是显式设限(mobile-bff 8
+KiB、openmuse-tasks 64 KiB、delivery 64 KiB、responsibilities 64 KiB 等),且 app.ts/index.ts 无全局 body
+limit。已认证用户向该路由发送超大 body 即可造成服务端内存耗尽。建议为两条 JSON 路由分别加小容量 bodyLimit;上传路由的 20 MiB+64 KiB 限制保持不变。
+
+-   routes.post("/import/gmail-attachment", async (context) => {
++   routes.post(
++     "/import/gmail-attachment",
++     bodyLimit({ maxSize: 64 * 1024 }),
++     async (context) => {
+
+─── server/src/openmuse-files/store.ts:535-537 ───
+[maintainability · low] 行接缝的 `insertFile`(接口声明与 drizzle 实现都在,但全仓库无任何调用点)是死代码——store 一律走
+`insertFileWithVersion`。保留它不仅无人使用,还提供了一个绕过 "file+version 必须原子写入" 注释契约的单条插入入口,未来调用者可能借此复现 "有行无版本"
+的毒行。建议从 `OpenMuseFileRows` 接口与 `createOpenMuseFileRows` 中一并删除。
+
+─── server/src/openmuse-files/store.ts:307-313 ───
+[security · low] 配额检查是原子的 check-then-act:`sumBytesByOwner` 检查通过后,到 `insertFileWithVersion`
+提交之间没有任何锁或数据库约束兜底(部分唯一索引只防同 key 重复,不防不同 key 并发)。N 个并发携带不同 Idempotency-Key 的上传可同时通过该检查,合计超出
+`quotaBytes` 约 N×20 MiB——有界但真实,在 "本地 byte root 无 sweeper"
+的部署前提下值得注意。建议在插入事务内重查总量后再写入,或至少注释记录这个有界超额是接受的。
+
+─── server/src/openmuse-files/routes.ts:485-486 ───
+[bug · low] 导入路径的文件名不受 upload(`max(255)`)与 rename(`max(255)` + 拒绝 `[\\/]`/`\0`
+refine)同款规则约束,而这里的名字来自邮件附件元数据、可被邮件发件人控制:`metadata.name` 未做分隔符/NUL 清理,含 NUL 的名字会在字节已落盘之后令 Postgres
+text 插入失败(0x00 不被允许),留下孤儿 blob 并向客户端返回误导性 503;此外兜底名 `gmail-${attachmentId}.pdf` 最长可达 6+255+4=265
+字符,超出本路由其余所有路径强制的 255 上限(attach的 `slice(0, 255)` 只约束了 vendor 名分支)。建议在存储前对名字套用与 rename
+相同的清理规则,并对兜底名同样截断到 255。
+
+-     const name =
+-       metadata.name.trim().slice(0, 255) || `gmail-${attachmentId}.pdf`;
++     const safeName = metadata.name
++       .trim()
++       .replace(/[\\/\0]/g, "")
++       .slice(0, 255);
++     const name = safeName || `gmail-${attachmentId}.pdf`.slice(0, 255);
+
+─── server/src/openmuse-finance/csv.ts:102-103 ───
+[bug · medium] 解析循环通过 `row.some((v) => v.trim())` 静默跳过整行空白（含 `,,` 这类全空单元格行），因此下方 `index + 2`
+是过滤空行后的数据行下标，而非 CSV 物理行号。当文件中部存在空行时，报出的 "Row N" 会小于真实物理行号，违反文件头注释承诺的 "refused with the offending CSV
+line number (header = line 1)" 契约。调用方 server/src/openmuse-tasks/runner.ts:1028-1060 会把该错误消息直接写入任务
+evidence、step result 和用户通知，用户按提示行号将定位到错误的行。建议在解析循环内维护物理行计数器（每遇引号外的 `\n` 递增），rows
+入栈时一并记录行号，报错时使用物理行号。
+
+-     if (r.length !== header.length)
+-       throw new Error(`Row ${index + 2} has the wrong number of columns`);
++   let physicalLine = 1;
++   // 解析循环内，引号外换行时：if (c === "\n") physicalLine++;
++   // 入栈时记录物理行号：rows.push({ cells: row, line: physicalLine });
++   // 校验处改用：
++   if (r.cells.length !== header.length)
++     throw new Error(`Row ${r.line} has the wrong number of columns`);
+
+─── server/src/openmuse-finance/csv.ts:42-43 ───
+[bug · low] `csv.length` 是 JS 字符串的 UTF-16 码元数（即字符数），而非字节数。描述/分类常含多字节字符（如中文，每字符 3 字节 UTF-8），此时 50
+万字符的输入实际可达约 1.5 MB，与注释声明的 "at most 500 KB" 口径不符；且 openmuse-files 存储层未见补充的字节级大小限制。可改用
+`Buffer.byteLength(csv, "utf8")` 按字节校验，或将注释措辞调整为字符数口径。
+
+-   if (csv.length > 500000)
++   if (Buffer.byteLength(csv, "utf8") > 500000)
+      throw new Error("Import at most 500 KB of transaction CSV");
+
+─── server/src/openmuse-finance/csv.ts:85-91 ───
+[maintainability · low] ["date", "description", "amount", "category"] 字面量在第 79-80 行与第 85-87
+行重复硬编码两处，且 `get()` 内对每行每列重复执行 `header.indexOf(name)`（5000 行 × 4 列的冗余线性查找）。建议提取模块级 `REQUIRED_COLUMNS`
+常量，并在表头校验后预计算"列名 -> 下标"映射供 `get` 直接查表，消除重复代码与逐行查找。
+
+-   if (
+-     !header ||
+-     !["date", "description", "amount", "category"].every((v) =>
+-       header.includes(v),
+-     )
+-   )
+-     throw new Error("CSV needs date,description,amount,category columns");
++ const REQUIRED_COLUMNS = [
++   "date",
++   "description",
++   "amount",
++   "category",
++ ] as const;
++ // 表头校验后预计算一次：
++ const columnOf = new Map(REQUIRED_COLUMNS.map((n) => [n, header.indexOf(n)]));
++ const get = (name: string) => r[columnOf.get(name) ?? -1]?.trim() ?? "";
+
+─── server/src/openmuse-finance/csv.ts:135-137 ───
+[documentation · low] 注释断言 "a Record keeps that insertion order, so the artifact's keys read in
+spending priority"，但当分类名是纯数字字符串（如 "2024"）时，该键属于 ES 规范的类整数键，JSON.stringify
+时会被排在所有字符串键之前，键序不再遵循支出降序。仅影响报告键序展示，不影响数值正确性。建议修正注释说明该例外，或由消费方按 byCategory 值自行排序。
+
+-   const byCategory: Record<string, string> = {};
+-   for (const [name, cents] of [...grouped].sort((a, b) => b[1] - a[1]))
+-     byCategory[name] = money(cents);
++   // Prior art's category order: biggest expense first. A Record keeps that
++   // insertion order for string keys; note that purely numeric category names
++   // (e.g. "2024") are integer-like keys and sort ahead of them, so key order
++   // is not guaranteed for those.
+
+─── server/src/openmuse-finance/csv.ts:135-137 ───
+[bug · medium] category 名来自 CSV 用户输入,却直接作为普通对象字面量的键写入。当分类名恰为 "__proto__" 时,`byCategory[name] = ...`
+会命中 Object.prototype 上继承的 `__proto__` setter;由于写入值是字符串(非对象/null),该赋值按规范被静默忽略,此分类不会成为自有属性——其金额仍计入
+spending 总额,却从 byCategory 报告中消失,导致 byCategory 各项之和与 spending 不一致,财务报告自相矛盾。建议改用
+`Object.fromEntries(...)`(内部走 CreateDataProperty,"__proto__" 会成为普通自有属性)或用 `Object.create(null)`
+构建对象。
+
+-   const byCategory: Record<string, string> = {};
+-   for (const [name, cents] of [...grouped].sort((a, b) => b[1] - a[1]))
+-     byCategory[name] = money(cents);
++   const byCategory: Record<string, string> = Object.fromEntries(
++     [...grouped]
++       .sort((a, b) => b[1] - a[1])
++       .map(([name, cents]) => [name, money(cents)]),
++   );
+
+─── server/src/openmuse-finance/csv.ts:113-115 ───
+[bug · medium] 这是文件中唯一缺少行号前缀的逐行校验错误:同层的 "Row N has the wrong number of columns" 和 "Row N needs an
+ISO date..." 都带位置信息,且文件头注释承诺 "refused with the offending CSV line number (header = line
+1)"。该分支可由合法格式的超大金额(如 999999999999.99,cents 溢出安全整数或 1e12 上限)触发,而调用方 runner.ts 会把错误消息原样写入任务
+evidence,用户无法定位出错的 CSV 行。建议补上与相邻校验一致的行号前缀;行号计算应与已确认的空行过滤/物理行号问题采用同一套物理行跟踪修复,保持契约一致。
+
+      const cents = Math.round(Number(amount) * 100);
+      if (!Number.isSafeInteger(cents) || Math.abs(cents) > 1e12)
+-       throw new Error("Transaction amount is out of range");
++       throw new Error(
++         `Row ${index + 2} transaction amount is out of range`,
++       );
+
+─── server/src/openmuse-tasks/runner.ts:2211-2217 ───
+[bug · high] [high] 已确认：sweep 循环没有 try/finally 保护，而 sweepOnce 里只有 queue.claim 在逐项 try 之外。第 1 轮
+begin() 持有槽位后，若第 2 轮 claim 因瞬时 DB 故障抛出，异常直接冒泡跳过 capacity.end() 释放循环；runner 在 index.ts:2712
+是进程级单例，taskWorkerCapacity 闭包的 running 永久偏高。外层 repeatAfterEach 的 catch 只防未处理拒绝，不补偿容量。DB 抖动累计
+maxWorkers 次（默认 4）后 claimLimit() 恒返回 0，该进程静默停止认领所有 OpenMuse 任务直至重启。建议用 finally 释放本次已持有的槽位。
+
++       try {
+-       for (;;) {
++         for (;;) {
+-         const began = await sweepOnce(report);
++           const began = await sweepOnce(report);
+-         held += began;
++           held += began;
+-         if (began === 0 || selfReoffered) break;
++           if (began === 0 || selfReoffered) break;
+-       }
++         }
++       } finally {
+-       for (let index = 0; index < held; index += 1) capacity.end();
++         for (let index = 0; index < held; index += 1) capacity.end();
++       }
+        return report;
+
+─── server/src/openmuse-tasks/routes.ts:121-125 ───
+[bug · medium] [medium] 已确认：拓扑剥离对重复的 dependsOn 条目（如 ["a","a"]）计数错误——unmet 用 Set 折叠重复项，但 dependents
+按条目重复登记，剥完依赖后同一步会被 push 两次，peeled 超过 steps.length，合法无环 plan 被误判为 "Plan steps must not form a cycle."
+返回 400；反向场景（环 + 足量重复条目）还可能掩盖真环。zod 的 dependsOn 数组不约束唯一性，客户端可直接触发。建议利用 delete() 的布尔返回值，仅在真实转移时入队。
+
+      for (const dependent of dependents.get(id) ?? []) {
+        const dependencies = unmet.get(dependent);
+-       dependencies?.delete(id);
+-       if (dependencies?.size === 0) frontier.push(dependent);
++       // Push on the real transition only: a duplicated dependsOn entry
++       // deletes false the second time and must not re-enqueue the step.
++       if (dependencies?.delete(id) && dependencies.size === 0)
++         frontier.push(dependent);
+      }
+
+─── server/src/openmuse-tasks/store.ts:747-755 ───
+[bug · medium] [medium] 已确认：insertTask 成功后 queue.offer 抛错会落入同一个 catch，按幂等键重读必然命中刚插入的行，误判为幂等重放并返回
+created=false——路由据此返回 200，但队列中并无该项；由于 runner 只从队列 claim、且不存在对账扫描（T10 checkpoint 明确未建
+poll-sweep），任务永久停留在 queued 无人执行。无幂等键时则 500 但行已落库同样滞留。建议把 insert 与 offer 分成两段 try：仅 insert
+失败才做幂等重读，offer 失败如实上抛（或补偿清理该行），不得折叠进创建成功的语义。
+
++     try {
++       await deps.rows.insertTask(task);
++     } catch (error) {
++       // A concurrent insert with the same key wins; re-read and agree with it.
++       if (input.idempotencyKey !== null) {
++         const winner = await deps.rows.findTaskByIdempotencyKey(
++           input.ownerUserId,
++           input.idempotencyKey,
++         );
++         if (winner) return { task: winner, created: false };
++       }
++       throw error;
++     }
++     // Offer failure is NOT an insert conflict: the row exists now, so the
++     // catch above would misread it as an idempotent replay (created=false)
++     // while no queue item exists to ever claim the row. Surface it honestly
++     // (or compensate by removing the row) instead of reporting success.
+-       if (deps.queue)
++     if (deps.queue)
+-         await deps.queue.offer({
++       await deps.queue.offer({
+-           kind: OPENMUSE_TASK_KIND,
++         kind: OPENMUSE_TASK_KIND,
+-           key: task.id,
++         key: task.id,
+-           payload: { ownerUserId: task.ownerUserId },
++         payload: { ownerUserId: task.ownerUserId },
+-           ...(task.nextCheckAt ? { runAt: task.nextCheckAt } : {}),
++         ...(task.nextCheckAt ? { runAt: task.nextCheckAt } : {}),
+-         });
++       });
+-       return { task, created: true };
++     return { task, created: true };
+-     } catch (error) {
+
+─── server/src/openmuse-tasks/runner.ts:2060-2069 ───
+[bug · medium] [medium] 已确认（续接 offer 的系统性缺口，此处为代表性位置）：plan 下一步、monitor 重排（re-arm）、review 轮询的
+queue.offer 都在逐项 try 内——settle 已落库（行已 queued/scheduled）之后 offer 抛错会被外层 catch 吞掉只记
+skipped，行永远等不到下一次认领；store 侧 resumeTask/retryTask/answerWait 的 offer 抛错则已过 CAS（守卫保证只 re-offer 一次）→
+500 且无第二次机会。整个子系统没有对账扫描补偿，一旦发生即永久滞留。建议：offer 失败至少上抛为可观测信号（sweep 报告/日志告警），或为"非终态但无队列项"的行增加对账重挂路径。
+
+              if (landed && more) {
++               // A failed re-offer strands the row: it is already `queued`
++               // with no queue item and no reconciliation scan will find it.
++               // Surface the failure instead of letting the per-item catch
++               // swallow it into a silent skip.
+                await queue.offer({
+                  kind: OPENMUSE_TASK_KIND,
+                  key: `${task.id}:${crypto.randomUUID()}`,
+                  payload: {
+                    ownerUserId: task.ownerUserId,
+                    taskId: task.id,
+                  },
+                });
+              }
+
+─── server/src/openmuse-tasks/routes.ts:51-56 ───
+[bug · medium] [medium] 已确认：contains 类型只强制 source，selector 保持可选（T10 checkpoint 文档亦如此记录），但 runner 的
+normalizeObservation 对无 selector 的 contains 恒产出 "false"（注释自认 "no selector can never
+match"）——这类监控会照常按周期检查、提交观测、消耗队列，却永远不会触发 monitor.matched，用户拿到一个静默失效的监控且创建时无任何报错。建议在创建矩阵补上 selector
+必填（contains 类型），使无效配置在 400 处拦截，而非运行期黑洞。
+
+    if (
+      (condition.type === "contains" || condition.type === "change") &&
+      condition.source === undefined
+    )
+      return `A ${condition.type} condition needs its source.`;
++   // The runner's normalizer can never match a selector-less contains
++   // observation, so refusing it here beats a silently dead monitor.
++   if (condition.type === "contains" && condition.selector === undefined)
++     return "A contains condition needs its selector.";
+    return null;
+
+─── server/src/openmuse-tasks/routes.ts:371-373 ───
+[bug · low] [low] 已确认（两点）：① 该计数与 store.create 的插入不在同一事务，并发创建可轻微突破
+ACTIVE_TASKS_PER_USER=100（限额精度问题）；② 更重要的是该上限只在本 HTTP 路径检查——openmuse-personal/tools.ts 的
+task_delegate 工具直接调用 store.create，完全绕过此检查（当前未接线，属潜在缺口）。建议将 §10 row 5 的界限下沉到 store.create
+单一收口处（也便于后续做事务化/DB 端约束），而非依赖各调用方自觉。
+
++       // Note: this check-then-insert is not atomic (concurrent creates can
++       // slightly overshoot) and only guards the HTTP path — consider moving
++       // the bound into store.create as the single choke point.
+        if ((await deps.store.activeTasks(actor.id)) >= ACTIVE_TASKS_PER_USER) {
+          return context.json({ error: TASK_LIMIT_MESSAGE }, 409);
+        }
+
+─── server/src/openmuse-tasks/store.ts:1475-1481 ───
+[bug · low] [low] 已确认矩阵不一致：requestTaskCancel/requestTaskPause 对 waiting_input/waiting_review 一律
+409（"This Task can no longer be cancelled" 措辞也失真——该状态从来不可取消），而本处批量关闭会将同状态置为
+cancelled。后果：用户无法主动放弃一个等待其输入/审阅的任务，而这类任务计入 ACTIVE_TASKS_PER_USER，积累 100 个被弃置的 wait
+任务即可永久锁死该用户的任务创建额度。若无 §7 契约明文禁止，建议将 waiting_* 纳入单行取消矩阵（或在文档中记录该取舍）。
+
+              inArray(openmuseTasks.status, [
+                "queued",
+                "scheduled",
+                "paused",
+                "waiting_input",
+                "waiting_review",
+              ]),
++             // Note: shutdownOwner cancels waiting_* rows while the per-row
++             // requestTaskCancel matrix refuses them (409) — an abandoned
++             // wait can never be cancelled by its owner yet still counts
++             // against ACTIVE_TASKS_PER_USER. Reconcile the two matrices or
++             // record the deliberate trade-off against §7.
+
+─── server/src/openmuse-tasks/runner.ts:227-232 ───
+[bug · low] [low] 已确认：price_below 用"首个十进制数"启发式，带千分位分隔符的观测（如 "1,000.50"、"US$1,299.99"）会被截断解析为 1.00 /
+1.29，造成阈值误判（误匹配或漏匹配），且无任何告警。建议先剥离千分位分隔符（如 raw.replace(/,(?=\d{3}\b)/g,
+"")）再匹配，或在注释中明确声明该限制并让解析失败走既有错误路径。
+
+      case "price_below": {
+-       const found = raw.match(/-?\d+(?:\.\d+)?/);
++       // Strip thousands separators first: "1,000.50" must read as 1000.50,
++       // not truncate at the comma to 1.00.
++       const found = raw.replace(/,(?=\d{3}\b)/g, "").match(/-?\d+(?:\.\d+)?/);
+        if (found === null)
+          throw new Error("The observation carries no readable price.");
+        return { source, value: Number(found[0]).toFixed(2) };
+      }
+
+─── server/src/openmuse-tasks/runner.ts:807-815 ───
+[bug · medium] [medium] monitor 检查失败路径（catch）丢弃了落在检查期间的停止请求：成功路径（714-760 行）在安全边界读取
+after?.cancellationRequested / after?.pauseRequested 并落 cancelled/paused，而此 catch 直接把行 settle 回
+`scheduled` 并按退避重排。后果：用户对运行中 monitor 点了取消/暂停（API 已返回 200 requested、标志置
+true），只要该次检查抛错（超时/源不可达很常见），停止就被静默丢弃——监控分支在执行 scheduled 检查前从不读这两个标志，行会继续按退避周期（最长
+6h/次）反复访问外部源；只有当后续某次检查成功时停止才真正落地，源持续故障时永不落地，且期间行状态一直显示 scheduled/running，与"stop
+在安全边界生效"的契约注释（714-716 行）不符。建议 catch 中像成功路径一样先重读行并优先落 cancelled/paused（附失败证据），再做退避重排。
+
++             // T04/T05: 与成功路径同一边界语义——检查失败也是一个安全边界，
++             // 先消费落在此期间的停止请求，再做退避重排。
++             const after = await store.get(task.ownerUserId, task.id);
+              const streak = task.monitorFailureStreak + 1;
+              const next = new Date(
+                now().getTime() + backoffMinutes(streak) * 60_000,
+              );
++             const failureEvidence = [
++               {
++                 id: `${task.id}:observation:${dueAt.toISOString()}`,
++                 kind: "web" as const,
++                 title: "Check failed",
++                 excerpt: detail(error),
++               },
++             ];
++             if (after?.cancellationRequested || after?.pauseRequested) {
++               await store.settleTask(task.id, {
++                 ifAttempts: generation,
++                 status: after.cancellationRequested ? "cancelled" : "paused",
++                 monitorFailureStreak: streak,
++                 setEvidence: cappedEvidence(failureEvidence),
++               });
++               await finish();
++               report.skipped.push(item.key);
++               continue;
++             }
+              const landed = await store.settleTask(task.id, {
+                ifAttempts: generation,
+                status: "scheduled",
+                nextCheckAt: next,
+                monitorFailureStreak: streak,
++               setEvidence: cappedEvidence(failureEvidence),
++             });
+
+─── server/src/openmuse-tasks/runner.ts:1804-1809 ───
+[maintainability · low] [low] settle 证据里的 "Your request" 条目未做任何截断：agent 类任务的 prompt 由创建路由校验为最长
+20,000 字符，会整体写入 jsonb evidence（成功与失败路径各追加一次，重试后最多两份），而同文件所有其它证据写入都遵循 EXCERPT_MAX=2000
+的截断纪律（DETAIL_MAX 注释也声明"行只携带截断后的原因"）。建议与其它条目一致地 slice。
+
+                {
+                  id: `${task.id}:prompt`,
+                  kind: "user",
+                  title: "Your request",
+-                 excerpt: task.prompt ?? "",
++                 excerpt: (task.prompt ?? "").slice(0, EXCERPT_MAX),
+                },
+
+─── server/src/openmuse-tasks/store.ts:40-43 ───
+[maintainability · low] [low] `waiting_approval` 是死状态：全库检索显示 openmuse-tasks 的 store/runner/routes
+从不产出它（enterprise/craft 各有独立状态机，与此无关），但它会被 countActiveByOwner 计入活跃数（notInArray 只排除
+succeeded/failed/cancelled）、cancel/pause 矩阵对它返回 409、shutdownOwnerTasks
+的批量取消列表也不含它——一旦未来有生产者接入，这些矩阵缺口会立即显现。建议移除该成员，或注明 §7 保留且当前无生产者，并同步补齐各矩阵分支。
+
+  export type OpenMuseTaskStatus =
+    | "queued"
+    | "running"
+-   | "waiting_approval"
++   // "waiting_approval" 在 §7 目录中保留，但当前没有任何生产者写入该状态；
++   // 若未来接入，需同步补齐 countActiveByOwner、cancel/pause 矩阵与
++   // shutdownOwnerTasks 的分支。
++   | "waiting_input"
+
+─── server/src/openmuse-tasks/routes.ts:189-191 ───
+[maintainability · low] [low] taskDto 声称 "explicit fields, no row internals leak"，但 steps/evidence
+是整列原样透传，T06×T07 打上的内部 `attempt` 世代戳（retryTask 的 stampAttempt 写入）会随 API 响应泄露给客户端——它是 runner
+恢复启发式的内部簿记字段，不属于 §7 客户端契约。建议在 DTO 映射时剥离 attempt 字段，或修正注释说明其外泄是有意的。
+
+      attempts: task.attempts,
+-     steps: task.steps,
+-     evidence: task.evidence,
++     // 剥离 T06×T07 的内部世代戳，不随 §7 DTO 外泄。
++     steps: (task.steps as Array<Record<string, unknown>>).map(
++       ({ attempt: _attempt, ...step }) => step,
++     ),
++     evidence: (task.evidence as Array<Record<string, unknown>>).map(
++       ({ attempt: _attempt, ...row }) => row,
++     ),
+
+─── server/src/openmuse-tasks/store.ts:1183-1190 ───
+[maintainability · low] [low] updateTask 的 patch
+允许同时传入绝对值与追加值（steps+appendedSteps、evidence+appendedEvidence），此时对象字面量中后写的 `appended*`
+分支会静默覆盖前者——调用方以为在整体替换 jsonb，实际执行的是 `||` 追加，且无任何报错。当前调用方恰好没有同时传两者，但这是 rows seam
+上的一个互斥陷阱，建议显式互斥校验或在类型/注释中声明不可同传。
+
+-           ...(patch.steps
+-             ? { steps: sql`${JSON.stringify(patch.steps)}::jsonb` }
+-             : {}),
+-           ...(patch.appendedSteps
+-             ? {
+-                 steps: sql`${openmuseTasks.steps} || ${JSON.stringify(patch.appendedSteps)}::jsonb`,
+-               }
+-             : {}),
++     async updateTask(id, patch) {
++       // 绝对替换与 jsonb 追加互斥：同传会让后写分支静默覆盖前者。
++       if (patch.steps && patch.appendedSteps)
++         throw new Error("steps and appendedSteps are mutually exclusive.");
++       if (patch.evidence && patch.appendedEvidence)
++         throw new Error("evidence and appendedEvidence are mutually exclusive.");
++       const [row] = await database
+
+
+LLM retry report summary: 28 of 987 requests affected -- 1 request failed, 10 requests cancelled, 17 requests recovered after retry
+
+Review planning (2 requests):
+- server/drizzle/meta/0081_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+- server/src/db/schema/core.ts,server/src/db/schema/coworker.ts,server/src/db/schema/index.ts,server/src/db/schema/openmuse.ts: network error -> succeeded
+
+Core review (16 requests):
+- server/drizzle/meta/0080_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> failed
+- server/drizzle/meta/0077_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+- server/drizzle/meta/0077_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+- server/drizzle/meta/0078_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+- server/drizzle/meta/0078_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+- ... and 11 more
+
+Context compaction (10 requests):
+- server/drizzle/meta/0076_snapshot.json: cancelled
+- server/drizzle/meta/0079_snapshot.json: cancelled
+- server/drizzle/meta/0080_snapshot.json: cancelled
+- server/drizzle/meta/0081_snapshot.json: cancelled
+- server/drizzle/meta/0082_snapshot.json: cancelled
+- ... and 5 more
+
+Per-attempt detail: --format json (retry_report).
+

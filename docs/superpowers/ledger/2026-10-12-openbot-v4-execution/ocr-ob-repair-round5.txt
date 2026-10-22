@@ -1,0 +1,96 @@
+OCR ocr-ob-certify REPAIR round 5 — executed 2026-10-14 in OpenBot/.worktrees/v4-base (branch v4/openbot-exec, NO commits per task).
+30 findings (6 high + 24 medium): 29 fixed, 1 fixed-with-correction (finding on package.json used ./dir path-anchoring instead of the suggested glob — the glob form matches ZERO files on bun 1.4.2, verified). Pinned-contract deviations recorded inline below.
+
+═══ HIGH FINDINGS ═══
+
+[H1 · ocr ci.yml:28] submodule guard not in verify.needs — FIXED.
+  .github/workflows/ci.yml:708 needs list now ends "...component-dockerfiles, submodule". YAML parse-checked via bun+yaml.
+
+[H2 · computer/routes.ts:503 TOCTOU revoke] — FIXED (both halves).
+  server/src/computer/routes.ts:497-510 — observed-none now rides as {requestId: null, takenBy: null};
+  server/src/computer/gateway.ts revokeControl type widened to requestId: string | null, takenBy: string | null | undefined;
+  agent-computer/src/index.ts:908-949 — precondition check accepts requestId === null as observed-none: any active (waiting/taken) request → 409.
+  Tests: server/tests/computer-routes.test.ts "the observed lease rides into the revoke named, and an observed-none read rides as the null precondition"; agent-computer/tests/control-http.test.ts observed-none 409.
+
+[H3 · openmuse-deletion/routes.ts:44 unwired seams] — FIXED.
+  index.ts:4290-4390 builds createOpenMuseWorkShutdown (tasks+reviewed ROWS seam+record+emit-with-bypass), createOpenMuseExternalAccessRevoker, createOpenMuseDeletionManifest (all module seams); app.ts openMuseSeams.deletion{Shutdown,Revoke,Manifest} pass them into the delete route (server/src/app.ts:1998-2023). §9 order verified by server/tests/request-tracking.test.ts "deletionAdmin mounts ... runs the wired seams": ran === ["sessions","shutdown","revoke","manifest"].
+
+[H4 · openmuse-deletion/fence.ts:21-26 open exposure] — FIXED via the finding's second option (session revocation).
+  New revokeSessions seam (delete route's FIRST step, server/src/openmuse-deletion/routes.ts:118-127) wired in index.ts to `delete from sessions where user_id` (server/src/index.ts openMuseDeleteOwnerSessions). fence.ts comment block rewritten: EXPOSURE CLOSED, names the residual (per-seam fences remain the belt). Chosen over per-seam fences: one statement vs per-request marker reads on hot paths; finding accepts either.
+
+[H5 · openmuse-deletion/restore.ts:201 admin routes unmounted] — FIXED.
+  app.ts:2037-2062 mounts createOpenMuseDeletionAdminRoutes at /api/admin/openmuse-deletion behind openMuseSeams.deletionAdmin {restore, purge, purgeRelational, cleanupView}; index.ts builds createOpenMuseDeletionRestore, both purgers, cleanup view. Mounted-ness pinned in request-tracking.test.ts (restore answers 410, not 404).
+
+[H6 · openmuse-tasks/store.ts:1234 claim TOCTOU] — FIXED.
+  rows.updateTask + store.settleTask gain ifStatus?: OpenMuseTaskStatus[] (drizzle WHERE inArray; in-memory test rows mirror). Central guard in settleTask: any settle not itself to "cancelled" requires status != cancelled (NOT_CANCELLED list, store.ts:65-76,817-827). All four runner claim sites carry the status their read saw: monitor ifStatus:["scheduled"] (runner.ts:671), finance :961, document :1362, turn :1835 — all ["queued"].
+  Tests: openmuse-tasks.test.ts "claim race with the owner's cancel/pause CAS (T04×T07)" — 4 cases (cancel/pause/no-ifStatus/terminal-settles).
+
+═══ MEDIUM FINDINGS ═══
+
+[M1 · baseline.sh:216 API env reuse] — FIXED. $STATE_DIR/api.env snapshot (umask 077) written at start; reuse branch diff -q against current baseline_env, mismatch → die "run '$0 down' first"; down removes it. bash -n clean.
+[M2 · baseline.sh:136 pg port map] — FIXED. docker port $CONTAINER 5432/tcp suffix-match :$PGPORT, mismatch → die.
+[M3 · baseline.sh:177 connector port map] — FIXED. Same shape for 3000/tcp vs $CONNECTORPORT.
+[M4 · package.json:19 test filters] — FIXED WITH CORRECTION. The suggested glob form ("app/**") matches ZERO test files on this bun (1.4.2; probed in /tmp/globcheck and repo-wide: 'shared/**' → "no matches" while bare 'shared' → 33 files). ./dir path-prefix form verified: ./app runs 158 files where bare "app" pulled 240 (submodule's 82 included), ./shared 13 files / 0 fail. package.json now uses ./app ... ./worker; bunfig.toml "Test DISCOVERY" comment updated to describe ./ anchoring with the measured numbers.
+[M5 · agent-computer human input seq] — FIXED. Payload validation for /human/click (finite x,y), /human/type (text string), /human/key (non-empty key) moved before admitHumanInput (index.ts:962-983). Test: control-http.test.ts — same seq twice on bad payloads answers 400 both times (not 409 replay).
+[M6 · capacity.ts:197 in-flight starts] — FIXED. START_GRACE_MS=30s; admittedBy counts lastRunActivity entries not yet in running() (capacity.ts:197-215). Test: computer-capacity.test.ts "a start still in flight holds a slot..." incl. grace-lapse frees the slot.
+[M7 · gateway.ts:1313 refundWrite ambiguity] — FIXED. New ComputerUnreachableError extends ComputerUnavailableError (client.ts:27-38), thrown only for non-timeout/non-abort transport failures; writeFile refunds ONLY that class — timeout/abort/5xx keep the charge (gateway.ts:1319-1331). Tests: computer-gateway.test.ts "the write budget's refund direction" (unreachable refunds, 500 keeps).
+[M8 · drizzle.config.ts:21 comment] — FIXED. Comment now states the real invariant (store→manifest→google-oauth/retention/restore side-effect graph incl. pino logger + value-level cycle) and the durable fix (move pgTables to db/schema/).
+[M9 · computer 409 shape (revoke)] — FIXED. The precondition 409 body carries controlRequestError: true (agent-computer index.ts:941-947) so client.ts maps it to HandoffRequestError — same shape as the route's own holder-check 409. Pinned in control-http.test.ts.
+[M10 · 0097/0098 unique index vs existing dupes] — FIXED. Both migrations gain the settle-duplicates UPDATE (keep earliest per gate key by (created_at,id), rest → 'cancelled', out of the partial predicate) before CREATE UNIQUE INDEX; 0098's variant keys on coalesce(target_id,''). Note: both files are R4-uncommitted; executed cleanly on a fresh openbot_test walk (db:migrate ✓).
+[M11 · channels rename atomicity] — FIXED. rename wrapped in database.transaction(read committed): UPDATE + member read + pg_notify inside; post-commit store.get retained (routes.ts:898-958). Contract pinned by new channel-events.integration.test.ts "announces a rename to every member with the new name, exactly once" (survives the refactor); crash-atomicity itself has no fault-injection seam (recorded).
+[M12 · app.ts 17 positional seams] — FIXED. All 17 tail params collapsed into one openMuseSeams?: {...} object (app.ts:646-723), destructured to the body's local names (app.ts:829-856); index.ts call site passes one named object. The deletion seams (H3/H4/H5) ride the same object. My own first attempt at the test call site transposed the object onto craftRoutes — the exact hazard the finding names; the named-object shape is what removes it.
+[M13 · purge.ts:150 metadata debt] — FIXED. Phase-2 hardDelete failure now persists one manifest row kind "openmuse-file-metadata" state retryable_error (insert-once + markRetryable refresh); a completing pass markDeleted()s it; purge-relational EXTERNAL_KINDS gains the kind so finalize 409s while it owes. Test: openmuse-deletion.test.ts "persists its metadata debt on the manifest, and the debt closes and unblocks finalize". Pinned transient report shape untouched.
+[M14 · deletion routes.ts:79 raw step errors] — FIXED. steps[name] passes sanitizeLastError (token-shaped → redacted sentence). Pinned "failed: tasks table unreachable" unchanged (plain messages pass); new test pins the ya29 redaction.
+[M15 · retention.ts:102 dead bookkeeping] — FIXED by wiring. noteBackupRetention runs as the delete route's "backup-retention" step through openMuseSeams.deletionNoteBackupRetention (index.ts openMuseBackupRetention). Step is named only when wired, so the pinned no-seams answer (steps: {shutdown, revoke, manifest}) is byte-identical.
+[M16 · purge-relational 409 blocked lastError] — FIXED. sanitizeLastError on the blocked payload. Test: "a blocked row's recorded reason is sanitized in the 409 (G06)".
+[M17 · shutdown.ts:61 record masking] — FIXED. record failure rethrows `Failed recording N shutdown transitions for U (...ids...): cause` — ids carried for a compensating marker append; route records the step failed (sanitized). Test pins the message shape.
+[M18 · shutdown.ts:71 doomed emit] — FIXED via the finding's option (b). "task.cancelled" added to OpenMuseNotificationEvent (store + db/schema/openmuse.ts column type — TS-level only, no SQL change); emit gains explicit bypassDeletionFence?: boolean (narrow, documented); index.ts wires the shutdown's emit through the bypass. Test: openmuse-notifications.test.ts "D02's deletion-fence bypass lands a task.cancelled notice for a fenced owner — the fence otherwise refuses". (Option (a) delete-the-emit was barred by the pinned "cancelled tasks emitted" contract.)
+[M19 · ops signals raw reason] — FIXED. collect()'s failure branch runs sanitizeLastError (signals.ts:165-172). Plain "connection refused" pinned unchanged; new test pins ya29 redaction.
+[M20 · goals.ts:319 quadruplicated fence] — FIXED. New server/src/openmuse-personal/shared.ts: one OpenMuseOwnerDisabledError + one createOwnerDisabled(database). goals/ideas/memories/tasks/notifications (5 copies total — the finding named 3; tasks+notifications carried the same drift hazard and the tools' task_delegate catch needs ONE class) all re-export the shared class and use the shared row read. All suites green.
+[M21 · tools.ts:60 read-path fence bypass] — FIXED. openMusePersonalTools gains ownerFenced?(); all four tools refuse with REFUSAL_MARKER at execute entry; task_delegate additionally catches OpenMuseOwnerDisabledError from create and refuses the readable way. index.ts wires ownerFenced: () => openMuseAccountDeletionStore.isDisabled(ownerUserId) (store hoisted beside the task store). Tests: openmuse-personal-tools.test.ts "the §9 fence at the tool seam" (3 cases).
+[M22 · runner.ts:1285 poll retry unbounded] — FIXED. Poll-failure reoffer passes backoffMinutes(2)=30min runAt (reoffer(delayMs) → offerContinuation(task, date)); comment names why the fresh-UUID key makes maxAttempts unenforceable alone. Test pins runAt ≥ 29min.
+[M23 · runner.ts:1163 parked cancel unreachable] — FIXED. Poll branch re-reads the row and consumes cancellationRequested at the safe boundary (settle cancelled + evidence "Cancelled while awaiting the review.", no reoffer). Test: "a cancellation flag parked with the wait is consumed by the poll".
+[M24 · tasks routes finance gate] — FIXED. finance + !deps.files → 503 "Finance tasks are not available."; finance + files → getOwnedFile ownership check → 404. Production wired: app.ts passes files into createOpenMuseTasksRoutes; index.ts hoists openMuseFileStore above the runner and passes files: openMuseFileStore (runner reads CSVs/versions for real now). PINNED-CONTRACT DEVIATIONS (recorded, substance preserved): openmuse-tasks.test.ts:536 "a finance task carries a CSV File id..." now uses a fixture WITH a files seam (all matrix assertions unchanged; the 201-without-seam expectation pinned the exact doomed-run failure mode the finding closes); openmuse-task-runner.test.ts "a missing or foreign CSV..." now creates-then-deletes (the runner's own race); "without the files seam wired..." now goes through store.create (the routes' 503 is pinned in the routes suite).
+
+═══ VERIFICATION ═══
+server tsc --noEmit: clean. biome check --error-on-warnings on all touched files: clean.
+Touched per-file suites (TEST_DATABASE_URL=openbot_test @127.0.0.1:5432):
+  25 server suites: 951 pass / 0 fail (openmuse-deletion 81, notifications 12, tasks 85, task-runner 80, task-capacity, task-lease-recovery, goals/ideas/memories 98, personal-tools 12, ops-signals 11, finance, documents, files, request-tracking 9, computer-routes/handoff/capacity/gateway/client/human-input, channel-routes 125, channel-events 17, reviewed-actions + store.integration 107).
+  agent-computer: control-http (OPENBOT_CONTROL_HTTP=1) + control + control-lease: 26 pass / 0 fail.
+  Adjacent createApp consumers (shared-wiring, offboarding, audit, agent-routes, openmuse-bot/activity/mail/calendar/google-oauth): 215 pass / 2 fail — BOTH PRE-EXISTING, not from this diff: (1) audit.test.ts "declares nothing this deployment cannot write" (workshop.* taxonomy rows, untouched by this diff); (2) openmuse-activity.test.ts "reviewed lister keyset ... same-millisecond" inserts 3 identical-payloadHash awaiting rows and hits R4's own 0098 unique index (constraint violation; my 0097/0098 edits are data-settling UPDATEs only).
+  migration-journal.test.ts: 1 pre-existing fail (0065/0098 snapshot-vs-migration diffs, all R4-era; zero references to my added UPDATEs).
+  deliverables/mobile-e2e-qa wdio specs error on missing own node_modules — identical under the old bare-name filters (pre-existing).
+SQL live check: edited 0097+0098 applied cleanly via db:migrate on a fresh openbot_test.
+
+═══ FILES + SHASUM-256 (first 16 hex) ═══
+8c956e53dd8a50fc .github/workflows/ci.yml            b6703896da23352e package.json
+fcaa42004cf6881a bunfig.toml                          907421574498a7c6 scripts/openmuse-v4-baseline.sh
+519bc6c2fa4d5989 server/drizzle.config.ts             a78f00f0cb785145 server/drizzle/0097_openmuse_user_fks_and_gates.sql
+4644073f94e4312e server/drizzle/0098_clean_triton.sql 73d639e78239f83c agent-computer/src/index.ts
+a1a335e7d9a2ae76 agent-computer/tests/control-http.test.ts
+9c698579afd778c1 server/src/computer/routes.ts       2ca936cf5597e1aa server/src/computer/gateway.ts
+61d9d5ab0bdd4153 server/src/computer/client.ts        3a04d981074407a8 server/src/computer/capacity.ts
+1d6dff7bf9d1b8e3 server/tests/computer-routes.test.ts f5b98094f7408e30 server/tests/computer-capacity.test.ts
+08c18446c29e7fb8 server/tests/computer-gateway.test.ts
+b6053ae64726efa5 server/src/channels/routes.ts        fd16059856c3e5f0 server/tests/channel-events.integration.test.ts
+ba1ed9cdc5e3a4d8 server/src/openmuse-personal/shared.ts (new)
+1e4ccfbbe3ff7091 server/src/openmuse-personal/goals.ts 72b70e372bb94240 server/src/openmuse-personal/ideas.ts
+e39e110f0f01e951 server/src/openmuse-personal/memories.ts ea0b6dcdd5b38c18 server/src/openmuse-personal/tools.ts
+a340806948eecb58 server/src/openmuse-tasks/store.ts    e274adaa6f0ea3fd server/src/openmuse-tasks/runner.ts
+d34f0290694e4ae4 server/src/openmuse-tasks/routes.ts   a41d752e756c2064 server/src/openmuse-notifications/store.ts
+c33cb349af0081c8 server/src/openmuse-ops/signals.ts    ccb297e12860976c server/src/openmuse-deletion/routes.ts
+7ec9e44ac9ad151d server/src/openmuse-deletion/fence.ts 06806d77730870c6 server/src/openmuse-deletion/shutdown.ts
+0ecadaa9babf2b22 server/src/openmuse-deletion/purge.ts 1be4f1136a0f431b server/src/openmuse-deletion/purge-relational.ts
+00441d693c923ae1 server/src/db/schema/openmuse.ts      210f5e38d398a709 server/src/app.ts
+bd8965c98b043395 server/src/index.ts
+4289260594143d8b server/tests/openmuse-personal-tools.test.ts bd658196b9a438f5 server/tests/openmuse-ops-signals.test.ts
+24f1aa10c87df471 server/tests/openmuse-tasks.test.ts   577d24b6a607e1cd server/tests/openmuse-task-runner.test.ts
+5c83b3d3dc48f6a0 server/tests/openmuse-deletion.test.ts 96d055b8e1484a4e server/tests/openmuse-notifications.test.ts
+73d4cc5fb368f9b4 server/tests/request-tracking.test.ts
+
+═══ TEST TAILS ═══
+$ bun test <25 touched server suites>   → 951 pass / 0 fail / 4142 expect() calls / Ran 951 tests across 25 files. [5.47s]
+$ OPENBOT_CONTROL_HTTP=1 bun test agent-computer/tests/{control-http,control,control-lease}.test.ts → 26 pass / 0 fail / 154 expect() calls. [528ms]
+$ bunx tsc --noEmit -p server → clean; $ bunx biome check --error-on-warnings <touched> → clean.
+
+NO commits made (per task). Worktree left dirty on v4/openbot-exec.

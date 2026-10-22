@@ -1,0 +1,1120 @@
+Review complete: 51 finding(s) across 142 selected item(s).
+
+─── server/src/index.ts:2684-2689 ───
+[maintainability · medium] 文件字节存储的根目录配置（OPENBOT_OPENMUSE_FILES_DIR 读取 + ".openmuse/files" 默认值）在此处与
+4372 行附近的 createOpenMuseFileBytePurger
+各重复了一份，形成两个独立实例。今天两者读同一环境变量所以等价，但任何一处被单独修改（如加前缀、换默认值、加归一化）都会让清除器指向另一个根目录：关系层标记 purge
+完成而用户文件字节永远残留在真实目录下，构成删除合规（隐私数据未真正清除）缺陷。建议将根目录配置或字节存储实例收敛为本文件顶部的单一常量/实例并两处共用。
+
++ const openMuseFileBytes = createLocalFileByteStore(
++   process.env.OPENBOT_OPENMUSE_FILES_DIR ?? ".openmuse/files",
++ );
+  const openMuseFileStore = createOpenMuseFileStore({
+    rows: createOpenMuseFileRows(database),
+-   byteStore: createLocalFileByteStore(
+-     process.env.OPENBOT_OPENMUSE_FILES_DIR ?? ".openmuse/files",
+-   ),
++   byteStore: openMuseFileBytes,
+  });
+
+
+─── server/src/index.ts:2707-2712 ───
+[performance · medium] openMuseToolsFor 被 loadToolsForActor 展开，而后者由 runtime 加载器与群组会话 runner
+在每个回合的工具装载路径上调用：即使部署里根本没有 OpenMuse Bot，任意 Bot 的每个回合也要为这次 findByTemplateKey 付出一次数据库往返（命中空结果），OpenMuse
+Bot 的回合则额外在每次调用中新建 goal/idea/memory rows 实例（无状态工厂，可提升到模块作用域复用）。建议将模板判定结果按 (ownerUserId, botId)
+做进程内缓存（或至少提升 rows 实例），把非 OpenMuse 路径的常量开销降为零。
+
++ const openMuseTemplateCache = new Map<string, string | null>();
+  const openMuseToolsFor = async (ownerUserId: string, botId: string) => {
++   const cacheKey = `${ownerUserId}:${botId}`;
++   const cached = openMuseTemplateCache.get(cacheKey);
++   if (cached === null) return [];
++   if (cached !== undefined && cached === botId) {
++     return buildOpenMusePersonalTools(ownerUserId, botId);
++   }
+    const privateBot = await openMuseTemplateMethods.findByTemplateKey(
+      ownerUserId,
+      OPENMUSE_TEMPLATE_KEY,
+    );
++   openMuseTemplateCache.set(cacheKey, privateBot?.id ?? null);
+    if (privateBot?.id !== botId) return [];
+
+
+─── server/src/index.ts:4222-4225 ───
+[maintainability · medium] ops signals 块在装配时新建了第二个 createOpenMuseAccountDeletionStore 与第二个
+createOpenMuseDeletionResourceRows 实例来构造 cleanup 视图——与 2678 行已提升的 openMuseAccountDeletionStore、下方声明的
+openMuseDeletionResourceRows 及 openMuseDeletionCleanup 完全重复（同一 cleanup 视图在本文件构造了两次）。这直接违背本文件
+2673-2676 注释自declared 的"单实例 seam"原则：若 store 未来引入内存态或缓存，两个实例将状态分叉，运维信号看到的清理视图与删除路由操作的实例不再是同一个。将
+openMuseDeletionCleanup 的声明上移到本块之前并复用共享实例即可收敛。
+
+-       cleanupView: createOpenMuseDeletionCleanupView({
+-         markers: createOpenMuseAccountDeletionStore(database),
+-         rows: createOpenMuseDeletionResourceRows(database),
+-       }),
++       cleanupView: openMuseDeletionCleanup,
+
+
+─── server/src/app.ts:1947-1950 ───
+[maintainability · medium] documents 面（F05）的挂载嵌套在与自身无任何依赖的 if (channelStore) 条件块内：一旦装配方提供了 documents
+seam 但未提供 channelStore（如裁剪掉 channels 的部署或某个测试装配），该路由族会静默不挂载、无任何日志，违反本轮收敛 openMuseSeams 时"每个 seam
+独立声明、独立挂载"的意图。fence 与 requireUser 均在更早处注册，将该 if 块移出 channelStore 条件不会改变围栏覆盖语义。另已核对两路由器路径表（files 的
+/:id、/:id/content、/import/gmail-attachment 等 vs documents 的
+/:id/inspect、/:id/fill、/:id/transfer）无重叠遮蔽，同前缀挂载本身无冲突。
+
+-     if (openMuseDocuments) {
++   if (openMuseDocuments) {
+-       app.route("/api/mobile/openmuse-files", openMuseDocuments);
++     app.route("/api/mobile/openmuse-files", openMuseDocuments);
+-     }
+    }
+
+
+─── server/src/computer/client.ts:255-257 ───
+[bug · high] 把一切非 TimeoutError 的异常归为 ComputerUnreachableError("证明请求从未到达")言过其实:该 catch 只包住 doFetch,但
+fetch 在「请求体已发出、对端已接收并提交 /files/write、响应头返回前连接被重置/提前关闭」时同样在此处以网络错误(如 TypeError/cause 为
+ECONNRESET、UND_ERR_SOCKET 等)拒接。gateway.writeFile 恰恰以本类为唯一退款依据——已落盘的写被退款后 charged 计数偏小,磁盘配额被静默突破,与
+capacity.ts/本文件宣称的「模糊方向保留计费」不变量相悖。建议检查 error.cause(及其 cause
+链)以区分「从未建连」(ECONNREFUSED/ENOTFOUND/EAI_AGAIN 等)与「建连后中断」,仅前者抛 ComputerUnreachableError,后者保持模糊语义的
+ComputerUnavailableError。
+
++       // 「从未建连」才有资格证明字节未落盘:fetch 的网络拒接需沿 error.cause 依运行时区分
++       // ECONNREFUSED/ENOTFOUND/EAI_AGAIN(未到达)与 ECONNRESET/UND_ERR_SOCKET(已发出后中断,
++       // 写可能已提交),后者与超时同属模糊方向,保留计费。
+        throw new ComputerUnreachableError(
+          "The assistant's computer is not running.",
+        );
+
+
+─── server/src/computer/stream-auth.ts:10-15 ───
+[security · medium] 把部署级 COMPUTER_TOKEN 放进上游 URL 查询串,注释给出的理由(「upgrade 无法携带自定义
+header」)只对浏览器直连成立,不适用于本代理跳:该 URL 的唯一消费方是服务端代理(index.ts 中 new WebSocket(stream.upstream),Bun 运行时支持
+headers 选项),且同一服务对电脑的全部 HTTP 调用在 client.ts 中都经 x-openbot-computer-token
+头携带同一令牌。查询串令牌会落入中间反代与电脑端的访问日志,泄漏面显著大于头形式,却没有任何补偿控制。电脑端
+offeredToken(agent-computer/src/authorisation.ts)对普通路径本就读头,仅 /stream 被硬编码为只认 query——建议让 /stream
+也接受头形式(保留 query 供浏览器兜底),本函数改为返回不含 token 的 URL、由代理经 header 携带。
+
+- export const toStreamUrl = (baseUrl: string, botId: string, token: string) =>
+-   // The Bot travels in the query, because a websocket upgrade carries no custom header for the
+-   // computer to read and every call it serves is per Bot. The secret travels the same way and for the
+-   // same reason, this socket is the one a person can type into, so it is the last thing that should
+-   // be reachable without it.
+-   `${baseUrl.replace(/^http/, "ws").replace(/\/$/, "")}/stream?bot=${encodeURIComponent(botId)}&token=${encodeURIComponent(token)}`;
++ export const toStreamUrl = (baseUrl: string, botId: string, botIdToken: never) =>
++   // bot 走 query;令牌改由代理经 x-openbot-computer-token 头携带(与 transport 的 HTTP 调用一致),
++   // 不再进入任何访问日志。电脑端 /stream 需同步接受头形式,query 仅作浏览器直连的兜底。
++   `${baseUrl.replace(/^http/, "ws").replace(/\/$/, "")}/stream?bot=${encodeURIComponent(botId)}`;
+
+
+─── server/src/computer/gateway.ts:1325-1327 ───
+[bug · high] 退款谓词与已确认的「过宽退款」正好相反,是过窄:电脑端对 /files/write 存在一类确定性拒绝——人在方向盘上/求助请求等待中/恢复期时
+assertBotMayAct 以 409 humanHasControl 拒绝(映射为 HumanHasControlError),以及 403 WorkspaceRefusedError、400
+WorkspaceRequestError、404 WorkspaceNotFoundError、413
+WorkspaceTooLargeError。这些错误意味着电脑已应答并在写入发生前拒绝,字节必然未落盘,但计费被保留。charged 无衰减,仅 resetUsage(破坏性
+reset)或进程重启清零:人接管期间模型每次写重试都白烧配额,bot 自己的求助等待窗口同理,若干次后写路径被 413 永久锁死而磁盘上没有对应字节——恰是 refundWrite
+注释声称要防止的后果。建议对「电脑已应答且写入前拒绝」的错误类同样退款,仅对模糊方向(超时、Stop 中断、连接重置)保留计费。注意
+HumanHasControlError、Workspace*Error 需从 ./client(经本模块已 re-export)引入作用域。
+
+-             if (error instanceof ComputerUnreachableError) {
++             // A refusal the COMPUTER itself answered before any bytes were written is proven
++             // not to have landed: the human-has-control gate answers 409 without writing, and
++             // so do the workspace refusals and the size cap. Only the ambiguous directions
++             // (timeout, mid-flight stop, connection reset) keep the charge.
++             if (
++               error instanceof ComputerUnreachableError ||
++               error instanceof HumanHasControlError ||
++               error instanceof WorkspaceRefusedError ||
++               error instanceof WorkspaceRequestError ||
++               error instanceof WorkspaceNotFoundError ||
++               error instanceof WorkspaceTooLargeError
++             ) {
+                capacity.refundWrite(botId, bytes);
+              }
+
+
+─── server/src/computer/gateway.ts:1020-1022 ───
+[bug · medium] resetUsage 排在两次可失败的 Postgres
+删除之后,而同函数上方的注释自己就承认这些删除会因连接重置、故障切换或语句超时抛出(那正是把审计行提前的原因)。一旦 snapshots.clear 或 pageFrames.clear
+抛出:provider.reset 已经清空了 workspace(不可回退),但 charged 里旧的字节配额仍保留——刚被清空的 workspace 背着幻影配额继续
+413,唯一的恢复途径是把这颗「最具破坏性的按钮」再按一次。建议把 resetUsage 放入 finally(workspace 此时必然已消失,预算不应比它活得更久),或至少放在删除之前。
+
++       try {
++         await snapshots.clear(botId);
+-       await pageFrames?.clear(botId);
++         await pageFrames?.clear(botId);
+-       // A wiped workspace starts its disk budget over with the profile it came with.
++       } finally {
++         // The workspace is already gone at this point, so the disk budget must go with it
++         // even when the trailing deletes above fail.
+-       capacity.resetUsage(botId);
++         capacity.resetUsage(botId);
++       }
+
+
+─── server/drizzle.config.ts:36-36 ───
+[maintainability · medium] 认证复核确认该脆弱耦合在 R5 后仍未消除,且风险已部分成真:经核实,drizzle-kit 打包执行的 import 图存在值级循环依赖
+store→manifest→retention→restore→store(manifest.ts:15 值导入 retention,retention.ts:1 值导入
+restore,restore.ts:11 值导入 store),且 manifest.ts 值导入的 google-oauth.ts 经 ./client.ts 在模块顶层执行
+getLogger("server")——shared/logger 的 createLogger 会在加载期读取
+process.env(LOG_LEVEL/OPENBOT_LOG_LEVEL/OPENBOT_LOG_FORMAT)并构造 pino 实例/pino-pretty
+transport。也就是说注释中"该图恰好在加载期无副作用"的前提并不完全成立:env 读取与 logger 构造今天就在迁移工具链内运行,只是尚未抛错。建议按注释中已写明的持久修复执行(将两个
+pgTable 定义移入 db/schema/ 并由 store.ts 反向导入,然后移除本条目),不要在扩展该 import 图之前继续依赖"目前恰好能用"。
+
+-     "./src/openmuse-deletion/store.ts",
++     "./src/db/schema/openmuse.ts", // 同时承载 openmuse_account_deletions / openmuse_deletion_resources,store.ts 从这里导入;随后删除 "./src/openmuse-deletion/store.ts" 条目
+
+
+─── server/drizzle/0097_openmuse_user_fks_and_gates.sql:18-24 ───
+[bug · medium] 此去重 UPDATE(以及下方的 CREATE UNIQUE INDEX)只按 (owner_user_id, kind, payload_hash) 三列判重,缺少
+coalesce(target_id, '')。运行时契约(service.ts propose 的 gate 注释与 schema 中
+openmuse_reviewed_actions_active_send_uq 的四列定义)明确 target 是 key
+的一部分:"同一日历上两个不同事件的删除是两次逻辑发送",按设计应并存。后果:同 payload 但 target 不同的活跃行(如同一日历上两个待审的日历删除提案,或 awaiting_review
+与 outcome_unknown 各一条)会被误判为竞态重复而置 'cancelled'。同批次的 0098 虽然重建了正确的四列索引,但无法复活此处已取消的行 —— 对升级环境这是不可逆的取消。若
+0097/0098 尚未被任何环境执行,建议直接在此按四列 key 去重并把索引加上第 4 列,然后删除 0098;若已有环境消费过 0097,则应记录这次一次性取消的副作用。
+
+  UPDATE "openmuse_reviewed_actions" SET "status" = 'cancelled'
+    WHERE "id" IN (
+      SELECT a."id" FROM "openmuse_reviewed_actions" a
+        JOIN "openmuse_reviewed_actions" b
+          ON a."owner_user_id" = b."owner_user_id"
+         AND a."kind" = b."kind"
+         AND a."payload_hash" = b."payload_hash"
++        AND coalesce(a."target_id", '') = coalesce(b."target_id", '')
+
+
+─── server/drizzle/0098_clean_triton.sql:2-6 ───
+[maintainability · medium] 该注释论证的方向是反的，且由此引入的 UPDATE 在任何合法环境上都是可证明的空操作。0098 的新键 (owner_user_id,
+kind, payload_hash, coalesce(target_id,'')) 是 0097 键 (owner_user_id, kind, payload_hash)
+的超集——追加列只会让唯一约束更弱，不会更强。任何在新键下相同的两行在旧键下必然也相同，而 0097 的部分唯一索引自上一条迁移起就在持续强制（payload_hash、created_at 均
+NOT NULL，谓词不变），所以这种行不可能存在：这个自连接 UPDATE 永远匹配不到行，紧随其后的 CREATE UNIQUE INDEX 不可能因重复而失败。注释所述的失败模式（"0097
+的键保持不同的行会中止本次建索引"）在逻辑上不成立——0097
+的键恰恰不允许这样的行共存。代价：在已承载流量的表上做一次全表自连接扫描并持有行锁，却毫无收益，且错误的"数据安全"论述会误导后续维护者按此模式编写迁移。建议二选一：(a) 直接删除这段
+UPDATE，只保留 DROP INDEX + CREATE UNIQUE INDEX（并在注释中说明新键严格弱于旧键、无需去重）；(b) 保留语句作为防御性措施，但把注释改写为真实不变量："0097
+更严的三列键已保证新四列键下的唯一性，此去重按预期匹配零行，仅为纵深防御"。
+
+- -- Same dedupe as 0097, re-keyed for the rebuilt index: the key gains coalesce(target_id, ''),
+- -- so rows identical in (owner, kind, payload, target) that 0097's key kept distinct would abort
+- -- this CREATE UNIQUE INDEX on an already-trafficked environment. Earliest per new key stays;
+- -- the rest land 'cancelled' and fall out of the partial predicate.
++ -- Re-key note: this key strictly extends 0097's (owner, kind, payload_hash) key with
++ -- coalesce(target_id, ''), so it is a weaker constraint: active rows already unique under
++ -- 0097's enforced index cannot collide here, and no dedupe is required before the rebuild.
++ -- (Kept below as belt-and-braces only; expected to match zero rows.)
+  UPDATE "openmuse_reviewed_actions" SET "status" = 'cancelled'
+
+
+─── server/drizzle/0097_openmuse_user_fks_and_gates.sql:18-28 ───
+[bug · high] 此去重 UPDATE 把每个 key 中除最早一行外的所有活跃行一律置为 'cancelled',其中包括 'executing'(provider 请求可能已在途)与
+'outcome_unknown'(provider 侧结果未定)的行。这与运行时门禁契约冲突:
+1) 重提拦截 findSettledSameSend(store.ts:255-259)只拦 executing/outcome_unknown/succeeded,'cancelled'
+不拦截;部分唯一索引的谓词也只含 awaiting_review/executing/outcome_unknown,'cancelled' 落在索引之外 ——
+即不确定的发送在迁移后变为可重新提议并批准,可能造成重复发送(gmail.send/gcalendar.delete 等),违反 R04 的核心不变量「outcome_unknown
+的发送绝不再提议」(service.ts:36、114-116)。
+2) reconcile(service.ts:524)仅接受 status='outcome_unknown' 的行,被改成 'cancelled' 后,运维对账修复路径对这些行永久关闭。
+3) 执行器落账走 claimTransition 的 CAS(WHERE status = 'executing',store.ts:299-304),行被迁移改为 'cancelled'
+后,在途执行的最终回写会静默丢失。
+建议调整幸存行选择策略:每个 key 优先保留最早的不确定行(executing/outcome_unknown),没有才保留最早的
+awaiting_review;这样不确定行保持活跃,门禁与索引继续封闭、对账路径保留,仅纯 awaiting_review 竞态重复被置为 cancelled(与注释声称「race
+的重复」场景一致)。
+
++ -- 每个门禁 key 保留最早的不确定行(executing/outcome_unknown),否则保留最早的
++ -- awaiting_review;其余活跃行置 'cancelled' 并落出部分索引谓词。不确定行保持活跃,
++ -- findSettledSameSend 与 reconcile 契约不破。
+  UPDATE "openmuse_reviewed_actions" SET "status" = 'cancelled'
+-   WHERE "id" IN (
+-     SELECT a."id" FROM "openmuse_reviewed_actions" a
+-       JOIN "openmuse_reviewed_actions" b
+-         ON a."owner_user_id" = b."owner_user_id"
+-        AND a."kind" = b."kind"
+-        AND a."payload_hash" = b."payload_hash"
+-        AND (a."created_at", a."id") > (b."created_at", b."id")
+-      WHERE a."status" IN ('awaiting_review', 'executing', 'outcome_unknown')
+-        AND b."status" IN ('awaiting_review', 'executing', 'outcome_unknown')
+-   );--> statement-breakpoint
++   WHERE "status" IN ('awaiting_review', 'executing', 'outcome_unknown')
++     AND "id" NOT IN (
++       SELECT DISTINCT ON ("owner_user_id", "kind", "payload_hash") "id"
++         FROM "openmuse_reviewed_actions"
++        WHERE "status" IN ('awaiting_review', 'executing', 'outcome_unknown')
++        ORDER BY "owner_user_id", "kind", "payload_hash",
++                 CASE WHEN "status" IN ('executing', 'outcome_unknown') THEN 0 ELSE 1 END,
++                 "created_at", "id"
++     )
+
+
+─── server/src/openmuse-calendar/routes.ts:303-304 ───
+[bug · medium] 拼接因 MAX_PROVIDER_PAGES、STITCH_BUDGET_MS
+或令牌成环(stoppedShort)提前终止且本页为空时(典型:带游标续传,取回行全部位于键集位置之前),last === undefined 使响应只携带 truncated=true 而无
+nextCursor:客户端丢失续传位置,若原样重试则每次最多再付出 100 次供应商调用/60s 且永远无法前进,形成不前进的重试循环与静默数据缺失。这与本文件 STITCH_BUDGET_MS
+注释宣称的 "truncated on, cursor out — so the client can resume" 直接相悖;mail
+路由在同一点位明确记载了空页截断的取舍(openmuse-mail/routes.ts:241-244),此处缺失。建议:capped/stoppedShort 且 page
+为空时,若存在入站游标,按入站键集位置(decoded 的 start/id/calendarId)携带 resumeToken 续发游标,保持位置可续;至少补齐与 mail 一致的空页语义说明。
+
+        truncated: truncated || stoppedShort || capped,
+-       ...(last !== undefined && (hasSurplus || capped)
++       // 空页也要保住续传位置:优先本页最后一行,否则沿用入站游标的键集位置,
++       // 以免截断后客户端丢失位置、原样重试陷入循环(取舍说明同 mail 路由)。
++       ...(hasSurplus || capped || stoppedShort
++         ? {
++             nextCursor: encodeCalendarCursor({
++               owner: actor.id,
++               alias: connection.alias,
++               ...(last !== undefined
++                 ? { start: last.start, id: last.id, calendarId: last.calendarId }
++                 : resumePosition),
++               providerToken: resumeToken,
++             }),
++           }
++         : {})
+
+
+─── server/src/openmuse-calendar/routes.ts:200-204 ───
+[bug · medium] 游标只绑定 owner 与 alias,未绑定查询窗口:客户端携带同一游标但更换 timeMin/timeMax 时不会得到
+400,而是从旧窗口的键集位置继续,新窗口内位于该位置之前的事件被静默跳过(无任何错误提示的残缺数据);且旧 providerToken 是旧窗口下铸出的,与新窗口混用后供应商翻页语义未定义。同仓基线
+openmuse-mail/routes.ts:145 在游标校验中显式绑定查询参数((decoded.query ?? "") !== query),本路由与既有约定不一致。建议把
+timeMin/timeMax 编入 encodeCalendarCursor/decodeCalendarCursor 并在此校验比对,不一致即 400。
+
+        if (
+          decoded === null ||
+          decoded.owner !== actor.id ||
+-         decoded.alias !== connection.alias
++         decoded.alias !== connection.alias ||
++         decoded.timeMin !== timeMin ||
++         decoded.timeMax !== timeMax
+        ) {
+
+
+─── server/src/openmuse-calendar/client.ts:43-44 ───
+[maintainability · medium] GCAL_LIST_ACTION_ID 是文档化占位符,仅能经 OPENCONNECTOR_GCAL_LIST_ACTION_ID
+在部署期覆盖,而模块加载时无任何信号、无目录核对路径(全仓仅此一处读取该环境变量)。若 O02 核对未落实或环境变量遗漏,所有日历读取将持续 502,且失败形态只是笼统的供应商失败消息,难以定位到动作
+id 配置。同仓基线 openmuse-mail/client.ts:47-66 对同类占位符 id 有 boot-time log.info 清单("a skipped O02 check
+leaves a trace rather than nothing"),本模块缺失该基线。建议补齐与 mail 一致的启动期占位符信号,或部署期经
+listServiceActions("gcalendar") 核对后在启动时记录核对结果。
+
+  export const GCAL_LIST_ACTION_ID =
+    process.env.OPENCONNECTOR_GCAL_LIST_ACTION_ID ?? "gcalendar.list";
++ 
++ // Boot-time O02 reminder(与 openmuse-mail/client.ts 的占位符信号同款):
++ // 模块加载即留痕,运维核对 listServiceActions("gcalendar") 时有确切字符串可查。
++ log.info(
++   { type: "openmuse-calendar-placeholder-action-id", id: GCAL_LIST_ACTION_ID },
++   "openmuse-calendar-placeholder-action-id",
++ );
+
+
+─── server/src/openmuse-connectors/google-oauth.ts:398-400 ───
+[bug · high] nonce 绑定依赖 openmuse_nonce 参数经 Google 授权链路往返，但该链路无法把它带回：此参数被附加到 Google 授权 URL 的 query
+上，而 G01 检查点确认 redirect_uri 就是 OpenBot 的公共回调（/api/public/openmuse-google/callback）；Google 按 OAuth 2.0
+规范只向 redirect_uri 回传 code/scope/state，不会原样带回未知的 openmuse_nonce，vendor 转发层也只携带 {code,
+state}。因此真实同意到达回调时 input.nonce 恒为 undefined，而 start 恒生成 UUID 存入 pending.nonce，下方 `pending.nonce !==
+input.nonce` 恒真，每个真实 Google 同意都会在此 400（"missing the nonce"），G01/G03
+的整个连接功能在线上不可用。现有测试全部通过是因为测试在构造回调请求时自行补上了 nonce 参数，并未证明参数能从 Google 链路往返。修复方向：将 OpenBot
+自有绑定改为不依赖第三方回传的通道——例如把 nonce 编入 returnUri 由客户端 deep-link 回程携带，或在 vendor 证实支持未知参数透传之前，将该硬校验降级为仅校验已有的
+session（actor）+ state 绑定。
+
+-       const withNonce = new URL(authorizationUrl);
++       // OpenBot's own binding must travel a channel OpenBot controls: Google
++       // returns only code/scope/state to the registered redirect_uri, so a
++       // free-form query parameter on the authorization URL never comes back.
++       const withNonce = new URL(input.returnUri);
+        withNonce.searchParams.set("openmuse_nonce", nonce);
+-       return { authorizationUrl: withNonce.toString() };
++       await deps.rows.insertPending({
++         /* … */, returnUri: withNonce.toString(), /* … */
++       });
++       return { authorizationUrl };
+
+
+─── server/src/openmuse-connectors/client.ts:378-387 ───
+[security · medium] 此处把 vendor 的原始 error.message（OpenConnectorOAuthError 的 message 正是
+vendorMessage）写入服务器日志，与项目自身声明的 §4 脱敏纪律冲突：retention.ts:74-78 明确写道 "an error message may quote the
+credential it failed on, and operator signals carry no token"，并实现了 TOKEN_SHAPED 正则脱敏；本模块 store.ts:56
+的注释也复述了同一纪律（"a vendor error may quote the credential it failed on"）。服务器日志属于 operator
+signal，客户端注册失败消息（如 invalid_client、redirect_uri mismatch）可能引用凭据片段，未脱敏落日志会造成敏感信息暴露。建议复用 retention.ts 的
+sanitizeLastError（或等价的 TOKEN_SHAPED 过滤）后再记录，或仅记录错误类名与固定句。
+
+      } catch (error) {
++       // §4: operator signals carry no token — the vendor's sentence may quote
++       // the credential it failed on, so sanitize before it reaches the log.
+        log.warn(
+          {
+            type: "openmuse-google-client-config-failed",
+            service,
+-           error: error instanceof Error ? error.message : String(error),
++           error: sanitizeLastError(
++             error instanceof Error ? error.message : String(error),
++           ),
+          },
+          "openmuse-google-client-config-failed",
+        );
+      }
+
+
+─── server/src/openmuse-connectors/google-oauth.ts:549-561 ───
+[bug · medium] CAS 仅比对 status，无法防住同状态内的快照回退竞态：本调用读取行（connected, generation=G, identity=A）后 vendor
+才返回 401；若并发 refresh 在此间隙已成功愈合该行（status 仍为 connected，identity 变化时还会 generation+1），这条迟到写入仍能通过 status
+比对，把刚愈合的行整体回退为 refresh_required，并抹掉新 generation/identity——刚刷新成功的连接被标记为需要再刷新，且身份代际被倒退。注释声称“并发 refresh
+不会被此处回滚”，但按 status 比较的 CAS 恰恰覆盖不了同状态并发。建议在 expectStatus 之外增加读取时快照的代际/时间戳条件（如 connectedAt 或
+generation 的等值条件），或降级前重读行、仅当行仍与本快照一致时才写入。
+
+          if (error instanceof OpenConnectorAuthExpiredError) {
+-           await deps.rows.overwriteConnection(
++           // Compare-and-set on the SNAPSHOT this call read, not just the
++           // status: a concurrent refresh that healed the row in place (same
++           // status, new generation) must not be rolled back by this late
++           // write.
++           await deps.rows.overwriteConnectionSnapshot(
+              {
+                ...connection,
+                status: "refresh_required",
+                lastError: OpenMUSE_REFRESH_FAILED_MESSAGE,
+              },
+-             // CAS on the state this call read: a row that moved underneath
+-             // (a concurrent disconnect or refresh) is not rolled back here.
+              connection.status,
++             connection.generation,
+            );
+            throw new OpenMuseRefreshRequiredError(provider);
+          }
+
+
+─── server/src/openmuse-calendar/routes.ts:290-292 ───
+[bug · medium] 令牌成环(stoppedShort)提前终止且本页非空时,响应会携带 truncated=true 却没有任何 nextCursor:循环不变量保证了能停在
+seenTokens 分支时 remainingCount ≤ pageSize(否则上一轮迭代末尾已 break),故该路径 hasSurplus 恒为 false,且此处 pageFetches
+< MAX_PROVIDER_PAGES、stitchTimedOut === false,capped 恒为 false,于是 `last !== undefined && (hasSurplus
+|| capped)` 不成立。结果客户端拿到「还有更多」的截断标志却拿不到续传位置,从零重试又会再次进入同一令牌环——与已确认的空页场景(last ===
+undefined)不同,该非空页场景不会被「空页时从键集位置补发游标」的修复覆盖,属于同一缺陷族的残余路径,也与下方注释宣称的 honest cut(诚实截断)意图相悖。建议把
+stoppedShort 并入 capped(或将游标发射条件改为 truncated 时必发),使截断响应始终携带可续传的 nextCursor。
+
+      const capped =
+        (nextToken !== null && pageFetches >= MAX_PROVIDER_PAGES) ||
+-       stitchTimedOut;
++       stitchTimedOut ||
++       stoppedShort;
+
+
+─── server/src/openmuse-connectors/client.ts:151-158 ───
+[bug · medium] wire.json() 在检查 wire.ok 之前被无条件调用：任何不带 JSON 体（body 为空）的应答——204 No Content、空 200，甚至
+deleteConnection 文档化容忍的 404 若响应体为空——都会在 json() 处抛错并被归类为「vendor 不可读应答」，而不是走到 ok/absentOk 分支。连锁后果：①
+deleteConnection 的 404 容忍失效（404+空体仍抛错），disconnect 会 502 且行保持 connected，revokeOwner/D07 purge
+把该席位永久记为 retryable，删除清理形成活锁；② putClientConfig 成功也在 boot 时记 warn；③ forwardCallback 成功却 502，而 state 已被
+consumePending 花掉，用户只能重新发起同意。下方 record 的 body !== null 防御暗示作者预期过空体，但 json()
+抛错发生在其之前，防御形同虚设。建议：仅在确实需要 JSON 的分支才解析；wire.ok 或 absentOk 容忍的 404 上，解析失败应视作空体而非 vendor 故障。
+
+-     let body: unknown;
++     let body: unknown = null;
+      try {
+-       body = await wire.json();
++       if (wire.status !== 204) body = await wire.json();
+      } catch {
++       // An empty body on a success (or on the delete seam's tolerated 404)
++       // is absence, not an unreadable vendor answer.
++       if (wire.ok || (options?.absentOk === true && wire.status === 404)) {
++         body = null;
++       } else {
+-       throw new OpenConnectorOAuthError(
++         throw new OpenConnectorOAuthError(
+-         "OpenConnector answered with something this deployment could not read as JSON. Check the container and the address in OPENCONNECTOR_URL.",
++           "OpenConnector answered with something this deployment could not read as JSON. Check the container and the address in OPENCONNECTOR_URL.",
+-       );
++         );
++       }
+      }
+
+
+─── server/src/openmuse-deletion/shutdown.ts:76-80 ───
+[bug · medium] 补偿回放契约自我失效：此 throw 携带全部 transitions 供"补偿性 append marker.resources 回放"，但 routes.ts 的
+run() 会把该消息先经 sanitizeLastError（retention.ts 的 LAST_ERROR_MAX = 120 字符截断，token 形态则整体替换为 redacted
+文案）才写入 steps 应答，且本文件与 routes.ts 均无服务端日志落盘完整清单——超过 120 字符的 id 清单在任何地方都不复存在。而重试时上方 state-guarded
+UPDATE 不会再命中这些行，transitions 为空并报 ok，本注释点名防范的"append-only 证据静默丢失"仍会发生。建议 throw 前用 log.error 落盘完整
+transitions（或消息内只携带有界 id 样本 + 总数），让补偿数据存在于服务端而非仅依赖注定被截断的应答。
+
++       if (error instanceof Error) {
++         // Full ids must outlive the 120-char display guard the route runs on
++         // this message — log them server-side before the sanitized throw.
++         log.error(
++           { type: "openmuse-work-shutdown-record-failed", userId, transitions },
++           "openmuse-work-shutdown-record-failed",
++         );
++       }
+-         throw new Error(
++       throw new Error(
+-           `Failed recording ${transitions.length} shutdown transitions for ${userId} (${transitions.join(", ")}): ${
++         `Failed recording ${transitions.length} shutdown transitions for ${userId} (${transitions.join(", ")}): ${
+-             error instanceof Error ? error.message : String(error)
++           error instanceof Error ? error.message : String(error)
+-           }`,
++         }`,
+-         );
++       );
+
+
+─── server/src/openmuse-deletion/routes.ts:115-119 ───
+[bug · medium] 与同文件注释宣称的应答契约"an unwired deployment's answer keeps exactly the steps it can act
+on"矛盾：sessions/backup-retention 用 if 守卫落实了"仅在被接线时才命名步骤"，但 shutdown/revoke/manifest 三步在接线缺失时以
+Promise.resolve() 兜底并落为 "ok"——未接线被误报为执行成功，调用方与监控无法从 steps 区分"真的执行了"与"没接线"；且未接线时 steps.manifest="ok"
+而应答体中并无 manifest 字段，自相矛盾。生产装配（app.ts）五步均为条件接线，部分接线的部署会拿到失真应答。建议与 sessions/backup-retention 一致，用 if
+守卫三步的命名。
+
+-     await run("shutdown", () =>
+-       deps.shutdownOwnerWork
+-         ? deps.shutdownOwnerWork(context.var.actor.id)
+-         : Promise.resolve(),
+-     );
++     if (deps.shutdownOwnerWork) {
++       const shutdownOwnerWork = deps.shutdownOwnerWork;
++       await run("shutdown", () => shutdownOwnerWork(context.var.actor.id));
++     }
+
+
+─── server/src/openmuse-deletion/manifest.ts:221-226 ───
+[performance · medium] buildManifest 把 11
+组相互独立的枚举查询（marker/files/tasks/reviewed/goals/ideas/memories/notifications/connectors/agents/channels
+）逐个 await 串行执行。各枚举仅依赖 userId、彼此无数据依赖，且都位于删除请求的关键路径上（D04 由删除路由调用），清单构建延迟为全部查询之和，违背了"独立异步操作应用
+Promise.all 并行"的规范。attemptedKinds 的 push 在 attempt 内同步发生，故并行化不改变 resolveGaps/insertResources
+的语义与顺序。建议先发起全部 attempt 再以 Promise.all 收集，最后按原有稳定顺序拼装 resources。
+
+-       const resources: OpenMuseDeletionResourceInput[] = [
+-         ...(deps.marker
+-           ? await attempt(["openmuse-account-deletion"], () =>
++       const [
++         markerRefs,
++         fileRefs,
++         taskRefs,
++         reviewedRefs,
++         goalRefs,
++         ideaRefs,
++         memoryRefs,
++         notificationRefs,
++         connectorRefs,
++         agentRefs,
++         channelRefs,
++       ] = await Promise.all([
++         deps.marker
++           ? attempt(["openmuse-account-deletion"], () =>
+                deps.marker.enumerateOwner(userId),
+              )
+-           : gapRows(["openmuse-account-deletion"])),
++           : gapRows(["openmuse-account-deletion"]),
++         deps.files
++           ? attempt(["openmuse-file"], async () =>
++               (await deps.files?.enumerateOwner(userId)) ?? [],
++             )
++           : gapRows(["openmuse-file"]),
++         // ……其余 9 组枚举（含 connectorRefs）按同一形态并入 Promise.all；
++         // attemptedKinds 的 push 在 attempt 内同步完成，收集后仍按
++         // resolveGaps → insertResources 的原顺序落地。
++       ]);
++ 
++       const resources: OpenMuseDeletionResourceInput[] = [
++         ...markerRefs,
++         ...fileRefs,
++         ...taskRefs,
++         ...reviewedRefs,
++         ...goalRefs,
++         ...ideaRefs,
++         ...memoryRefs,
++         ...notificationRefs,
++         ...connectorRefs,
++         ...agentRefs,
++         ...channelRefs,
++       ];
+
+
+─── server/src/openmuse-deletion/purge.ts:64-64 ───
+[maintainability · medium] "openmuse-file-metadata" 这个 kind 是 D06↔D08 握手的契约字符串：purge-relational.ts 的
+EXTERNAL_KINDS 前置条件与 finalize 完全依赖与其精确匹配，但此处把它定义为工厂内私有常量，另一侧只能以裸字面量重复书写，改名时没有任何编译期保护——任一侧漂移都会让
+metadata 债务行永远不被认账，D08 的 finalize 永远 409。建议提升为模块级共享导出常量，供 D06 写入方与 D08 判定方共同引用。
+
+-   const OPENMUSE_FILE_METADATA_KIND = "openmuse-file-metadata";
++ /** D06 写入、D08 前置条件认账的 metadata 债务 kind——两侧共享同一来源。 */
++ export const OPENMUSE_FILE_METADATA_KIND = "openmuse-file-metadata";
+
+
+─── server/src/openmuse-deletion/purge-relational.ts:38-45 ───
+[maintainability · medium] EXTERNAL_KINDS 的四个 kind 全是与写入方重复硬编码的字面量："openmuse-file-metadata" 由
+purge.ts 的私有常量写入（改名时此处无保护）、两个 google 连接 kind 应与 manifest.ts 用来枚举的
+Object.keys(PROVIDER_BY_CONNECTION_KIND) 键集保持一致（此处再次手写即引入第二事实源）；连同下方 MARKER_KIND 的
+"openmuse-account-deletion" 与 manifest.ts 中的同名字面量，D08 的前置条件与 finalize
+判定完全悬在这些跨模块字符串的精确匹配上——任一处漂移都会静默破坏删除闭环（前置条件误放行或 finalize 永久 409）。建议统一引用共享导出的 kind 常量，google 连接 kind
+直接从 PROVIDER_BY_CONNECTION_KIND 派生。
+
+  const EXTERNAL_KINDS = new Set([
+    "openmuse-file",
+-   // D06's durable metadata debt: the bytes are gone, the openmuse_files row
+-   // is not — finalize waits for the pass that completes the hard delete.
+-   "openmuse-file-metadata",
+-   "openmuse-google-connection",
+-   "openmuse-google-calendar-connection",
++   OPENMUSE_FILE_METADATA_KIND,
++   ...Object.keys(PROVIDER_BY_CONNECTION_KIND),
+  ]);
+
+
+─── server/src/openmuse-files/store.ts:607-612 ───
+[bug · medium] appendVersion 修剪被取代版本时同步删除 blob：一个并发下载若在修剪前经 getOwnedFile 解析到旧 latest（read() 闭包捕获其
+bytePath），在修剪后执行 read() 将命中已删除的 blob，抛 "File ...'s bytes are missing"（全库唯一抛出点，无降级捕获），经
+routes.onError 归为 503——fill 完成瞬间同文件上正在进行的下载会失败。本文件已记录的 KNOWN RACE/LIMIT 仅覆盖并发 append
+分叉与配额检查非原子，未覆盖这条读者-修剪竞态。建议：修剪时只删版本行，blob 由清理任务延迟回收（或保留宽限期），使修剪前解析的 read() 仍能读到旧版本字节。
+
+          if (doomed.length > 0) {
++           // 只删版本行；blob 交给延迟清理任务回收，避免在飞 read() 命中已删 blob
+            await rows.deleteVersions(doomed.map((row) => row.versionId));
+-           for (const row of doomed) {
+-             await byteStore.delete(row.bytePath).catch(() => {});
+-           }
++           await scheduleByteSweep(doomed.map((row) => row.bytePath));
+          }
+
+
+─── server/src/openmuse-documents/routes.ts:46-46 ───
+[bug · high] 此处的「KNOWN MOUNT GAP」在 post-R5 仍未闭合,且影响被低估。已核实:app.ts 先在第 1877 行挂载 mobile-bff(其
+routes.use("*", bodyLimit({maxSize: 8_192})) 作用于全部 /api/mobile/*),后在第 1948 行才挂载本子应用;Hono
+按注册顺序组合中间件,因此 /fill 请求体超过 8 KiB 时会先被 family 限制 413,本路由的 1 MB 上限永远不生效。app.ts:1944-1945
+的注释只论证了「inspect 无请求体」却忽略了同一子应用还挂载了带体的 /fill 与 /transfer。而 MAX_FILL_TEXT_CHARS=10,000:单个 ASCII 字段的
+JSON 即约 10 KB > 8,192,意味着 §5 预算内的合法填充(哪怕单字段打满)在生产必然收到误导性 413,F06
+对大表单值整体不可用。这应从「记录的依赖」升级为必须的修复:将本子应用挂载移到 mobile-bff 之前(本子应用自带 requireUser,前置不影响鉴权),或按
+openMuseFiles/openMuseTasks 的先例挂入 bff 内、family 限制之前的通道。
+
+- const OPENMUSE_MAX_FILL_BODY_BYTES = 1_000_000;
++ // 修复方向(落点在 app.ts,不在本文件):
++ // app.route("/api/mobile/openmuse-files", openMuseDocuments); // 移到 app.route("/api/mobile", mobileBff) 之前
++ // 使本路由的 OPENMUSE_MAX_FILL_BODY_BYTES 成为实际生效的上限。
+
+
+─── server/src/openmuse-documents/routes.ts:313-316 ───
+[bug · medium] 版本分叉竞态在 post-R5 仍未闭合,且窗口比注释描述的更大。已核实三点:(1) store.ts:535-543 自述 check-then-insert
+非原子;(2) schema 的 openmuse_file_versions(openmuse.ts:76-90)根本没有 parent_version_id 列(溯源只存在内存
+seam),0096-0098 等新迁移也未补任何唯一约束,注释设想的「带唯一索引的迁移」并不存在;(3) 竞态窗口不止于 latest 检查与 insert 之间——两次 fill 各自的
+inspect 解析、applyFill 重解析、最长 10 MiB 的 byteStore.put 都发生在检查之前,同一 owner 双端并发提交即可双双通过 stale-parent
+检查后落地,形成同父双子版本,后续 latestVersion 取值与 prune 归属均不确定。若本轮认证要求闭合,最小修复是持久化 provenance 列并加 (file_id,
+parent_version_id) 部分唯一索引(仅约束非原始版本),或以每文件 advisory lock/SELECT FOR UPDATE 事务化检查与插入。
+
+-         return context.json(
+-           { error: "A newer version exists; reload the file and fill again." },
+-           409,
+-         );
++ // 迁移方向:
++ // ALTER TABLE openmuse_file_versions ADD COLUMN parent_version_id text;
++ // CREATE UNIQUE INDEX openmuse_file_versions_parent_uq
++ //   ON openmuse_file_versions (file_id, parent_version_id)
++ //   WHERE parent_version_id IS NOT NULL;
+
+
+─── server/src/openmuse-documents/routes.ts:366-377 ───
+[security · medium] transfer 路由是三条路由中唯一没有本地 bodyLimit 的:fill 有 1 MB 上限、openMuseTasks 有 64 KiB 先例(bff
+内注释明言「挂在 family 限制之前,必须自带限制」),而 transfer 直接 await context.req.json() 无任何本地上限。当前它仅被 family 8
+KiB「偶然」兜底——而这恰是问题 1 要修复的同一挂载缺口;一旦把本子应用前移出 family 限制的覆盖范围(修复 fill 必需),transfer 将变成对已认证用户开放的无上限 JSON
+读入与解析,构成内存放大 DoS 面。无论挂载顺序如何调整,本路由都应自带与 tasks 同级的 bodyLimit。
+
+-     let body: unknown;
+-     try {
+-       body = await context.req.json();
+-     } catch {
+-       return context.json(
+-         {
+-           error:
+-             "The transfer needs a JSON body with versionId and transferKey.",
+-         },
+-         400,
++   routes.post(
++     "/:id/transfer",
++     bodyLimit({
++       maxSize: 64 * 1024, // 与 openMuseTasks 的本地限制同级
++       onError: (context) =>
++         context.json({ error: "The transfer body is too large." }, 413),
++     }),
++     async (context) => { /* ... */ },
+-       );
++   );
+-     }
+
+
+─── server/src/openmuse-documents/routes.ts:400-408 ───
+[bug · medium] F09 转移在生产是永久 503 死面,且其失败清理 seam 以当前 gateway 能力不可能实现。已核实:(1) index.ts:4295-4298
+创建本子应用时只传了 { store, requireUser },transferWorkspace 从未注入,transfer 在生产对任何请求必然走到此处返回 503——transfer.ts
+全部 219 行与 ledger 幂等/防覆盖逻辑在生产零执行;(2) ComputerGateway 至今只有 list/read/write 三个文件动词,无任何删除能力(全文件无
+remove/delete 文件方法),transfer.ts 头部 seam citation 也自认这一点,而本路由的失败清理(filesystem.remove)与二进制写入(write
+bytes)都是接线时的硬前置。若本轮认证允许「接线归后续票」,至少应确认后续票的依赖清单里同时包含 gateway 的二进制写与删除两个动词,否则接线票落地时 transfer.ts 的 §5
+承诺(半写工件绝不报完成)无法兑现。
+
+
+
+─── server/src/openmuse-documents/fill.ts:136-137 ───
+[performance · medium] 同一份字节(上限 10 MiB,OPENMUSE_MAX_PDF_BYTES = 10 * 1024 * 1024)在每次 fill 中被完整
+pdf-lib 解析两次:路由先经 inspectPdfDocument → createPdfFieldExtractor → loadPdfDocument 解析一次并丢弃文档,applyFill
+的生产适配器又对同一 bytes 重新 loadPdfDocument。峰值内存虽为顺序单份,但 CPU 开销约翻倍,叠加 appearance 重算与 save,使 fill
+成为最重的已认证端点,且 owner 可高频重放放大。adapter seam 目前只收 bytes,无法复用已加载文档;而 applyFill 的 inspection 参数实际只用了
+.supported(生产适配器形参名为 _supported,完全忽略)——seam 形状本身就在阻止复用。建议让适配器接受已加载的 PDFDocument(或注入 loader),使 fill
+全程只解析一次,inspection 与填充共享同一文档实例。
+
+-   return async (bytes, _supported, values) => {
+-     const doc = await loadPdfDocument(bytes);
++ export type PdfFillAdapter = (
++   doc: PDFDocument,
++   supported: PdfInspection["supported"],
++   values: TypedPdfFillValues,
++ ) => Promise<Uint8Array>;
++ // applyFill 改为接收 loadPdfDocument 的产物并传入,生产与测试适配器共享一次解析。
+
+
+─── server/src/openmuse-files/routes.ts:174-175 ───
+[bug · medium] PDF 魔数（hasPdfMagic）只用于放宽 415 分类门槛和选择 10 MiB 上限，但入库的 mimeType 仍是未佐证的嗅探结果，未归一为
+PDF_MIME，造成两个问题：(1) 功能断裂——合法 PDF 若以泛型声明上传（application/octet-stream 或空 claim，PDF 字节非 UTF-8
+且无图片签名，sniffMimeType 必回落到 octet-stream），会被 isPdf 门槛放行却以 "application/octet-stream" 落库，随后
+openmuse-documents 的 inspect/fill 路由因 `owned.file.mimeType !== "application/pdf"` 直接 400 "Only PDFs
+can be inspected"，同一份上传路径明确放行、下游一律拒绝；(2) 门槛旁路——带 "%PDF-" 前缀的 polyglot 声明 "text/html" 时，sniff 按契约原样返回
+"text/html"（正是该契约要求调用方拒绝的名字），isPdf 令 `!isPdf` 短路跳过 classify 拒绝，被拒绝的 MIME 名仍被存储并以此 Content-Type
+从本源服务（仅靠 attachment+nosniff 兜底）。同文件的 Gmail 导入路径验证魔数后显式存 PDF_MIME，上传路径应保持一致：isPdf 为真时将存储类型钉为
+PDF_MIME。
+
+-       const mimeType = sniffMimeType(bytes, part.type);
+-       const isPdf = mimeType === PDF_MIME || hasPdfMagic(bytes);
++       const sniffed = sniffMimeType(bytes, part.type);
++       const isPdf = sniffed === PDF_MIME || hasPdfMagic(bytes);
++       // The magic outvote must also normalize what is stored: admitting the
++       // bytes as a PDF while keeping the un-corroborated sniffed name lands
++       // genuine PDFs (generic claim → "application/octet-stream") as
++       // non-PDFs that inspect/fill then refuse, and lets a "%PDF-"-prefixed
++       // polyglot claimed "text/html" bypass the classify refusal yet store
++       // the refused name. The Gmail import stores PDF_MIME; mirror it.
++       const mimeType = isPdf ? PDF_MIME : sniffed;
+
+
+─── server/src/openmuse-mail/client.ts:41-45 ───
+[bug · high] 五个 Gmail 动作 ID 全部硬编码为占位字符串，仓库内不存在对 listServiceActions("gmail") 目录的启动期核对，唯一防线是模块加载时的一条
+log.info。同批姊妹模块 openmuse-calendar/client.ts 的占位 ID 采用 `process.env.OPENCONNECTOR_GCAL_LIST_ACTION_ID
+?? "gcalendar.list"` 的环境变量覆盖（其注释明言：catalogue mismatch 是部署变量而非重新发版）；本模块破坏了该家族模式——若 O02
+部署核对发现占位符与线上目录不符，列表/搜索/线程/附件全链路将以 502 失效，且只能改代码重新发布。建议比照 calendar 模式为五个 ID 提供环境变量覆盖，或在模块加载时经 adapter
+的 listServiceActions 做一次目录断言。
+
+- export const GMAIL_LIST_ACTION_ID = "gmail.list";
+- export const GMAIL_SEARCH_ACTION_ID = "gmail.search";
+- export const GMAIL_THREAD_ACTION_ID = "gmail.thread";
+- export const GMAIL_ATTACHMENT_GET_ACTION_ID = "gmail.attachment.get";
+- export const GMAIL_ATTACHMENT_BYTES_ACTION_ID = "gmail.attachment.bytes";
++ export const GMAIL_LIST_ACTION_ID =
++   process.env.OPENCONNECTOR_GMAIL_LIST_ACTION_ID ?? "gmail.list";
++ export const GMAIL_SEARCH_ACTION_ID =
++   process.env.OPENCONNECTOR_GMAIL_SEARCH_ACTION_ID ?? "gmail.search";
++ export const GMAIL_THREAD_ACTION_ID =
++   process.env.OPENCONNECTOR_GMAIL_THREAD_ACTION_ID ?? "gmail.thread";
++ export const GMAIL_ATTACHMENT_GET_ACTION_ID =
++   process.env.OPENCONNECTOR_GMAIL_ATTACHMENT_GET_ACTION_ID ??
++   "gmail.attachment.get";
++ export const GMAIL_ATTACHMENT_BYTES_ACTION_ID =
++   process.env.OPENCONNECTOR_GMAIL_ATTACHMENT_BYTES_ACTION_ID ??
++   "gmail.attachment.bytes";
+
+
+─── server/src/openmuse-mail/mail.ts:55-58 ───
+[bug · medium] client.ts 的 providerAnswerOf 仅校验 messages 是数组便整组透传（不过滤元素），routes.ts
+将每个元素直接传入本函数。若供应商页内混入 null/undefined 行，`row.id` 将抛 TypeError，使整页列表请求落入 onError 兜底 503，与本函数注释"a row
+that cannot even be named is dropped rather than guessed at"的契约相悖；线程路径经 {...row} 展开虽不抛错，却会把空行映射成派生
+ID 的幽灵消息。建议入口处先做非空/对象类型防护，将不可读行安全丢弃。
+
+  export function mapProviderMessage(
+    row: GmailProviderMessage,
+  ): OpenMuseMailMessage | null {
++   if (row === null || typeof row !== "object") return null;
+    if (typeof row.id !== "string" || row.id === "") return null;
+
+
+─── server/src/openmuse-mail/client.ts:243-250 ───
+[bug · medium] dialAction 只对 wire.json() 做了包装；deps.dial（真实 fetch）的网络拒绝与 AbortSignal.timeout(30_000)
+超时异常会原样上抛，绕过 OpenMuseMailVendorError 分类落入 routes.ts 的通用 503
+分支——与"OpenMuseMailVendorError：供应商失败被命名以便路由答 502"的类注释不一致，且 openmuse-mail-vendor-failed
+监控日志对传输层故障完全不可见（503 与"未配置 OPENCONNECTOR_URL"的 503 无法区分，误导告警与重试语义）。相比之下 JSON 解析失败（同类供应商故障）却能拿到 502 +
+日志，分类不一致。建议同样以 try/catch 归一为 OpenMuseMailVendorError（可与 JSON
+解析失败区分文案）。注意：openmuse-calendar/client.ts 共享同一 dial 且存在同样缺口，宜在共享缝一并修复。
+
+-     const wire = await deps.dial(
+-       `/v1/actions/${encodeURIComponent(actionId)}`,
+-       {
++     let wire: Awaited<ReturnType<MailWireDial>>;
++     try {
++       wire = await deps.dial(`/v1/actions/${encodeURIComponent(actionId)}`, {
+          method: "POST",
+          headers: { "x-oo-connector-alias": alias },
+          body: { input },
+-       },
++       });
++     } catch (error) {
++       log.warn(
++         { type: "openmuse-mail-vendor-failed", actionId, transport: true },
++         "openmuse-mail-vendor-failed",
++       );
++       throw new OpenMuseMailVendorError(
++         `The Gmail service could not be reached (${error instanceof Error ? error.message : "unknown transport failure"}).`,
+-     );
++       );
++     }
+
+
+─── server/src/openmuse-notifications/store.ts:245-247 ───
+[maintainability · medium] insertNotification 函数体首行重复声明了 `const ownerDisabledRow =
+createOwnerDisabled(database);`，与外层（第 243
+行）同名声明形成遮蔽，且函数内从未引用——每次插入都会白白构造一个闭包。缩进异常（未随函数体缩进）表明这是合并残留的死代码，还会误导维护者以为插入路径本身需要围栏检查。应删除此行。
+
+      async insertNotification(row) {
+-   const ownerDisabledRow = createOwnerDisabled(database);
+        const inserted = await database
+
+
+─── server/src/openmuse-notifications/store.ts:7-7 ───
+[maintainability · medium] 导入的 `openmuseAccountDeletions` 在本文件内完全没有使用点，属残留死导入：它让通知 store
+对删除模块产生了一个本不存在的模块级依赖（实际依赖方向相反——删除模块的 manifest/purge/restore 反向引用本 store）。已确认
+openmuse-deletion/store.ts 并不反向导入本模块，故无运行时循环，但该无谓耦合仍应移除。
+
+
+
+─── server/src/openmuse-mail/client.ts:222-227 ───
+[security · medium] 附件字节的 25 MiB 上限只在 routes.ts 的 byteLength 复检处生效，而该复检发生在全部缓冲完成之后：wire.json()
+先整体缓冲供应商响应，随后这里 replaceAll 产生整份 base64 副本、Buffer.from 解码、new Uint8Array 再拷贝一次——即使合法的 25 MiB
+附件，单请求峰值内存也约为成品体积的数倍（base64 ≈34MB 同时存活多份）；而 routes.ts 自己记录的威胁场景「稀疏/撒谎的供应商应答（size 读为 0）」恰好绕过元数据预检，让
+bytes 拨号可拉取任意大载荷，30 秒窗口内足以放大成内存耗尽。建议在解码前加一道按 base64 长度换算的廉价防护（上限常量可下沉到本模块导出，routes.ts 已反向依赖本模块，或将
+maxBytes 经 buildOpenMuseMailClient deps 注入），把「撒谎供应商」从潜在 OOM 降级为干净的供应商错误。
+
++   if (typeof record?.data !== "string" || record.data === "") {
++     throw new OpenMuseMailVendorError(
++       "The Gmail attachment bytes came back in a shape this deployment could not read.",
++     );
++   }
++   // Decode-side ceiling: base64 inflates ~4/3, so a payload longer than this
++   // cannot be a within-limit attachment — refuse before any full-size copy
++   // exists (the routes re-check runs only after this decode has buffered).
++   const maxBase64Length = Math.ceil((ATTACHMENT_MAX_BYTES + 2) / 3) * 4;
++   if (record.data.length > maxBase64Length) {
++     throw new OpenMuseMailVendorError(
++       "The Gmail attachment came back over this deployment's byte ceiling.",
++     );
++   }
+    const bytes = new Uint8Array(
+      Buffer.from(
+        record.data.replaceAll("-", "+").replaceAll("_", "/"),
+        "base64",
+      ),
+    );
+
+
+─── server/src/openmuse-ops/signals.ts:349-356 ───
+[performance · medium] 该读取器每次调用都执行 WHERE status = 'outcome_unknown' 的全表扫描：openmuse_reviewed_actions
+是只增历史表（succeeded/failed/denied 等已决行永久保留），且表上没有任何以 status 为首列的索引（owner_created_idx 与部分唯一索引
+active_send_uq 均以 owner_user_id 为首列，无法服务仅按 status 过滤的查询）。/signals 是运维健康面、可被轮询，扫描成本将随历史行数线性放大。建议在
+schema 中补一个部分索引，如
+index("openmuse_reviewed_actions_outcome_unknown_idx").on(table.createdAt).where(sql`${table.status}
+= 'outcome_unknown'`)，使该读取器与 taskQueue() 一样有索引支撑。
+
++       // 结果集应恒为小集合（outcome_unknown 是例外态），但过滤本身无索引：
++       // 需在 openmuse_reviewed_actions 上补部分索引（见 schema 建议），
++       // 否则本查询随历史行数增长退化为逐次全表扫描。
+        const actions = await deps.database
+          .select({
+            id: openmuseReviewedActions.id,
+            ownerUserId: openmuseReviewedActions.ownerUserId,
+            createdAt: openmuseReviewedActions.createdAt,
+          })
+          .from(openmuseReviewedActions)
+          .where(eq(openmuseReviewedActions.status, "outcome_unknown"));
+
+
+─── server/src/openmuse-personal/tools.ts:128-130 ───
+[bug · medium] 配额检查存在 check-then-act 竞态：tasks.activeTasks(...) 与 tasks.create(...) 是两次独立调用，create
+内部（openmuse-tasks/store.ts:711-798）只有 ownerDisabled 与幂等键处理，没有配额兜底校验。模型在同一轮对话中并发触发多次
+task_delegate、或该工具与 HTTP 创建路由（routes.ts:432 同样是先查后插）交错时，可在检查与写入之间的窗口内双双通过，使活跃任务数超过
+ACTIVE_TASKS_PER_USER——而每个委托任务对应一次完整的 headless agent 运行。建议把上限校验下沉到 tasks.create 的同一事务/条件写内（如 INSERT
+... WHERE 计数子查询小于上限，或事务内 SELECT ... FOR UPDATE 再插入），本处的预检查保留为快速拒绝路径即可；HTTP 路由与工具两条路径也将随之同时收敛。
+
++         // 仅作快速拒绝路径：真正的上限必须由 tasks.create 在同一事务/条件写内
++         // 兜底执行，避免并发委托双双通过检查突破 ACTIVE_TASKS_PER_USER。
+          if ((await tasks.activeTasks(ownerUserId)) >= ACTIVE_TASKS_PER_USER) {
+            return `${REFUSAL_MARKER} The owner's active Task quota is full (${TASK_LIMIT_MESSAGE}); tell the person delegation is unavailable rather than retrying.`;
+          }
+
+
+─── server/src/openmuse-ops/signals.ts:211-213 ───
+[bug · medium] 该过滤会把「重试次数已耗尽的终态队列行」误报为 stuck_task / queued-runnable（"runnable ... without a worker
+claim"）。queue.claim 只领取 attempts < maxAttempts 的行（openmuse 任务为 2），耗尽后的行
+claimedBy=null、finishedAt=null、永不再被认领，runner（T07）将其视为 wedged/done-with，仅由 7 天后的 reap
+清除；在此窗口内这些行会持续满足 now - runAt > 5min 而产生误报（最长 7 天/行），且同一 task 以新 key 重新 offer
+后旧行仍继续报警，既产生噪音又掩盖真正的卡死行、并误导处置方向（应重新 offer 而非等待 worker）。根因是下方 taskQueue 读取器未选择 attempts（及
+lastError），聚合层无法区分「等待 worker」与「已达上限的终态」。建议：读取器补选 workItems.attempts 并加入
+OpenMuseOpsTaskQueueRow，在此过滤中排除（或单独分类）attempts 已达上限的行。
+
++ // reader:
++ .select({
++   key: workItems.key,
++   payload: workItems.payload,
++   runAt: workItems.runAt,
++   claimedBy: workItems.claimedBy,
++   leaseUntil: workItems.leaseUntil,
++   finishedAt: workItems.finishedAt,
++   attempts: workItems.attempts,
++ })
++ // filter:
+-                 if (row.finishedAt !== null) return false;
++ if (row.finishedAt !== null) return false;
++ // 已达重试上限的行是终态（claim 永不再领取，仅等 reap），不是 runnable。
++ if (row.attempts >= maxAttempts) return false;
+-                 if (row.claimedBy === null)
++ if (row.claimedBy === null)
+-                   return at.getTime() - row.runAt.getTime() > queuedRunnableMs;
++   return at.getTime() - row.runAt.getTime() > queuedRunnableMs;
+
+
+─── server/src/openmuse-reviewed-actions/service.ts:558-562 ───
+[bug · medium] reconcile 收尾时的 claimTransition 不带任何 patch：confirmed_succeeded 分支只把操作员读回的
+providerEventId 写进 attempt 行，动作行顶层的 providerRef 与 completedAt 保持
+null；而正常执行路径（settleExecution）两条都写。此外 recoverAbandonedExecutions（resetStaleExecuting）把 executing 翻成
+outcome_unknown 时也不写 completedAt，reconcile 关闭时同样不补。结果是同一成功动作在 routes.ts 的 actionJson 里顶层
+providerRef/completedAt 为 null、receipt 里却有值——action 行与 attempt
+行账目口径分裂，按顶层字段做展示或对账的消费者会拿到自相矛盾的数据。store 的 ClaimPatch 本就支持这两个字段，属于可修复的遗漏：建议在此处补 patch { completedAt:
+now(), ...(confirmed_succeeded 且有 providerEventId 时 providerRef) }。
+
+        const settled = await rows.claimTransition(
+          id,
+          "outcome_unknown",
+          input.outcome === "confirmed_succeeded" ? "succeeded" : "failed",
++         {
++           completedAt: now(),
++           ...(input.outcome === "confirmed_succeeded" && input.providerEventId
++             ? { providerRef: input.providerEventId }
++             : {}),
++         },
+        );
+
+
+─── server/src/openmuse-reviewed-actions/store.ts:332-334 ───
+[bug · medium] 本 stub 的注释自述"D01 标记尚不存在，标记落地前所有 owner 视为 enabled"，但同一批更新里 D01
+标记已存在（openmuseAccountDeletions，phase='fenced'），且家族内其他 store 均直接读取它：connectors store、files/tasks
+store、goals/ideas/memories/notifications 经 shared 的 createOwnerDisabled。本 store 恒返 false 使 service
+层栅栏（propose/decide/list/get 及 createOpenMuseActivityReviewedLister 的 ownerDisabled
+抛错）全部失活。/api/mobile HTTP 面确有 app.ts 注册的 openMuseAccountFence 中间件兜底，但 T16 的
+createDocumentReplyReview.propose 走 openmuse-tasks runner 的后台路径、不经该 fence，fenced owner 仍可落提案行。建议照
+connectors store 的做法读取真实标记（或复用 createOwnerDisabled），并同步修正上述过时注释。
+
+-     async ownerDisabled() {
+-       return false;
++     // D01 的标记表即 deleted-owner fence：phase-aware 直读，与 connectors/
++     // personal 系 store 同一查询，restored 标记自动重新准入。
++     ownerDisabled: async (ownerUserId) => {
++       const rows = await database
++         .select({ userId: openmuseAccountDeletions.userId })
++         .from(openmuseAccountDeletions)
++         .where(
++           and(
++             eq(openmuseAccountDeletions.userId, ownerUserId),
++             eq(openmuseAccountDeletions.phase, "fenced"),
++           ),
++         );
++       return rows.length > 0;
+      },
+
+
+─── server/src/openmuse-reviewed-actions/gmail-send-executor.ts:166-173 ───
+[other · medium] 占位 action id（gmail.send、gcalendar.create/update/delete，及 update/delete 预读的
+gcalendar.get）在全仓没有任何目录/别名映射或启动校验，grep 证实这些 id 只在本模块与测试中出现；calendar 客户端的 callAction 与本处 dial 都把 id
+原样拼进 `/v1/actions/<id>` 直达供应商。O02 部署核验一旦缺位，每次审批后的执行都会收到供应商 4xx 而必然 settled `failed`（update/delete 的
+etag 预读则 404→null→预检静默跳过），整个评审动作特性上线即功能失效，目前仅靠部署纪律（注释记录的 O02/S20/S21）兜底、代码层零强制。建议以配置/env 注入真实目录 id
+并在装配处做启动断言，让缺口在 boot 时显式暴露而非静默降级。
+
++         // 占位 id 的目录绑定（O02）以配置注入并在装配处断言，缺失即拒绝
++         // 启动，而非让每次审批都以供应商 4xx 落 failed。
+          const dialled = dial(
+-           `/v1/actions/${encodeURIComponent(GMAIL_SEND_ACTION_ID)}`,
++           `/v1/actions/${encodeURIComponent(gmailSendActionIdForDeployment)}`,
+            {
+              method: "POST",
+              headers: { "x-oo-connector-alias": connection.alias },
+              body: { input: parsed.data },
+            },
+          );
+
+
+─── server/src/openmuse-reviewed-actions/calendar-create-executor.ts:183-190 ───
+[maintainability · medium] "kind 守卫 → payload 重解析 → vendor 客户端缺失分支 → requireConnection → 连接漂移检查 →
+deadline 竞速 → dialled.catch(()=>{}) → 4xx/5xx 结果映射（此块）→ 不可读 answer → outcome_unknown 兜底 → finally 清理
+deadline" 的执行骨架在 gmail-send/create/update/delete 四个执行器中近乎逐行重复（各约 150–170 行）；executor.ts 目前只抽了
+envelopeFieldOf/vendorDetailOf/readCurrentEtag 三个小件。结果映射、超时语义或日志字段一旦修复（例如 4xx
+边界、竞速清理）必须同步改四处，极易漂移。建议仿照 readCurrentEtag 的做法，把骨架抽成公共执行模板（注入 kind、拨号函数、providerRef
+读取器与服务/名词文案），四个执行器只保留各自的差异部分。
+
++           // 该 4xx→failed / 其余→outcome_unknown 的映射是四个执行器的
++           // 逐字副本：抽到 executor.ts 的公共执行模板里，修一处生效四处。
+            if (
+              answer.status !== null &&
+              answer.status >= 400 &&
+              answer.status < 500
+            ) {
+              return { outcome: "failed", error: detail, fingerprint };
+            }
+            return { outcome: "outcome_unknown", error: detail, fingerprint };
+
+
+─── server/src/openmuse-tasks/runner.ts:2281-2286 ───
+[bug · high] 该外层 catch 意图只覆盖「行/渠道无法解析」，但实际捕获范围内包含多个可瞬时抛错的数据库调用（store.get、store.ownerDisabled、各 kind
+分支的首次 running-settle、generic 分支的 actorFor/channels.direct）。任何一次瞬时 DB 故障都会走到这里：不写日志、不落失败证据、不发通知，仅
+finish() 销毁队列项——队列项删除后 claim 不再发放，行永久停留 queued/scheduled/running；running 行还会永久占用
+ACTIVE_TASKS_PER_USER=100 名额（取消矩阵对 running 只置 cancellationRequested
+标志，而队列项已消失、无人再消费该标志），用户无任何自救路径。同文件 offerContinuation 的注释已自认「no reconciliation scan exists to re-find
+it」，而全库检索确认 openmuse-tasks 下确无任何补偿扫描。此外 maxAttempts: 2 的 wedged 项被 reap(maxAttempts: 2) 回收后同样坐实
+running 行永久搁浅。建议：至少将错误记入 log.error（与 openmuse-task-reoffer-failed 同级），并考虑在 catch 内对已 claim
+到的行落一条失败证据（CAS 容错），或引入周期性 reconciliation 扫描重新 offer 无队列项的非终态行。
+
+-       } catch {
+-         // The row or the channel could not be resolved: over, and the queue
+-         // row with it, best-effort — the outer claim must survive either way.
++       } catch (error) {
++         // Best-effort, but never silent: the row is now stranded (queued or
++         // running with no queue item and no reconciliation scan to re-find
++         // it), so the failure must at least be visible in the logs.
++         log.error(
++           {
++             type: "openmuse-task-claim-dispatch-failed",
++             key: item.key,
++             error: error instanceof Error ? error.message : String(error),
++           },
++           "openmuse-task-claim-dispatch-failed",
++         );
+          await finish().catch(() => {});
+          report.skipped.push(item.key);
+        }
+
+
+─── server/src/openmuse-tasks/store.ts:1299-1310 ───
+[bug · medium] 取消/暂停 CAS 矩阵只接受 queued/scheduled/paused（或 running 置标志），对 waiting_input/waiting_review
+一律 unapplied → 路由层 409。而 countActiveByOwner 将这两个状态计入 ACTIVE_TASKS_PER_USER=100 活跃上限：owner
+无法放弃自己卡在等待的任务——尤其 runner 轮询到 outcome_unknown 后会写上不确定标记并永久停止轮询（runner.ts「no further poll or proposal
+follows」），reviewed-actions 的 expired 翻转只发生在 resolve 调用时、因此永远无法触达该行——名额被无限期占用。该矩阵还与
+shutdownOwnerTasks 批量取消 waiting_* 直接矛盾（代码仅以 RECORDED DIVERGENCE 记录、未裁决）。建议：将
+waiting_input/waiting_review 纳入单行取消矩阵（取消时清除 wait 或保留作记录），或至少为 waiting_review 提供 owner 侧终止路径，并同步裁决与
+shutdownOwnerTasks 的分歧。
+
+          .where(
+            and(
+              eq(openmuseTasks.id, id),
+              or(
+-               inArray(openmuseTasks.status, ["queued", "scheduled", "paused"]),
++               inArray(openmuseTasks.status, [
++                 "queued",
++                 "scheduled",
++                 "paused",
++                 "waiting_input",
++                 "waiting_review",
++               ]),
+                and(
+                  eq(openmuseTasks.status, "running"),
+                  eq(openmuseTasks.cancellationRequested, false),
+                ),
+              ),
+            ),
+          )
+
+
+─── server/src/openmuse-tasks/runner.ts:608-611 ───
+[maintainability · medium] 「租约恢复 prologue」（attempts>1 判定 → ofCurrentAttempt 先验效应检查 → ambiguous
+失败落账/notify → attempts CAS 自增 → ifStatus running-settle）在本文件中以近乎相同的形态复制了 4
+份（monitor/finance/document/generic，行 609/906/1340/1782，每份约 40 行），cancel/pause 安全边界落账块亦有 9
+处雷同。各副本已开始出现细微分叉（generic 分支的 priorEffect 额外检查 steps、monitor 分支的 ambiguous 文案与其余不同），对恢复启发式的任何修复都需同步修改
+4 处以上，漏改即造成各 kind 行为分叉——这类一致性恰是 T07 exactly-once 语义的命脉。建议抽取为单一辅助函数（如 recoverLease(task, item, {
+ambiguousDetail, priorEffect }) 与 consumeStopRequest(task, generation)），各分支只传入差异项。
+
++           // One shared recovery prologue for every kind: the 4 inline copies
++           // (monitor/finance/document/generic) drift already — extract it.
+            let generation: number;
+            if (task.status === "running" && item.attempts > 1) {
+              /*
+               * T07's shape, a monitor's: a lease lost with prior
+
+
+─── server/src/openmuse-reviewed-actions/service.ts:527-530 ───
+[bug · high] 这里对 "无 attempt 行" 的 outcome_unknown 是一条永久死路：当 decide 已提交 claim（行变 executing）但
+insertAttempt 尚未提交时进程崩溃（或 insert 本身失败），行会被 boot 时的 recoverAbandonedExecutions/resetStaleExecuting 翻成
+outcome_unknown，但该行没有任何 attempt。此后三条出路全部关闭——reconcile 在此直接抛 ConflictError（409 文案还误称 "executing and
+not decisionable"）；decide/cancel 把 outcome_unknown 当终态原样返回；同一逻辑发送的重提议被 findSettledSameSend（含
+outcome_unknown）和 openmuse_reviewed_actions_active_send_uq 索引双重永久拒绝。settleExecution 的注释声称 "a crash
+mid-execution leaves the durable attemptId reconciliation works from"，但恰好漏掉了 attempt
+插入本身失败的窗口，结果是只能手工改库才能解开的核心安全门。建议：reconcile 容忍缺失的 attempt（就地补一条 tombstone attempt 记录 reconciliation
+后照常走 claimTransition），或让 resetStaleExecuting 只翻转存在 attempt 的行、对缺失者补建 attempt/直接置 failed（此刻可证请求未发出）。
+
+-       const attempt = await rows.latestAttempt(id);
++       let attempt = await rows.latestAttempt(id);
+        if (!attempt) {
+-         throw new ReviewedActionConflictError();
++         // crash between claim and the attempt insert → no attempt row.
++         // Backfill a tombstone attempt so the operator can still close the
++         // tail instead of wedging this action (and its re-proposal gate)
++         // permanently.
++         attempt = await rows.insertRecoveredAttempt(id, reviewer);
+        }
+
+
+─── server/src/openmuse-reviewed-actions/gmail-send-executor.ts:232-237 ───
+[bug · medium] generic catch 把"拨号之前"抛出的错误也归类为 outcome_unknown，但错误文案断言
+"服务没有应答、是否已发送未知"——这不成立：requireConnection 只是本地行读取（requireConnection 内部为 rows.getConnection，不发起任何
+provider 拨号），它在 callAction/dial 之前执行；此刻请求根本没构建。OpenMuseRefreshRequiredError 因是 ConnectionRefused
+子类会被正确判为 definite failed，但 requireConnection 的瞬时 DB 读错误（或任何非预期异常）会走到这里，把一个确定未发送的发送/创建/更新/删除永久写成
+outcome_unknown：审计记录了不实句子、需要操作员 reconcile、且 findSettledSameSend 会以 "uncertain"
+封锁该逻辑发送的重提议。四个执行器（gmail.send 与 gcalendar 三件套）同构地存在此问题。建议把 pre-dial 区域（requireConnection + 漂移检查）与
+post-dial 区域分开 try：拨号前发生的非预期错误应 definite failed（请求可证未离开）。
+
+-         return {
+-           outcome: "outcome_unknown",
+-           error:
+-             "The Gmail service did not answer this send; whether it was sent is unknown.",
+-           fingerprint: fingerprintOf(proposal),
+-         };
++       } catch (error) {
++         if (error instanceof OpenMuseConnectionRefusedError) {
++           return { outcome: "failed", error: error.message, fingerprint: fingerprintOf(proposal) };
++         }
++         // Errors raised BEFORE the dial existed (requireConnection's row
++         // read) are a definite non-send; only failures after the request
++         // may have left settle outcome_unknown.
++         return { outcome: "failed", error: "", fingerprint: fingerprintOf(proposal) };
++       }
+
+
+─── server/src/openmuse-reviewed-actions/service.ts:475-477 ───
+[bug · medium] 部分唯一索引覆盖 awaiting_review/executing/outcome_unknown，而 findSettledSameSend 的封锁查询刻意不含
+awaiting_review，于是最常见的重复提议（客户端重试，而上一个同类 proposal 还在等审批）只能落到这个 23505 兜底——它一律回答 reason:"uncertain"，409
+文案是 "prior send ... still uncertain; an operator must reconcile it"。但对 awaiting_review
+的孪生行，什么都没有被尝试过、没有任何不确定性，用户自己取消/审批该 proposal（或等 30 分钟 TTL 过期）即可重新提议，既不需要操作员也不存在 reconcile
+对象。普通重试路径会收到双重误导的指引（requires-operator + uncertain）。建议区分两种封锁来源：让 findSettledSameSend（或兜底后的复查查询）也覆盖
+awaiting_review 并返回阻断行，据其 status 给出真实 reason（如 awaiting/already_proposed）与对应文案；至少应为该情形修正 409 消息。
+
+          if (isActiveSendUniqueViolation(error)) {
+-           throw new ReviewedActionReproposalError("uncertain");
++           // The index holds awaiting_review twins too: nothing was ever
++           // attempted there, so "uncertain / call an operator" is wrong.
++           // Re-query including awaiting_review and answer the real state.
++           const twin = await rows.findSettledSameSendIncludingAwaiting(
++             ownerUserId, input.kind, payloadHash, input.targetId ?? null,
++           );
++           throw new ReviewedActionReproposalError(
++             twin?.status === "succeeded" ? "already_sent" : "uncertain",
++           );
+          }
+
+
+LLM retry report summary: 22 of 798 requests affected -- 1 request failed, 11 requests cancelled, 10 requests recovered after retry
+
+Review planning (1 request):
+- server/drizzle/meta/0085_snapshot.json: network error -> succeeded
+
+Core review (10 requests):
+- server/src/openmuse-tasks/capacity.ts,server/src/openmuse-tasks/routes.ts,server/src/openmuse-tasks/runner.ts,server/src/openmuse-tasks/store.ts: timed out -> failed
+- server/drizzle/meta/0080_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+- server/drizzle/meta/0081_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+- server/drizzle/meta/0084_snapshot.json: network error -> succeeded
+- server/drizzle/meta/0091_snapshot.json: rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+- ... and 5 more
+
+Context compaction (11 requests):
+- server/drizzle/meta/0076_snapshot.json: cancelled
+- server/drizzle/meta/0079_snapshot.json: cancelled
+- server/drizzle/meta/0081_snapshot.json: cancelled
+- server/drizzle/meta/0082_snapshot.json: cancelled
+- server/drizzle/meta/0083_snapshot.json: cancelled
+- ... and 6 more
+
+Per-attempt detail: --format json (retry_report).

@@ -1,0 +1,539 @@
+Review complete: 26 finding(s) across 35 selected item(s).
+
+─── apps/mobile/src/openbot/config.ts:30-32 ───
+[bug · medium] 配置校验与实际使用不一致：parseEndpoint 只拒绝凭据/查询/片段，却允许 URL 携带路径；而这里（以及模块级 openbotUrl =
+openbotEndpoint.origin）只取 .origin。若用户配置
+EXPO_PUBLIC_OPENBOT_URL=https://host/openbot，路径前缀会被静默丢弃，所有请求被路由到 https://host/api/... 而非
+https://host/openbot/api/...，表现为无任何诊断信息的全量 404。建议在 parseEndpoint 中与非根路径 pathname
+显式报错（与现有凭据/查询/片段守卫风格一致），或完整保留路径前缀。
+
+- export function resolveOpenbotUrl(platform: OpenbotOS, envValue?: string): string {
+-   return parseEndpoint(envValue?.trim() || defaultBaseUrl(platform)).origin;
+- }
++   if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
++     throw new Error("EXPO_PUBLIC_OPENBOT_URL must not carry credentials, query, or fragment.");
++   if (endpoint.pathname !== "/")
++     throw new Error("EXPO_PUBLIC_OPENBOT_URL must be origin-only: it must not include a path.");
++   return endpoint;
+
+
+─── apps/mobile/src/openbot/client.ts:148-159 ───
+[style · medium] 状态码→错误码的映射是 4 层嵌套三元表达式（上方 signal 选择的星号判断亦有 2
+层嵌套），违反评审检查清单“禁止嵌套三元表达式”的硬性规则，且这是核心错误分类逻辑，深层嵌套显著降低可读性与可维护性。建议改为 if/else 链（需从 ./errors 导入
+OpenBotErrorCode 类型）。
+
+-   const code =
+-     response.status === 401
+-       ? "authentication_required"
+-       : response.status === 403
+-         ? "refused"
+-         : response.status === 404
+-           ? "not_found"
+-           : response.status === 408 || response.status >= 500
+-             ? isWrite
+-               ? "outcome_unknown"
+-               : "unavailable"
+-             : "invalid_input";
++   let code: OpenBotErrorCode;
++   if (response.status === 401) code = "authentication_required";
++   else if (response.status === 403) code = "refused";
++   else if (response.status === 404) code = "not_found";
++   else if (response.status === 408 || response.status >= 500)
++     code = isWrite ? "outcome_unknown" : "unavailable";
++   else code = "invalid_input";
+
+
+─── apps/mobile/App.tsx:287-295 ───
+[bug · medium] 六个入口按钮采用绝对定位魔法数字（top: 6, right: 32/96/160/224/288/352，各 44×44）叠加在 OpenBotChatScreen
+之上，坐标系是 SafeAreaProvider 的全屏物理区（不感知安全区），与 chat.tsx 内部头部布局强耦合，产生多重实测冲突：① 在零/小安全区 inset 的环境（web、iPhone
+SE 类、多数 Android）上，聊天头部（SafeAreaView 内 paddingTop: 8，右端为
+SignOutButton，y≈8-46）与本按钮行（y=6-50）完全重叠，right: 32 的本按钮作为后续兄弟节点命中测试优先，遮住 SignOutButton
+的中段，退出登录仅剩细窄左条可点；② 在刘海屏上按钮落入系统状态栏区域，与电池/信号图标相撞；③ 任一覆盖层打开时，其余未打开入口的按钮因 JSX 顺序靠后会浮在该覆盖层自身的头部（刷新/关闭按钮，见
+calendar.tsx 等的右上角 Button）之上并拦截点击，例如打开频道后 任务/日历/连接/文件/计算机 五个按钮全部悬浮在频道屏头部；④ 375pt 窄屏上 right: 352
+的按钮左缘越出屏幕约 21pt。建议改为一个感知安全区的整体入口行（useSafeAreaInsets 定 top，flexDirection: row + gap
+靠右），并在任一覆盖层打开时整体隐藏该行，消除与各屏内部头部的坐标耦合。
+
+-       {computerOpen ? (
+-         <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+-           <OpenBotComputerScreen botId={session.botId} onClose={() => setComputerOpen(false)} />
+-         </View>
+-       ) : (
+-         <View style={{ position: "absolute", top: 6, right: 32 }}>
++       const insets = useSafeAreaInsets();
++       const anyOverlayOpen =
++         channelsOpen || tasksOpen || calendarOpen || connectionsOpen || filesOpen || computerOpen;
++       // …渲染期：一个感知安全区的入口行，任一覆盖层打开时整体隐藏，
++       // 不再与各屏内部头部共享坐标，也消除 32/96/160/224/288/352 魔法偏移。
++       {!anyOverlayOpen && (
++         <View
++           style={{
++             position: "absolute",
++             top: insets.top + 6,
++             right: 12,
++             flexDirection: "row",
++             gap: 8,
++           }}
++         >
++           <IconButton icon={MessagesSquare} label="频道" onPress={() => setChannelsOpen(true)} />
++           <IconButton icon={SquareCheck} label="任务" onPress={() => setTasksOpen(true)} />
++           <IconButton icon={CalendarDays} label="日历" onPress={() => setCalendarOpen(true)} />
++           <IconButton icon={Plug} label="连接" onPress={() => setConnectionsOpen(true)} />
++           <IconButton icon={FolderOpen} label="文件" onPress={() => setFilesOpen(true)} />
+            <IconButton icon={Monitor} label="计算机" onPress={() => setComputerOpen(true)} />
+          </View>
+        )}
+
+
+─── apps/mobile/src/openbot/client.ts:133-134 ───
+[bug · medium] 超时错误在原生端会以裸 AbortError 泄漏、绕过错误模型。本文件自己的注释已确认 RN 0.81 没有 AbortSignal.timeout/any，原生端走
+timeoutSignalAfter + mergeAbortSignals 回退；但 RN 的 fetch（whatwg-fetch/XHR polyfill）不透传 abort
+reason，超时触发的请求被拒时错误名固定为 'AbortError'（手写的 TimeoutError reason 被丢弃），于是命中这里的 `error.name ===
+"AbortError"` 分支被原样 rethrow，与上方注释承诺的『超时以 TimeoutError 归入 network』相矛盾。后果：所有用 `e instanceof
+OpenBotError ? e.message : String(e)` 兜底的界面（files/tasks/channels/calendar/pdf-view 及
+connection-status.connectionErrorCopy）会把 'AbortError: Aborted' 之类的原始错误直接展示给用户，而不是设计的『无法连接 OpenBot
+服务…』。实际上识别『调用方取消』只需 `init.signal?.aborted`；caller signal 未 abort 时的 AbortError 只可能是传输层超时，应归入 network
+而不是原样抛出。
+
+-     if (init.signal?.aborted || (error instanceof Error && error.name === "AbortError"))
+-       throw error;
++     // A caller-initiated abort rethrows as-is (it is a cancellation, not a
++     // network failure). Anything else is a transport failure and maps to
++     // `network`: on RN's fetch polyfill even the timeout arrives as a bare
++     // AbortError (no abort-reason propagation), so it must not be rethrown raw.
++     if (init.signal?.aborted) throw error;
++     throw new OpenBotError("network", "无法连接 OpenBot 服务，请检查网络后重试。");
+
+
+─── apps/mobile/package.json:23-25 ───
+[maintainability · medium] expo-crypto 与 expo-device 为本 PR 新增，但没有任何使用方：apps/mobile 源码中无任何
+import，且二者均不在 @better-auth/expo@1.7.1 的 peerDependencies 中（按 pnpm-lock.yaml，其可选 peer 仅为
+expo-constants、expo-linking、expo-network、expo-secure-store、expo-web-browser，恰好对应本次新增的另外五项）。Expo
+autolinking 会把这两个包编译进原生构建，白白增大包体并扩大依赖审计/供应链面。若有后续 ticket 计划使用，应随使用方代码一起引入；否则建议从 dependencies 中移除这两行。
+
+-     "expo-crypto": "~15.0.9",
+      "expo-dev-client": "~6.0.20",
+-     "expo-device": "~8.0.10",
+
+
+─── apps/mobile/src/openbot/connection-status.ts:96-98 ───
+[bug · medium] 服务端可控字符串直接索引普通对象字面量，`??` 兜底对继承键失效。types.ts 特意将 status 保持为开放 string（注释明确"unknown
+status must render as 未知"）、provider 为任意非空字符串，但当取值为 "constructor"、"toString"、"__proto__"、"valueOf"
+等继承键时，查找命中 Object.prototype 上的属性（函数或对象），`?? UNKNOWN_PROVIDER_LABEL` / `?? UNKNOWN_STATUS_LABEL`
+永远不会执行；函数/对象随后作为 Text 子节点渲染会直接抛 "Objects/Functions are not valid as a React
+child"，连接屏白屏——这正是文档声称要避免的"fail the whole screen"。建议用自有属性守卫（Hermes 下用 hasOwnProperty.call 或 null
+原型映射，或用 googleConnectionStatuses.includes 收窄）。
+
+-       providerLabel: providerLabels[connection.provider] ?? UNKNOWN_PROVIDER_LABEL,
++       providerLabel: Object.prototype.hasOwnProperty.call(providerLabels, connection.provider)
++         ? providerLabels[connection.provider]
++         : UNKNOWN_PROVIDER_LABEL,
+        status: connection.status,
+-       statusLabel: connectionStatusLabels[connection.status] ?? UNKNOWN_STATUS_LABEL,
++       statusLabel: Object.prototype.hasOwnProperty.call(
++         connectionStatusLabels,
++         connection.status,
++       )
++         ? connectionStatusLabels[connection.status]
++         : UNKNOWN_STATUS_LABEL,
+
+
+─── apps/mobile/src/openbot/connections.tsx:217-217 ───
+[bug · medium] 同一动态索引问题：row.status 是服务端开放的字符串（types.ts 不收窄），当值为 "constructor" 等继承键时
+`statusChip[row.status]` 返回继承自 Object.prototype 的构造函数而非 undefined，`?? statusChip.disconnected`
+兜底失效，函数被传入 RN style 数组，样式扁平化时抛异常导致整屏崩溃。请与 connection-status.ts 的标签映射一致地加自有属性守卫。
+
+-         <Text style={[chipBase, statusChip[row.status] ?? statusChip.disconnected]}>
++         <Text
++           style={[
++             chipBase,
++             Object.prototype.hasOwnProperty.call(statusChip, row.status)
++               ? statusChip[row.status]
++               : statusChip.disconnected,
++           ]}
++         >
+
+
+─── apps/mobile/src/openbot/auth.ts:46-50 ───
+[bug · medium] getCookie() 的所有异常被吞成 null，与"未登录"不可区分。下游契约（client.ts:114）对 null 的处理是省略 Cookie
+头继续发匿名请求，服务端必回 401：连接屏显示"登录已过期"，且 App.tsx 的 onAuthExpired 会执行 signOut + clearPrivateState +
+踢回登录界面。SecureStore/Keychain 的瞬时读取故障因此被升级为"强制重新认证 + 本地私有数据全量清扫"。建议区分"确认无凭证"与"无法读取凭证"——让异常向上传播，使传输层按
+network/unavailable 失败并保留可重试路径，而不是带着空凭证把请求发出去。
+
+    try {
+      return await authClient.getCookie();
+-   } catch {
+-     return null;
++   } catch (error) {
++     // 存储读取故障 ≠ 未登录：向上抛出，让传输层按临时错误处理，
++     // 而不是省略 Cookie 头发匿名请求后被 401 化、触发强制重登与本地清扫。
++     throw error;
+    }
+
+
+─── apps/mobile/src/openbot/auth.ts:55-57 ───
+[bug · medium] getSession() 的错误（网络故障、存储故障）与"确认无会话"被合并为同一个 null，但注释声称"null when signed out"。实际调用方
+gate.tsx:122-131 对 null 的语义是"本机不存在有效会话 → clearPrivateState() 清扫全部私有状态并回登录表单"，因此冷启动时一次瞬时网络/存储错误会把
+SecureStore 会话令牌连同 PDF 缓存一起清掉，用户被强制重新登录。建议返回判别式结果（或让错误向上抛），把"清扫"决策留给调用方在确认真的无会话时执行，网络未确认时走可重试失败路径。
+
+    const { data, error } = await authClient.getSession();
+-   if (error || !data?.user?.id) return null;
++   // 网络失败 ≠ 已登出：向上抛出，避免调用方把"无法确认"当成"无会话"而清扫本地凭证。
++   if (error) throw new Error(`session-check-failed:${error.status ?? "unknown"}`);
++   if (!data?.user?.id) return null;
+    return { userId: data.user.id };
+
+
+─── apps/mobile/src/openbot/tool-cards.ts:185-193 ───
+[style · medium] 存在多层嵌套三元表达式（kind 映射嵌套 3 层，下方 status 映射也嵌套了 2
+层），评审规范明确禁止嵌套三元。可读性差且新增状态分支时容易出错，建议提取为模块级查找表（Record）消除嵌套。
+
+-   const kind: ToolCardKind =
+-     named ??
+-     (event.status === "start"
+-       ? "tool_start"
+-       : event.status === "error"
+-         ? "tool_error"
+-         : event.status === "result"
+-           ? "tool_result"
+-           : "unknown");
++ const KIND_BY_STATUS: Record<NonNullable<ToolEvent["status"]> | "none", ToolCardKind> = {
++   start: "tool_start",
++   result: "tool_result",
++   error: "tool_error",
++   none: "unknown",
++ };
++ 
++ // classifyToolEvent 内：
++ const kind: ToolCardKind = named ?? KIND_BY_STATUS[event.status ?? "none"];
+
+
+─── apps/mobile/src/openbot/calendar.tsx:86-87 ───
+[performance · medium] 本屏幕的数据量没有客户端上界：openBotCalendarEventsSchema 对 events
+数组无大小约束（types.ts:173），load 会把窗口内最多 50 页无条件压入 collected；渲染又是非虚拟化的 ScrollView +
+events?.map，全部行一次性挂载。日程密集时（数千行）在低端设备上会造成明显的内存与挂载卡顿。此外 EventRow 未做 memo，父组件 busy/truncated/error
+任一状态翻转都会触发全行重渲染，每行重新执行 eventRowView（多次 Date.parse + Intl.formatToParts，Hermes 上开销可见）。建议：渲染改用
+FlatList（虚拟化挂载 + ListHeaderComponent 承载 truncated 提示），并用 React.memo 包裹 EventRow——event 对象在 collected
+中身份稳定、zone 不变，memo 即可消除状态翻转引起的重复 Intl 计算；也可同时给 collected 设总量上限（超出即置 sawTruncated），避免极端数据下的无界内存增长。
+
+-         collected.push(...page.events);
+-         cursor = page.nextCursor;
++ const EventRow = React.memo(function EventRow({ event, zone }: { event: OpenBotCalendarEvent; zone: string }) {
++   const view = eventRowView(event, zone);
++   /* …原渲染… */
++ });
++ 
++ <FlatList
++   data={events ?? []}
++   keyExtractor={(item) => item.id}
++   renderItem={({ item }) => <EventRow event={item} zone={zone} />}
++   ListHeaderComponent={truncated ? <Text style={s.muted}>{COPY.truncatedList}</Text> : null}
++   contentContainerStyle={{ paddingHorizontal: 18, paddingVertical: 12, flexGrow: 1 }}
++ />
+
+
+─── apps/mobile/src/openbot/calendar-view.ts:214-216 ───
+[maintainability · medium] 裸 catch 完全静默：它的本意是消化脏数据 RangeError（降级为原始字符串行，注释已论证无法
+heal），但同时会吞掉内部实现任何意外异常（如重构引入的 TypeError），把真实缺陷伪装成"服务端脏数据"。eventRowView
+是每行渲染的唯一计算漏斗，一旦内部回归，全部行集体降级且线上零日志、零信号，无法与真正的脏数据区分。模块族当前确无 console/日志惯例（全族 0 处命中），但至少应加一条 __DEV__
+限定的开发态告警：typeof 守卫保持本模块"无 react-native import、可在 node:test 运行"的约束（console 为标准全局，__DEV__ 用 typeof 探测在
+node 下安全）。
+
+-   } catch {
++   } catch (e) {
++     if (typeof __DEV__ !== "undefined" && __DEV__) {
++       console.warn(`[calendar] event row degraded to raw strings (id=${event.id})`, e);
++     }
+      return { range: `${event.start} – ${event.end}`, duration: "", assumed: false };
+    }
+
+
+─── apps/mobile/src/openbot/tool-cards.ts:203-206 ───
+[bug · medium] 错误状态的截图卡片会展示成功口径的摘要：renderSummary 对 computer_screenshot 无条件返回「已获取屏幕截图」，而
+classifyToolEvent 计算 summary 时不区分 error 状态（toolCardRows 中 message.error 非空即走 error 路径），导致失败卡片渲染为红标题
++ 「已获取屏幕截图」，且 payload 中的真实错误信息被丢弃。这违反了本模块自述的「an error is never shown as success」约定。建议 error 状态时优先透出
+payload 的错误详情，而非沿用成功摘要（其余命名种类的摘要是对输入的描述性字段，可保留现状）。
+
+-   const summary =
+-     kind === "tool_start"
+-       ? safeTruncate(event.name)
+-       : renderSummary(kind, event.payload) || safeTruncate(safeStringify(event.payload));
++   // 失败卡片不沿用成功口径的摘要（如「已获取屏幕截图」），优先展示载荷中的错误信息。
++   const payloadDetail = safeTruncate(safeStringify(event.payload));
++   let summary: string;
++   if (kind === "tool_start") {
++     summary = safeTruncate(event.name);
++   } else if (event.status === "error") {
++     summary = payloadDetail || renderSummary(kind, event.payload);
++   } else {
++     summary = renderSummary(kind, event.payload) || payloadDetail;
++   }
+
+
+─── apps/mobile/src/openbot/chat.tsx:263-266 ───
+[maintainability · medium] renderSet 在本组件中只写不读，属于死记账：applyBatch 的返回值被丢弃，reset
+之后的内部状态（lastEventId()/size()）在应用代码中无任何消费方（仅纯模块测试引用）；resume 游标已按第二轮修复改用 messagesRef（上方注释也说明了合成工具卡 id
+不能作游标）。因此这段「§3 记账」对渲染和 resume 决策均无可观察效果，而注释声称它 "drives the resume/reset machinery"
+与事实不符，会误导后续维护。渲染去重已由 dedupeById 承担、resume 决策已由 messagesRef + resumeStrategy 承担，建议删除组件内的 renderSet
+及其两处调用（stream-resume.ts 纯模块保留给测试即可），或让某条路径真正消费它的状态。
+
+      messagesRef.current = agent.messages;
+-     renderSet.current.applyBatch(
+-       [...rows, ...toolRows].map((row) => rowEvent(session.threadId, row.id)),
+-     );
++     // （同时删除 renderSet ref 与 reload-history 分支里的 renderSet.current.reset(offered)：
++     //  渲染去重由 dedupeById 承担，resume 决策由 messagesRef + resumeStrategy 承担。）
+
+
+─── apps/mobile/src/openbot/chat-state.ts:93-95 ───
+[maintainability · medium] historyKey 是应用代码零调用的死导出（仅 openbot-chat-state.test.ts 引用）：chat.tsx
+的用户消息乐观回显走内存内 agent.addMessage + 失败时 setMessages 回滚，从不经过本地存储，注释所宣称的唯一用途（"Used ONLY for optimistic
+echo of the user's own line while a run is in flight"）对应的功能在任何地方都没有实现。这会让读者误以为存在基于存储的回显/恢复路径（注释还强调
+"the mount-time connect restores it"）。与 terminalOf、dedupeByEventId
+这类确有测试且语义自洽的纯模型不同，本函数描述的是一条不存在的持久化机制。建议删除该导出及其测试；若确为预留 API，请修正注释明确当前无调用方。
+
+
+
+─── apps/mobile/src/openbot/calendar-view.ts:197-201 ───
+[bug · medium] 脏数据守卫只覆盖 timed 分支，allDay 分支没有等价校验：本模块注释明确指出 Hermes 上 Date.parse → NaN 会「流过 Intl
+不抛错（不像 V8）」。当 allDay 事件的 start 不可解析而 end 可解析时，renderAllDay 里 dayLabel(start) 在 Hermes 不抛错，只有 end 走
+toISOString() 才会抛——于是同一份脏数据在 V8/node 走 catch 降级为原始字符串，在 Hermes 上却把 "Invalid Date" 之类的乱码标签直接渲染给用户，违反
+EventRowView.range 的降级契约（"on dirty data, the raw start/end strings"），且行为随引擎漂移。应仿照 timed 分支，对 allDay
+的 start/end 也做 parse 有效性校验后再渲染。
+
+      if (
+-       !event.allDay &&
+-       (!Number.isFinite(instantOf(event.start, resolved.zone)) ||
+-         !Number.isFinite(instantOf(event.end, resolved.zone)))
++       event.allDay &&
++       (!Number.isFinite(Date.parse(`${event.start}T00:00:00Z`)) ||
++         !Number.isFinite(Date.parse(`${event.end}T00:00:00Z`)))
+      ) {
++       throw new RangeError(`unparseable all-day date: ${event.start} / ${event.end}`);
++     }
+
+
+─── apps/mobile/src/openbot/calendar-view.ts:120-122 ───
+[bug · medium] assumed 把「裸 ISO」一律视为「假定了默认时区」，但 fallback 可能来自事件自己声明的 timeZone：此时渲染时区是事件明确给出的（instant
+已被钉死，没有任何假设），calendar.tsx 却因 assumed=true 给行打上「默认时区」徽标——对声明了 timeZone
+的事件这是错误文案（既非设备默认时区，也非假设值）。zoneOf 不区分 fallback 来源，导致上层 UI 无法正确表述。建议增加来源参数：仅当回退到设备默认时区时才置 assumed（调用处
+zoneOf(event.start, event.timeZone || zone, Boolean(event.timeZone))），或让文案区分「按事件时区显示」与「默认时区」。
+
+- export function zoneOf(dateIso: string, fallback: string): ResolvedZone {
+-   return { zone: fallback, assumed: /T/.test(dateIso) && !hasExplicitOffset(dateIso) };
++ export function zoneOf(dateIso: string, fallback: string, fromEventTimeZone = false): ResolvedZone {
++   return {
++     zone: fallback,
++     assumed: !fromEventTimeZone && /T/.test(dateIso) && !hasExplicitOffset(dateIso),
++   };
+  }
+
+
+─── apps/mobile/src/openbot/files.tsx:90-90 ───
+[bug · medium] fetchFiles() 返回的是分页结构（{ files, nextCursor }），此处仅取第一页且界面没有"加载更多"入口，nextCursor
+被丢弃：超出首页的文件对用户完全不可见（无法下载/预览），也没有任何列表被截断的提示。同套件 calendar.tsx 已实现 cursor = page.nextCursor
+的游标加载模式，建议此处保持一致，至少提供加载更多或在有下一页时给出明确提示。
+
+-       setFiles((await fetchFiles()).files);
++       const page = await fetchFiles();
++       setFiles((prev) => (prev === null ? page.files : [...prev, ...page.files]));
++       setNextCursor(page.nextCursor);
+
+
+─── apps/mobile/src/openbot/gate.tsx:252-256 ───
+[bug · high] 非重试失败(如 workspace_inconsistent)后唯一的出口只执行 setState 回到登录页,既不调用 signOut 也不清除已持久化的 stored
+session。之后用户重新登录会走 load(true) 的 justSignedIn 分支——该分支明确跳过 clearPrivateState 清扫——readStoredSession()
+仍会读到指向失效 botId 的同一条 stored session,workspace-ok 校验再次失败,用户被锁死在永久 workspace_inconsistent
+循环中;冷启动重进同样无法恢复(currentSession 仍有效则跳过 no-local-session 分支的清扫),而 SignOutButton
+只存在于到达不了的已连接页,应用内没有任何恢复路径。建议:返回登录页前先吊销会话并清扫(sweep 本就会移除 registry 里的 OPENBOT_SESSION_STORAGE_KEY),再重置
+seq。
+
+        {failure && (
+-         <Pressable onPress={() => setState({ phase: "signin", error: false })}>
++         <Pressable
++           onPress={() => {
++             // Invalidate everything first: revoke the still-valid session and
++             // sweep (the registry clear removes the stale stored session), or
++             // the next sign-in re-reads the dead botId and deadlocks here.
++             void signOut()
++               .catch(() => undefined)
++               .then(() => clearPrivateState())
++               .catch(() => undefined)
++               .finally(() => {
++                 setSeq(initialEntrySequence);
++                 setState({ phase: "signin", error: false });
++               });
++           }}
++         >
+            <Text style={[s.small, { color: colors.blueDark }]}>{COPY.backToSignin}</Text>
+          </Pressable>
+        )}
+
+
+─── apps/mobile/src/openbot/gate.tsx:115-121 ───
+[security · high] justSignedIn 分支跳过清扫的安全性完全依赖"登录表单渲染前 sweep 必已执行"这一不变量,但"返回登录页"路径不 signOut、不清 stored
+session,直接破坏了它:用户 A 卡在 workspace_inconsistent 后回到登录页,用户 B 登录后 load(true) 会把 A 的 stored session 当作 B
+的入口候选——openBotSessionSchema 仅含 {botId, channelId, threadId},没有任何用户绑定字段可供校验归属;同时 A 的私有 web
+存储键(copilotkit-*、cookie jar 分块)与 A 仍然有效的 Better Auth 会话也未被清理/吊销。建议将持久化会话与当前登录用户绑定(fetchMe 返回的
+user.id 一并存取并在读回时比对,不匹配即丢弃),使"干净启动"不依赖上游是否执行过 sweep。
+
+-           if (justSignedIn) {
+-             // A fresh sign-in starts from a clean slate — the full sweep ran
+-             // in the no-local-session branch before the form ever rendered.
+-             // It must NOT re-run here: sign-in has already written the new
+-             // SecureStore/localStorage jar, and (post I07 registry) the sweep
+-             // would delete the session it just persisted.
+-           } else {
++           const stored = readStoredSession();
++           // A stored session carries no user binding; only trust it when it was
++           // persisted under the account that is signed in right now, so a
++           // leftover session from a previous user can never seed this entry.
++           const usable = stored && stored.userId === me.user.id ? stored : null;
++           if (stored && !usable) removeStoredSession();
++           step(usable ? { type: "stored", session: usable } : { type: "start" });
+
+
+─── apps/mobile/src/openbot/file-cache.ts:234-234 ───
+[bug · critical] meta sidecar 以 JSON 明文走了 base64 字节写入通道：CacheFileSystem.writeFileAsync 的契约（形参
+base64）与真实适配器（native-cache-adapter 以 EncodingType.Base64 写入，即先 base64 解码再落盘）都会把这段 JSON 当 base64
+解码。Android 的 Base64.decode 遇到 `{`/`"`/`:` 等非法字符会抛 IllegalArgumentException → 每次下载都在 meta 写入一步失败（字节已
+rename 落盘但流程报错）；iOS 的 NSDataBase64DecodingIgnoreUnknownCharacters 静默丢弃非 base64 字符 →
+落盘乱码，readFileAsync（UTF8）读回后 JSON.parse 恒失败 → 缓存永不命中、每次全量重下，乱码 sidecar 还会残留。node 测试的 cacheFsStub
+按原字符串存取、roundtrip 恰好成立，故测试无法暴露。建议在 seam 上补充文本写入（如 writeTextAsync(path, text)，适配器实现为
+fs.writeAsStringAsync(path, text)，默认即 UTF8），meta 改用它；或对称地对 JSON 做 base64 编码写入、读取时解码。
+
+-   await fs.writeFileAsync(metaPath, JSON.stringify(meta));
++   // sidecar 是 UTF-8 JSON，必须走文本写入；writeFileAsync 的载荷会被
++   // 适配器按 base64 解码，JSON 明文在 Android 直接抛错、iOS 落盘乱码。
++   await fs.writeTextAsync(metaPath, JSON.stringify(meta));
+
+
+─── apps/mobile/src/openbot/files.tsx:221-223 ───
+[bug · medium] 一旦某行进入 cached，「下载」入口被静态「已缓存」文本永久取代，而 刷新（load）只重拉列表、从不依据新的 file.versionId 校正
+rows：服务端文件更新版本后，该行仍以旧 meta（旧 size/SHA-256/downloadedAt）展示为「已缓存」的事实，且本屏内再无任何路径重新调用 ensureCached ——
+「版本陈旧即重下」的保证只存在于下次调用，而 UI 不会再发起调用，与 ensureCached 及本屏 docstring 宣称的 version-stale re-download
+行为矛盾（PDF 预览 F07 会重下，但 F04 自身的下载/打开流程不会）。建议 load 拉到新列表后把 meta.versionId !== file.versionId 的 cached
+行回退为 idle 让下载按钮重新出现，或对 cached 行保留下载操作。
+
+-                   {row.phase === "cached" ? (
+-                     <Text style={styles.action}>{COPY.cached}</Text>
+-                   ) : row.phase === "downloading" ? (
++       // load 拉到新列表后校正行状态：版本已变的 cached 行回退为 idle，
++       // 让「下载」重新可点以触发 ensureCached 的 versionId 陈旧重下，
++       // 而不是永远展示旧 sidecar 的 size/SHA-256。
++       const page = await fetchFiles();
++       setFiles(page.files);
++       setRows((prev) => {
++         const next = { ...prev };
++         for (const file of page.files) {
++           const row = next[file.id];
++           if (row?.phase === "cached" && row.meta.versionId !== file.versionId)
++             delete next[file.id];
++         }
++         return next;
++       });
+
+
+─── apps/mobile/src/openbot/pdf-view.tsx:130-132 ───
+[bug · medium] 拒绝路径的缓存清理位于第一道世代守卫之后：若 401/404/invalid_response 处理期间用户切换了版本（generation 已推进），guard 直接
+return，clearVersionCache 永不执行，被拒版本（如已删除文件）的缓存字节将残留至登出清扫，违反模块头部声明的协议「A refusal … deletes that
+version's cached copy before the error shows」。clearCacheSlot 的 onlyVersionId 机制（先比对 sidecar 的
+versionId，不匹配则不删）已保证清理在世代变更后执行依然安全——不会误删其他版本的有效副本——因此应将清理移到该守卫之前，仅把 setError 留在守卫之后。
+
++       // The refusal's cache clear must run even when the selection moved on:
++       // failedVersionId scopes the delete to THIS version (a slot already
++       // holding another version's still-valid copy survives the check), so
++       // the clear is safe ahead of the generation guard.
++       if (e instanceof OpenBotError && refusalClearsCache(e.code)) {
++         await clearVersionCache(
++           file,
++           {
++             cacheDirectory: adapter.cacheDirectory,
++             fileSystem: adapter.fileSystem,
++           },
++           selected.versionId,
++         ).catch(() => undefined);
++       }
+        if (openGeneration.current !== request) return; // a dead request's failure/error must not land under the new selection
+        setOpened(null);
+-       if (e instanceof OpenBotError && refusalClearsCache(e.code)) {
+
+
+─── apps/mobile/src/openbot/gate.tsx:122-130 ───
+[bug · medium] 该分支把 `currentSession()` 返回 null 一律当作「确认已登出」并执行不可逆的全量清扫（SecureStore cookie
+jar、sessionStorage 会话键、copilotkit-* 等），但 auth.ts 的 currentSession 是 `if (error || !data?.user?.id)
+return null`——authClient.getSession 的**任何**失败（网络不可达、服务器瞬断；better-auth 客户端把请求失败放进 error 字段返回而非抛出，I04
+也证实 getSession 会发起网络请求）都会折叠成 null。结果：冷启动时恰好离线或 /api/get-session
+瞬时失败，就会销毁当前用户仍然有效的登录态并强制重新登录——与注释声称的「everything private … belongs to a previous
+user」相反，这些恰是当前用户的有效私有状态。建议让「确认无会话」与「会话检查失败」可区分（currentSession 在检查失败时抛出类型化错误或返回可辨识结果），gate
+仅在确认无会话时清扫，检查失败走既有的可重试错误路径（setSeq failed / notice），保住本地 jar。
+
+-             const session = await currentSession();
++             let session: { userId: string } | null = null;
++             try {
++               session = await currentSession(); // currentSession 需改为：检查失败抛出，仅「确认无会话」返回 null
++             } catch (checkError) {
++               // 会话检查本身失败 ≠ 已登出：不清扫（保住仍有效的 jar），按可重试错误处理。
++               throw checkError;
++             }
+              if (!session) {
+-               // No valid session anywhere: everything private left on this
+-               // device (native SecureStore jar + PDF cache, web storage)
+-               // belongs to a previous user — sweep it now, before the sign-in
+-               // form can establish a new one (I07: each new sign-in starts
+-               // from zero). This is the one sweep point that is both before
+-               // any new sign-in's writes and after the old session is dead.
+                await clearPrivateState().catch(() => undefined);
++               setState((prev) => entryPhaseReducer(prev, { type: "no-local-session" }));
++               return;
++             }
+
+
+─── apps/mobile/src/openbot/gate.tsx:238-242 ───
+[style · medium] 嵌套三元表达式（审查清单明确禁止）：`failure ? failure.retryable ? … : … : …` 在 JSX
+中形成两层条件嵌套，可读性差且后续新增失败文案时容易写错分支。建议提取模块级辅助函数，把「失败文案选择」与「阶段文案选择」拆开。
+
+-         {failure
+-           ? failure.retryable
+-             ? COPY.loadStuck
+-             : COPY.loadStuckFinal
+-           : (STEP_COPY[seq.phase] ?? COPY.checking)}
++         {loadingCopy(failure, seq.phase)}
++ 
++ // 模块级辅助函数（与 STEP_COPY 同层）：
++ function loadingCopy(
++   failure: EntrySequenceFailure | undefined,
++   phase: EntrySequencePhase,
++ ): string {
++   if (!failure) return STEP_COPY[phase] ?? COPY.checking;
++   return failure.retryable ? COPY.loadStuck : COPY.loadStuckFinal;
++ }
+
+
+─── apps/mobile/src/openbot/private-state.ts:266-269 ───
+[security · medium] clearPrivateState 丢弃了 clearNativePrivateState 返回的
+NativeClearReport,failedKeys/failedDeletes 被收集后既不日志、不上报、也不重试;而全部生产调用方(gate.tsx 两处、App.tsx 两处)又统一以
+.catch(() => undefined) 吞掉本函数的异常。这与本文件自身的设计声明矛盾:collectFiles 刻意让顶层 infoAsync/readDirectoryAsync
+失败上抛以免"清扫静默降级但报告仍称已清理",NativeClearReport 也注明"供调用方重试"——但在生产路径上两者都落空。叠加 gate.tsx 的 fresh-sign-in
+分支在写入新会话后刻意不再补扫,一次瞬时删除失败就会把上一用户的 SecureStore
+会话分块(_cookie.N)或缓存文件静默留在共享设备上,削弱文件头承诺的"后续用户看不到前一用户任何数据"。建议至少对失败项打日志(或将报告返回/上抛给调用方决策)。
+
+  export async function clearPrivateState(): Promise<void> {
+    clearWebPrivateState();
+-   await clearNativePrivateState(nativeAdapters());
++   const report = await clearNativePrivateState(nativeAdapters());
++   if (report.failedKeys.length > 0 || report.failedDeletes.length > 0)
++     console.warn("[openbot] private-state sweep incomplete", report);
+  }
+
+
+LLM retry report summary: 4 of 209 requests affected -- 1 request failed, 3 requests recovered after retry
+
+Review planning (1 request):
+- apps/mobile/src/openbot/chat-state.ts,apps/mobile/src/openbot/chat.tsx,apps/mobile/src/openbot/stop-state.ts,apps/mobile/src/openbot/stream-resume.ts,apps/mobile/src/openbot/tool-cards.ts: timed out -> failed
+
+Core review (3 requests):
+- apps/mobile/src/openbot/auth.ts,apps/mobile/src/openbot/connection-status.ts,apps/mobile/src/openbot/connections.tsx,apps/mobile/src/openbot/email-signin.tsx: network error -> succeeded
+- apps/mobile/src/openbot/gate-state.ts,apps/mobile/src/openbot/gate.tsx: network error -> succeeded
+- apps/mobile/src/openbot/pdf-view-state.ts,apps/mobile/src/openbot/pdf-view.tsx: network error -> succeeded
+
+Per-attempt detail: --format json (retry_report).

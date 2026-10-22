@@ -1,0 +1,223 @@
+# ocr-openmuse-final split — cluster A: session/auth/core (auth, email-signin, gate+state, client, api, config, App.tsx, package.json)
+# source: ocr-openmuse-final.txt (16 findings)
+# repo: /Users/wuyongjun/trea/openmuse/.worktrees/v4-base (branch v4/openbot-exec)
+
+─── apps/mobile/src/openbot/auth.ts:106-108 ───
+[security · medium] signUpWithEmail 的兜底分支把原始服务端错误文本 `error.message?.slice(0, 120)` 直接透传到注册表单，既无
+isTokenShaped 守卫也无通用兜底，与本模块自身的安全不变量（见文件头注释及 signInErrorReason："raw server text never reaches the
+sign-in screen"）相悖。client.ts 会把服务端错误消息截断至 500 字符原样抛出，其中可能夹带内部端点/凭据形状内容。建议仿照 signInErrorReason
+抽出集中式映射函数，未识别的错误一律落入通用文案。
+
+-           : error.code === "INVALID_PASSWORD" || /at least/i.test(error.message ?? "")
+-             ? "密码至少 8 位。"
+-             : error.message?.slice(0, 120) || "注册失败，请稍后重试。",
++ function signUpErrorReason(error: { code?: string; message?: string }): string {
++   if (error.code === "USER_ALREADY_EXISTS") return "该邮箱已注册，请直接登录。";
++   if (error.code === "INVALID_PASSWORD" || /at least/i.test(error.message ?? ""))
++     return "密码至少 8 位。";
++   // 未识别的服务端错误不给原文：isTokenShaped 之外仍可能含内部 URL 等敏感细节。
++   return "注册失败，请稍后重试。";
++ }
+
+─── apps/mobile/src/openbot/auth.ts:103-108 ───
+[style · low] 此处三层嵌套三元表达式违反检查清单"禁止嵌套三元表达式"，且内联错误映射与同文件 signInErrorReason
+的集中式函数风格不一致——后续新增错误码时容易再滑向原文透传的写法（见上一条 medium 问题）。建议同样抽为 signInErrorReason 风格的辅助函数，用早返回替代嵌套三元。
+
+-       reason:
+-         error.code === "USER_ALREADY_EXISTS"
+-           ? "该邮箱已注册，请直接登录。"
+-           : error.code === "INVALID_PASSWORD" || /at least/i.test(error.message ?? "")
+-             ? "密码至少 8 位。"
+-             : error.message?.slice(0, 120) || "注册失败，请稍后重试。",
++       reason: signUpErrorReason(error),
+
+─── apps/mobile/src/openbot/email-signin.tsx:120-123 ───
+[security · medium] catch 路径在 `raw.trim() && !isTokenShaped(raw)` 为真时把原始异常文本 `raw.slice(0, 120)` 直接
+setServerError 展示，与正上方注释 "raw exception text never reaches the screen" 自相矛盾。token
+形状守卫拦不住非凭据但敏感的异常细节——RN/Web 网络层异常常携带内部端点、主机名或完整请求 URL。应与 Connections 屏的 sanitize
+策略一致：整句替换为通用文案，而非部分放行。
+
+-       const raw = e instanceof Error ? e.message : String(e);
+-       setServerError(
+-         raw.trim() && !isTokenShaped(raw) ? raw.slice(0, 120) : COPY.errSignInUnexpected,
+-       );
++     } catch {
++       // 网络层异常文本可能含内部端点/主机名，一律通用文案，不放行原文。
++       setServerError(COPY.errSignInUnexpected);
++     }
+
+─── apps/mobile/src/openbot/email-signin.tsx:46-50 ───
+[maintainability · low] "密码至少 8 位"这一业务规则以硬编码散落多处：此处 `value.length < 8`、COPY.errPasswordShort 与
+phPassword 的文案、auth.ts L107 的 "密码至少 8 位。"。服务端 minPasswordLength 调整时需人工同步多个点，存在客户端校验与 Better Auth
+规则漂移的隐患。建议抽取共享常量（如 auth.ts 导出 MIN_PASSWORD_LENGTH = 8）并统一引用。
+
+  export function validatePassword(value: string): string | null {
+    if (!value) return COPY.errPasswordEmpty;
+-   if (value.length < 8) return COPY.errPasswordShort;
++   if (value.length < MIN_PASSWORD_LENGTH) return COPY.errPasswordShort;
+    return null;
+  }
+
+─── apps/mobile/src/openbot/client.ts:64-65 ───
+[bug · high] sendAndCheck 依赖 AbortSignal.timeout 与 AbortSignal.any 组合超时，但 RN ≤0.81（本仓
+0.81.5/Hermes）的 AbortSignal 实现长期不提供这两个静态方法，且仓库内没有任何垫片（index.js 仅引入 react-native-get-random-values 与
+@copilotkit/react-native/polyfills，依赖中无 abort-controller/core-js，client.ts 也是全应用唯一使用者）。关键在于这两行位于下方
+try/catch 之外：运行时一旦缺失，每次 OpenBot 请求都会在进入错误映射前直接抛 TypeError（"AbortSignal.timeout is not a
+function"），聊天/任务/日历/连接/文件/计算机在原生端全部不可用。建议启动时或模块顶部做特性探测并补一个 setTimeout + AbortController
+的降级实现（node:test 走 Node ≥17.3 自带实现，测试无法暴露此问题）。
+
+-   const timeout = AbortSignal.timeout(timeoutMs);
+-   const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
++   // RN 的 AbortSignal 缺静态 timeout/any：探测缺失时退回手工实现，
++   // 避免(原:NM)生端每次请求在 try 之外抛 TypeError。
++   const timeout =
++     typeof AbortSignal.timeout === "function"
++       ? AbortSignal.timeout(timeoutMs)
++       : timeoutSignalAfter(timeoutMs); // setTimeout → controller.abort(reason)
++   const signal = init.signal ? mergeAbortSignals(init.signal, timeout) : timeout;
+
+─── apps/mobile/src/openbot/client.ts:103-114 ───
+[maintainability · low] 两个问题：(1) 四层嵌套三元违反清单“禁止嵌套三元表达式”，可读性差；(2) 兜底分支把 409/429/400 等一律映射为
+invalid_input，与 api.ts 的注释语义冲突——reopenChannel 的 409 是“频道未归档”冲突、控制租约的 409 是“无租约/seq 过期”、429
+是限流，均非调用方入参错误，按 code 分支的调用方会误判错误性质。建议改用查表/switch 并补充 conflict、rate_limited 等错误码（errors.ts 的
+OpenBotErrorCode 同步扩展）。
+
+─── apps/mobile/App.tsx:192-196 ───
+[style · low] provider 头展开使用两层嵌套三元，违反清单“禁止嵌套三元表达式”。建议在 return 前用 if/else 或独立函数算出 headers/credentials
+对象再展开。
+
+-       {...(web
+-         ? { credentials: "include" as const }
+-         : cookie
+-           ? { headers: { Cookie: cookie } }
+-           : {})}
++       {...providerAuthProps(web, cookie)}
+
+─── apps/mobile/App.tsx:234-236 ───
+[style · low] 六个功能入口按钮使用硬编码魔法数字像素偏移（top: 6，right:
+32/96/160/224/288/352）加静态内联样式：不同屏宽、字体缩放与安全区下可能与标题栏元素重叠或被裁剪出屏，也违反“避免静态内联样式”检查项。建议提取为常量样式表，并考虑用
+flexDirection 行布局或 useWindowDimensions 计算偏移。
+
+─── apps/mobile/src/openbot/api.ts:223-227 ───
+[maintainability · low] 默认 returnUri "openmuse://connections" 的 scheme 字面量在此、auth.ts（expoClient 的
+scheme: "openmuse"）与 app.json（"scheme": "openmuse"）三处重复，属清单禁止的业务 URL 硬编码。已核实当前三处一致、深链回跳可用，但任一处漂移（改
+scheme、换部署）都会让 OAuth 授权完成后落到系统浏览器而中断连接流程。建议提取共享常量（如 config.ts 导出 OPENMUSE_SCHEME /
+CONNECTIONS_RETURN_URI），auth.ts 与此复用。
+
+─── apps/mobile/src/openbot/config.ts:55-57 ───
+[maintainability · low] 顶层即执行 parseEndpoint：EXPO_PUBLIC_OPENBOT_URL 配置非法时在 import
+阶段抛错，应用启动即白屏/闪退，没有任何 UI 兜底；且该初始化未复用已导出的 resolveOpenbotUrl（同一“env 覆盖 + 平台默认”逻辑存在两份）。建议改为内部调用
+resolveOpenbotUrl(currentOS(), process.env.EXPO_PUBLIC_OPENBOT_URL)，并考虑将解析错误推迟到首屏受控提示而非模块加载期崩溃。
+
+- export const openbotEndpoint = parseEndpoint(
+-   process.env.EXPO_PUBLIC_OPENBOT_URL?.trim() || defaultBaseUrl(currentOS()),
+- );
++ export const openbotEndpoint = parseEndpoint(resolveOpenbotUrl(currentOS(), process.env.EXPO_PUBLIC_OPENBOT_URL));
+
+─── apps/mobile/package.json:0-0 ───
+[bug · high] 新增的 7 个 expo 模块统一使用 ^57.0.x 版本线，与 expo@~54.0.0 以及同文件既有的 SDK 54 模块（expo-dev-client
+~6.0.20、expo-document-picker ~14.0.8、expo-file-system ~19.0.17、expo-sharing ~14.0.8、expo-status-bar
+~3.0.0、@expo/metro-runtime ~6.1.2）严重不一致。Expo 要求所有 expo-* 原生模块与所装 SDK 同一条版本线（expo-doctor 会直接报错）：这些
+^57 版本要么在 registry 上不存在导致安装失败，要么对应更新的 SDK 主线，autolinking 会链接不兼容的原生代码，造成 iOS/Android 构建或运行期崩溃。请改用
+`npx expo install expo-constants expo-crypto expo-device expo-linking expo-network expo-secure-store
+expo-web-browser` 写入与 SDK 54 匹配的版本。
+
+─── apps/mobile/App.tsx:102-108 ───
+[bug · medium] onAuthExpired 只做了 signOut + clearPrivateState，从不把 UI 送回登录门：该回调在模块作用域注册，拿不到 OpenBotApp
+里的 setEntry；而全仓检索确认没有任何消费方在会话中途因 authentication_required 翻回 gate（gate.tsx
+只在进入流程自身失败时处理，各屏幕只显示「登录已过期」文案）。结果是会话在别处失效/过期后，用户停留在死会话界面上，所有操作持续 401（每次还会再触发一轮
+signOut），只能手动找到退出按钮恢复。这与 errors.ts 写明的契约「authentication_required: 401, session gone, go back to
+sign-in」以及 I04 工单「flip to signin」不一致。建议把 transport 默认值注册移入 OpenBotApp 的 useEffect（或提供模块级通知回调），在清扫完成后
+setEntry(undefined) 让整棵树回到 OpenBotGate。
+
++ function OpenBotApp() {
++   const [entry, setEntry] = useState<{ workspace: OpenBotWorkspace; session: OpenBotSession }>();
++   useEffect(() => {
++     setOpenbotTransportDefaults({
++       platform: web ? "web" : "native",
++       getCookie: sessionCookie,
+-   onAuthExpired: () => {
++       onAuthExpired: () => {
+-     // Revoke first, then sweep (I07): the native clear must not delete the
+-     // SecureStore session while signOut still needs its cookie.
+-     void signOut()
++         void signOut()
+-       .then(() => clearPrivateState())
++           .then(() => clearPrivateState())
+-       .catch(() => undefined);
++           .catch(() => undefined)
++           .finally(() => setEntry(undefined));
+-   },
++       },
++     });
++   }, []);
+
+─── apps/mobile/src/openbot/gate.tsx:119-129 ───
+[security · high] 问题成立（两轮修复后仍存留）：justSignedIn 路径只调用 clearWebPrivateState()，native 侧的 SecureStore
+键（openmuse-openbot-* 的 _cookie/_session_data 及 .N 分片）与 PDF 下载缓存不会被清。可达路径：native 上前一用户会话已失效（如服务端吊销后重启
+App）→ currentSession() 返回 null → 新用户直接登录，全程不经 signOut/401 清扫，前一用户的会话分片与下载文件跨用户残留，违背 private-state.ts
+头注释声明的 I07 不变量（"each new sign-in clear everything"）。注意修复位置约束：不能把清扫直接放进 justSignedIn 分支——此时新会话刚由
+signIn 写入 SecureStore，会误删（与 auth-failed 路径 revoke-first 的注释同一约束）；应在进入登录态之前（no-local-session
+分支）或登录提交、signIn 写入新键之前执行 clearPrivateState()。
+
+            if (justSignedIn) {
+              // A fresh sign-in starts from a clean slate: no previous user's
+-             // web-private state may leak into the new session.
+-             clearWebPrivateState();
++             // private state may leak into the new session. The full sweep
++             // (native included) must run BEFORE sign-in writes the new jar,
++             // never here — it would delete the session just persisted.
+            } else {
+              const session = await currentSession();
+              if (!session) {
++               // No valid session anywhere: safe to sweep everything now — the
++               // old jar/cache is dead and a new sign-in rewrites its keys. If a
++               // transient getSession failure wiping a valid session is a
++               // concern, sweep in the sign-in submit path instead (still before
++               // signInWithEmail writes the new SecureStore keys).
++               await clearPrivateState().catch(() => undefined);
+                setState((prev) => entryPhaseReducer(prev, { type: "no-local-session" }));
+                return;
+              }
+            }
+
+─── apps/mobile/src/openbot/gate.tsx:233-237 ───
+[style · low] 嵌套三元表达式违反本项目评审清单约定（禁止嵌套三元）。建议提取为带早退的辅助函数，JSX 中只保留一次调用。
+
+-         {failure
+-           ? failure.retryable
+-             ? COPY.loadStuck
+-             : COPY.loadStuckFinal
+-           : (STEP_COPY[seq.phase] ?? COPY.checking)}
++         <Text style={s.muted}>{stepCopy(failure, seq.phase)}</Text>
++ 
++ // module scope:
++ function stepCopy(failure: EntrySequenceFailure | undefined, phase: EntrySequencePhase): string {
++   if (!failure) return STEP_COPY[phase] ?? COPY.checking;
++   return failure.retryable ? COPY.loadStuck : COPY.loadStuckFinal;
++ }
+
+─── apps/mobile/src/openbot/gate-state.ts:26-27 ───
+[maintainability · low] entryPhaseReducer 的 signed-out、workspace-ok、workspace-failed 事件以及
+GateState.error=true 状态在生产代码中不可达：gate.tsx 只派发 no-local-session / me-ok / auth-failed；登出发生在 Gate
+卸载之后的 App 层（onSignOut），workspace 失败走的是 entrySequenceReducer 的 failed/error
+路径。若测试之外无调用方，这是半台永不通电的平行状态机。建议将 GateEvent/GateState 裁剪到生产实际派发的事件集（保留纯模块供 node:test 直测的设计不变），或让 gate
+真正派发这些事件以消除双机并存。
+
+─── apps/mobile/src/openbot/gate.tsx:247-251 ───
+[bug · low] "返回登录页"处理器只重置 phase，未清 notice：上一次失败的错误文案会残留在全新登录表单上方（ErrorNotice 渲染 notice）。另外
+workspace_inconsistent 阻断路径在 persistSession 之前提前 return，触发阻断的旧 stored session 仍留在
+sessionStorage，用户每次冷启动都会重入同一错误页，直到完整重新登录才被 load(true) 清掉——若这是有意设计（文案即"请退出登录后重试"），至少应重置 notice。
+
+        {failure && (
+-         <Pressable onPress={() => setState({ phase: "signin", error: false })}>
++         <Pressable
++           onPress={() => {
++             setNotice("");
++             setState({ phase: "signin", error: false });
++           }}
++         >
+            <Text style={[s.small, { color: colors.blueDark }]}>{COPY.backToSignin}</Text>
+          </Pressable>
+        )}
+

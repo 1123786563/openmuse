@@ -1,0 +1,890 @@
+# ocr-openbot-final split — cluster D: computer / agent-computer / mobile-bff / baseline / templates / app-wiring / db+drizzle / .gitmodules
+# source: ocr-openbot-final.txt (45 findings)
+# repo: /Users/wuyongjun/trea/OpenBot/.worktrees/v4-base (branch v4/openbot-exec)
+
+─── .gitmodules:1-3 ───
+[bug · medium] apps/openmuse 注册为 submodule 后,其内容仍完全落在根级工具链扫描范围内:biome.json 的 files.includes 为 ["**"]
+且没有 !apps/openmuse 排除,根 bunfig.toml 的 [test] 也未限定路径。一旦开发者按标准流程 git submodule update --init
+初始化客户端(apps/openmuse-mobile 已删除,这是唯一前端来源),bun run lint / format:check
+将按本仓规则扫描上游全部源码(上游格式化约定不受本仓控制);根目录 bun test / test:ci 还会递归发现并导入上游的 *.test.ts(如 pin 内
+apps/mobile/test/jev-actions.test.ts),其依赖来自 OpenMuse 自己的 pnpm workspace,在根 bun 安装下无法解析,导入即抛错 →
+套件计数下降,触发 scripts/test-ci.ts 的 MINIMUM_TESTS 下限失败。建议在 biome.json 显式追加
+!apps/openmuse/**,并把根测试发现范围限定到本仓目录(如 bun test app server worker tests scripts shared 或等价配置)。
+
+─── .gitmodules:3-3 ───
+[security · medium] 前端整体固定于 gitlink 46792335,但本仓 CI 从未初始化或校验该 submodule:ci.yml / release 等所有
+actions/checkout 均未设置 submodules 输入,也没有任何 job 执行 git submodule update --init。后果:(1) 悬空 pin(gitlink
+指向从未推送到远端的 commit)可以绿灯合入,直到有人本地 init 才发现;(2)
+设计规格(docs/superpowers/specs/2026-10-12-openmuse-frontend-openbot-backend-design.md)写明 "CI 初始化
+submodule、--frozen-lockfile 安装并单独构建 Web/原生包",目前仅有 b02/b03 的本地人工取证,无自动护栏;(3) 唯一上游是个人账号仓库,其转私/删除/强推 +
+GC 后,所有 clone 与 CI 在 submodule init 时才失败。建议新增轻量 job:git submodule update --init apps/openmuse 后断言
+git -C apps/openmuse rev-parse HEAD 等于 git ls-tree HEAD apps/openmuse 的 SHA(可再加 pnpm install
+--frozen-lockfile + web 构建以兑现规格),并考虑将 url 指向组织可控的镜像以消除单点可用性依赖。
+
+─── agent-computer/src/index.ts:932-938 ───
+[bug · medium] 序列号在负载校验之前就被 admitHumanInput 消费(lastInputSeq = seq 已提交),但随后 /human/scroll 的 deltaY
+校验失败会返回 400,click/type/key 的参数校验失败经 performHumanInput 抛错返回 502,currentPage 失败同样
+502——这些情况下输入从未送达页面,seq 却已被记为"已见过"。客户端修正负载后以同一 seq 重试会被判为重放,收到 409
+STALE_INPUT_SEQUENCE,该合法输入被永久拒绝。建议将各端点的必填字段校验(至少 scroll 的 parseScrollDelta)移到 gate 之前,或把 gate 拆为"检查
++ 派发前提交"两阶段,仅在输入真正要送达时才推进 lastInputSeq。
+
++         // Validate the endpoint's own payload first: a rejected gesture must not consume its
++         // sequence number, or the corrected retry is answered as a replay.
++         if (url.pathname === "/human/scroll") {
++           const parsed = parseScrollDelta(body?.deltaY);
++           if (!parsed.ok) {
++             return json({ error: parsed.error }, 400);
++           }
++         }
+          const seq = body?.seq;
+          const gate = session.control.admitHumanInput(
+            seq === undefined ? undefined : { seq: seq as number },
+          );
+          if (!gate.ok) {
+            return json({ error: gate.error }, gate.status);
+          }
+
+─── agent-computer/src/control.ts:393-396 ───
+[bug · medium] 此注释声称"两条输入路径(live screen 与 HTTP 手势)都在送达页面前经过此门",但 live screen(WS screencast
+输入,index.ts:603-606)实际只调用 humanMayDrive(),从未调用 admitHumanInput——既不受 seq 重放/乱序检查,也不更新
+lastInputSeq。后果:通过 WS 路径的输入完全绕过序列保护,一个有 bug 或被重放的客户端只需改走 WS 即可绕开门控;且与 HTTP
+路径混用时两条输入流的顺序互不约束。证据文档(k03)也记录了 "WS path unchanged — deferred"。请在 WS 处理器的 humanMayDrive 检查处接入
+admitHumanInput,或修正本注释并明确记录该路径延后的事实,避免防护声明与实现不符。
+
+─── agent-computer/src/control.ts:120-124 ───
+[maintainability · low] finish 的 status 参数手工内联了终态联合,与 shared/computer-control.ts 的 HandoffStatus
+完全重复(五个值一一对应)。后续新增终态时两处易漂移(本次 "refused" 就需要同时改两处)。建议直接复用 HandoffStatus,在本文件的 type import 中加入即可。
+
+    function finish(
+      request: HandoffRequest,
+-     status: "completed" | "cancelled" | "expired" | "interrupted" | "refused",
++     status: HandoffStatus,
+      interruption?: string,
+    ) {
+
+─── agent-computer/src/control.ts:85-88 ───
+[security · medium] 新的身份绑定机制只保护了 take:heldByAnother 仅在 take 的幂等重取路径被检查,而 release() 不接收、不校验任何身份。任何持有
+COMPUTER_TOKEN 的调用方(经服务端转发即任意可操作该 Bot 的另一用户)只要拿到持有者的 requestId,即可调用 /control/release
+结束他人正在驾驶的租约——持有者下一条输入将收到 409、快照被作废,这正是 take 侧 409("Another person already holds this control
+request.")要阻止的"第二人"干扰场景,只是换成了"把人踢下车"而非"抢上车"。index.ts 的 /control/release、/control/cancel 分支也未透传
+userId;服务端仅在 /control/revoke 路由做了"持有者或管理员"校验(gateway.releaseControl/cancelControl 只传 requestId),按
+revoke 路由注释自己立的标准("结束别人的租约……不能是防护更弱的路径"),release(以及取消 taken 租约的 cancel)同样应绑定持有者身份。建议为 release(与
+taken 状态的 cancel)增加与 take 对称的 heldByAnother 校验,并由 index.ts 透传服务端注入的 userId。
+
+-   const heldByAnother = (
+-     request: HandoffRequest,
+-     holder?: { userId: string },
+-   ) =>
++     release(requestId: string, holder?: { userId: string }): ControlState {
++       const request = intended(requestId);
++       if (request.status === "completed" && data.holder === "bot") return get();
++       if (
++         data.holder !== "human" ||
++         (request.status !== "taken" && request.status !== "cancelled")
++       )
++         throw new ControlRequestError(
++           "That request is no longer held by a person.",
++           409,
++         );
++       if (heldByAnother(request, holder))
++         throw new ControlRequestError(
++           "Another person holds this control request.",
++           409,
++         );
++       if (request.status === "taken") finish(request, "completed");
+
+─── scripts/openmuse-v4-baseline.sh:207-209 ───
+[bug · medium] API 复用校验存在两个相互叠加的缺陷：(1) PID 文件记录的是 `bun run dev` 父进程（经 `exec nohup env ... bun run
+dev` 启动），而 server/package.json:22 定义 dev 为 `bun --env-file=../.env --watch src/index.ts`，真正持有监听端口的是
+`bun --watch src/index.ts` 子进程（监听逻辑在 server/src/index.ts:4798）——脚本自身 cmd_down 的注释也承认「二者脱节是常态」。对父 pid
+做 lsof 永远查不到 LISTEN 端口，`live_port` 恒为空，合法复用场景（API 已在同一端口健康运行时再次 up）必然被误判为 config 变更。(2) 该命令替换在 `set
+-euo pipefail` 下未加 `|| true`：lsof 无匹配时以非零状态退出，经 pipefail 传播使命令替换整体非零，赋值语句即失败，脚本会在打印任何诊断前静默退出——下方含
+"run '$0 down' first" 提示的 die 分支实际不可达。影响：up 失去幂等性；smoke-db-off 之后按正常流程再次 up 无法恢复，用户被迫执行 down，而 down
+中 `docker rm -f` 会连同数据库容器一起销毁本地基线数据。建议改为按「端口 + 命令行」认领真正的监听进程（与 cmd_down 收尾逻辑一致），并对 lsof 加 `|| true`
+兜底。
+
+-     local live_port
+-     live_port="$(lsof -nP -a -p "$(api_pid)" -iTCP -sTCP:LISTEN 2>/dev/null \
+-       | awk 'NR>1 {sub(/.*:/,"",$9); print $9; exit}')"
++     # PID 文件记的 bun run dev 父进程不持端口（真正监听的是 bun --watch
++     # src/index.ts 子进程），按「端口 + 命令行」认领监听进程，与 cmd_down 一致；
++     # lsof 无匹配时非零退出，|| true 防 set -euo pipefail 静默退出。
++     local lpid ours=""
++     for lpid in $(lsof -nP -iTCP:"$APIPORT" -sTCP:LISTEN -t 2>/dev/null || true); do
++       ps -p "$lpid" -o command= 2>/dev/null | grep -q "src/index.ts" && ours="$ours $lpid"
++     done
++     [ -n "$ours" ] || die \
++       "no src/index.ts listener on $APIPORT (API pid $(api_pid) holds no port; config changed? run '$0 down' first)"
+
+─── scripts/openmuse-v4-baseline.sh:219-220 ───
+[bug · low] `env $(baseline_env | tr '\n' ' ')` 有意依赖无引号词分割（SC2046 已 disable，注释假设「one VAR=value per
+word」），但 baseline_env 的值是用户可控的：OPENMUSE_V4_PUBLIC_ORIGIN（服务端在 index.ts:4022 消费，用于拼接 Google OAuth 回调
+URI）等一旦含空格或 glob 字符，值会被拆成多个词，env 会把多余片段当作待执行命令而启动失败。失败模式尤其糟糕：API 进程没起来，脚本要等 30 秒 /ready
+轮询超时后才以这一无关联错误退出，排障成本高。建议逐行读入数组后以 "${env_args[@]}" 传递，值含任何空白都不再被拆坏。
+
+-     (cd "$ROOT/server" && exec nohup env $(baseline_env | tr '\n' ' ') bun run dev \
++     local -a env_args=()
++     while IFS= read -r kv; do env_args+=("$kv"); done < <(baseline_env)
++     (cd "$ROOT/server" && exec nohup env "${env_args[@]}" bun run dev \
+        > "$LOG_FILE" 2>&1) & echo $! > "$PID_FILE"
+
+─── server/drizzle.config.ts:20-21 ───
+[maintainability · low] 表定义来源自此分散两处：openmuse 系表集中在 db/schema/openmuse.ts，而
+openmuse_account_deletions / openmuse_deletion_resources 两张删除子系统表仍留在业务模块 openmuse-deletion/store.ts
+中并以相对路径引入。已核实该文件无副作用导入、功能安全，但与本次将 openmuse 表归拢到 db/schema 的做法不一致；建议后续归拢到 db/schema
+目录，或在此加注释说明该例外的归属原因，避免维护者误判 schema 清单位置。
+
+    schema: [
++     // 例外：删除子系统的表声明与业务代码同址（openmuse_account_deletions /
++     // openmuse_deletion_resources），文件内仅含 pgTable 定义，无副作用导入。
+      "./src/openmuse-deletion/store.ts",
+
+─── server/drizzle/0081_stormy_expediter.sql:1-4 ───
+[bug · medium] openmuse_reviewed_actions 缺少对活跃状态同 payload 提案的去重约束,而 R04 门控与应用层配合存在两处缺口:(1)
+findSettledSameSend 仅拦 executing/outcome_unknown/succeeded,不含 awaiting_review——首个提案仍在等待复核时,同一
+(owner_user_id, kind, payload_hash) 的第二次 propose 可直接再插入一条(无需并发竞态);(2) propose 是先查后插(service.ts
+propose → insertAction),并发双击/客户端重试存在 TOCTOU,两条都会插入成功。decide 路径没有兄弟提案校验,审批者批准两条重复提案后,executor 将对
+provider 重复执行真实副作用(重发邮件、重复创建日程)——这正是本模块 payloadHash/generation/fingerprint
+体系要防范的最坏后果。建议为本表补一条部分唯一索引作为 DB 级兜底,并在 insertAction/propose 捕获唯一冲突后重跑门控查询、返回既有提案(幂等化),使应用层门控与约束语义闭环。
+
+- CREATE TABLE "openmuse_reviewed_actions" (
+- 	"id" text PRIMARY KEY NOT NULL,
+- 	"owner_user_id" text NOT NULL,
+- 	"kind" text NOT NULL,
++ CREATE UNIQUE INDEX "openmuse_reviewed_actions_active_send_uq" ON "openmuse_reviewed_actions" USING btree ("owner_user_id","kind","payload_hash") WHERE "status" IN ('awaiting_review','executing','outcome_unknown');
+
+─── server/drizzle/0079_faithful_shooting_star.sql:20-22 ───
+[performance · medium] openmuse_oauth_pending 没有任何删除路径,行会无限累积:sweepExpired(connectors/store.ts
+L161-174)只把过期行标记 outcome='expired' 而不删除;purge-relational 的 RELATIONAL_KINDS 不含该
+kind(账号删除不清这张表);表也没有到 users 的外键可级联。同时每次 OAuth start 的懒清扫都会执行 `UPDATE ... WHERE consumed_at IS NULL
+AND outcome IS NULL AND expires_at < now()`,在无 expires_at 索引的情况下退化为全表扫描,且随历史行增长持续变慢。建议:(1)
+为清扫谓词补一个部分索引;(2) 增加 TTL 清理(对 consumed/expired 超过保留期的行 DELETE),否则这张记录每次授权尝试的表将永久增长。
+
+- 	"expires_at" timestamp with time zone NOT NULL,
+- 	"consumed_at" timestamp with time zone
+- );
++ CREATE INDEX "openmuse_oauth_pending_open_idx" ON "openmuse_oauth_pending" USING btree ("expires_at") WHERE "openmuse_oauth_pending"."consumed_at" IS NULL AND "openmuse_oauth_pending"."outcome" IS NULL;
+
+─── server/drizzle/0078_melodic_nightcrawler.sql:2-4 ───
+[maintainability · low] 同一 PR 中 0077 的 openmuse_files/openmuse_file_versions 都带 `REFERENCES
+users(id) ON DELETE cascade`,而这里 openmuse_tasks.owner_user_id(以及 0079 的
+openmuse_google_connections.user_id、openmuse_oauth_pending.user_id、0085 的
+openmuse_goals.owner_user_id)是裸 text 列、无外键。目前行清理由 purge-relational 的显式 owner-scoped seam
+补偿、代码内也没有其它用户删除路径,但任何旁路删除(手工运维、未来的用户删除功能)都会留下永久孤儿行,且 per-owner 查询无法依赖引用完整性。建议与 0077 保持同一模式补上外键。
+
+  	"id" text PRIMARY KEY NOT NULL,
+- 	"owner_user_id" text NOT NULL,
++ 	"owner_user_id" text NOT NULL REFERENCES "public"."users"("id") ON DELETE cascade ON UPDATE no action,
+  	"bot_id" text NOT NULL,
+
+─── server/drizzle/meta/0093_snapshot.json:7399-7415 ───
+[style · low] 唯一索引 openmuse_tasks_owner_key_uq 实际覆盖列为 owner_user_id + idempotency_key，其中 "key"
+指幂等键，与快照中大量以 owner_XXX 命名的普通组合索引（如 openmuse_tasks_owner_created_idx）混用时，维护者易将 "owner_key"
+误读为某种主键复合或泛化的 owner 维度索引。快照为 drizzle-kit 生成物，建议后续在 server/src/db/schema/openmuse.ts
+的表定义上加注释说明，或在未来一次迁移中同步改名为更明确的 openmuse_tasks_owner_idem_uq（需 schema 定义与迁移、快照一起变更），避免手工单独编辑本文件。
+
+-         "openmuse_tasks_owner_key_uq": {
+-           "name": "openmuse_tasks_owner_key_uq",
++         "openmuse_tasks_owner_idem_uq": {
++           "name": "openmuse_tasks_owner_idem_uq",
+            "columns": [
+              {
+                "expression": "owner_user_id",
+                "isExpression": false,
+                "asc": true,
+                "nulls": "last"
+              },
+              {
+                "expression": "idempotency_key",
+                "isExpression": false,
+                "asc": true,
+                "nulls": "last"
+              }
+            ],
+            "isUnique": true,
+
+─── server/src/index.ts:3991-3996 ───
+[maintainability · medium] 三处（Google/Mail/Calendar client）各自硬编码 `process.env.OPENCONNECTOR_URL ??
+"http://localhost:3000"`，绕过了 config 模块。问题在于 config.ts:2310 已存在 `openConnectorUrl` 字段且默认值为
+`http://localhost:3100`：同一进程内同一环境变量出现两个相冲突的默认值，OPENCONNECTOR_URL 未设置时，既有 openconnector 消费方拨 :3100
+而这三个新 seam 拨 :3000，必有一半连错服务。同理 `OPENBOT_PUBLIC_ORIGIN`、`OPENBOT_OPENMUSE_FILES_DIR`（cwd 相对默认
+`.openmuse/files`，运行目录变化会漂移）也都绕过了统一配置。建议直接改用 `config.openConnectorUrl`（字段已存在，无需改 config.ts），其余两处 env
+一并收敛进 config。
+
+  const openMuseGoogleClient = (() => {
+    try {
+      return createOpenConnectorOAuthClient({
+-       url: process.env.OPENCONNECTOR_URL ?? "http://localhost:3000",
++       url: config.openConnectorUrl,
+      });
+    } catch (error) {
+
+─── server/src/app.ts:630-634 ───
+[maintainability · medium] 本轮又向 `createApp` 追加约 17 个可选位置参数（累计 30+），调用侧已被迫以显式 `undefined` 占位
+readinessProbe；注释多处自认 "APPENDED LAST … positional" 风险。全仓约 45 个测试调用点 + 1 个生产调用点，其中大量同型 `Hono<{
+Variables: AppVariables }>` 参数——一旦有人在序列中部插入参数，TS 对 Hono↔Hono 错位无法察觉，路由会静默挂错 seam 或不挂载。建议将这批可选 seam
+收敛为单个尾部 options 对象，按名取用以消除位置错位风险。
+
+-   openMuseTemplateStore?: OpenMuseTemplateMethods,
+-   /**
+-    * Whether the deployment's database answers, for `/ready`. APPENDED LAST, like
+-    * `openMuseTemplateStore` beside it: these are positional, so inserting one anywhere else
+-    * silently shifts every existing call site's arguments by one.
++   options?: {
++     openMuseTemplateStore?: OpenMuseTemplateMethods;
++     readinessProbe?: () => Promise<void>;
++     openMuseTemplateRevisions?: OpenMuseTemplateRevisionService;
++     openMuseFiles?: OpenMuseFileStore;
++     openMuseTasks?: OpenMuseTaskStore;
++     // …其余 openmuse-* seam 同样收进该对象，按名取用；
++     // 迁移可分步进行：新参数一律只加在 options 内，位置参数序列冻结。
+
+─── server/src/index.ts:2717-2724 ───
+[maintainability · medium] 此处的 `toolsForTurn`（连同 `createTurnRunner` 的
+intelligence/runner/components/buildAgentFor 脚手架）与既有 `routineRunner` 的装配（index.ts:1919-1938）逐行重复，包含
+`canUseComputer` 这一安全门控。两份副本将来只要有一份改动（如审计 store、initiator 规则、Team Bot
+判定），交互式运行与本任务运行就会持有不一致的工具集，且漂移不可见。建议抽出一个共享的 headless 计算机工具工厂（或 `computerToolsForTurn({ ownerUserId,
+agentId, initiator })` 辅助函数），两个 runner 复用同一实现。
+
+-   channels: channelStore,
+-   emitNotification: openMuseNotificationStore.emit,
+-   runTurn: createTurnRunner({
++ // 与 routineRunner 共享同一装配，两处调用同一工厂：
++ const headlessTurnRunner = () =>
++   createTurnRunner({
+      intelligence: routineIntelligence,
+      runner: routineAgentRunner,
+      components: { store: componentStore, auditStore: bootAuditStore },
+      buildAgentFor,
+-     toolsForTurn: async ({ ownerUserId, agentId, initiator }) => {
++     toolsForTurn: computerToolsForTurn, // 抽取后的共享实现
++     learningContainerForThread: (input) =>
++       copilotRuntime.learning?.containerForThread(input) ??
++       Promise.resolve(undefined),
++   });
+
+─── server/src/computer/stream-auth.ts:131-138 ───
+[security · medium] 502 分支把内部错误的 `error.message` 原样作为响应体下发给浏览器。`gateway.locate` 抛出的
+`ComputerUnavailableError` 可能携带内部拓扑（如 `checkComputerAddress` 的 "The computer's address is not a URL:
+${raw}" 直接包含 supervisor 返回的原始地址），transport 错误也可能含内部 URL。同文件对 503 容量分支刻意做了净化（"no OPENMUSE_* advice
+sent out"），此分支却与之自相矛盾。index.ts 会将 `decision.message` 原样返回，无中间净化层。建议对外一律返回通用文案，详细错误仅写服务端日志。
+
++       log.warn(
++         `stream proxy could not locate ${botId}'s computer: ${error instanceof Error ? error.message : String(error)}`,
++       );
+        return {
+          kind: "refuse",
+          status: 502,
+-         message:
+-           error instanceof Error
+-             ? error.message
+-             : "That Bot's computer could not be reached.",
++         message: "That Bot's computer could not be reached.",
+        };
+
+─── server/src/computer/routes.ts:474-480 ───
+[security · medium] 持有人校验存在 TOCTOU 竞态：先经 `gateway.control(botId)` 读取 `takenBy`，再调
+`revokeControl`，两步是各自独立的往返。窗口内若他人 take 成功，非持有人（非 admin）即可撤销他人租约——已确认计算机端 `/control/revoke` 落到
+`interrupt()` 时无条件结束当前活动租约，不做任何持有人前置复核，服务端这道检查是唯一防线且不在原子操作内。建议把观察到的租约标识（requestId/takenBy）作为前置条件随
+revoke 传给计算机端，由其在结束前复核当前活动租约仍匹配，不匹配则返回 409。
+
+-       const holder = (await gateway.control(botId)).request?.takenBy;
++       // 观察到的租约作为前置条件传下去，由计算机在 interrupt 前复核仍未被他人接管，
++       // 消除“读 takenBy → 撤销”两步之间的接管窗口。
++       const observed = await gateway.control(botId);
++       const holder = observed.request?.takenBy;
+        if (holder && holder !== actor.id && context.var.actor.role !== "admin") {
+          throw new HandoffRequestError(
+            "Another person holds this control request.",
+            409,
+          );
+        }
++       return gateway.revokeControl(botId, actor, reason, observed.request?.id);
+
+─── server/src/computer/routes.ts:474-474 ───
+[bug · medium] 该预读经 `gateway.control` → `get` → `locate` → `capacity.reserve` + supervisor
+`/ensure`：仅为读取 `takenBy` 就可能把一台已停止的计算机重新启动（白白占用容量名额），而停止的计算机本不可能持有租约；反过来，计算机不可达时整个 revoke 抛
+503，“无可撤租约”的正常情形被当成故障。建议对 control 读取失败或无活动租约的情形按 no-op 处理（或提供不触发 /ensure 的只读定位路径），避免撤销路径产生启动计算机的副作用。
+
+-       const holder = (await gateway.control(botId)).request?.takenBy;
++       let holder: string | undefined;
++       try {
++         holder = (await gateway.control(botId)).request?.takenBy;
++       } catch {
++         // 计算机不在运行就没有可撤销的租约：已停止的计算机不可能持有人，
++         // 不为读一个 takenBy 而把它 /ensure 起来，也不让登出路径整体失败。
++         holder = undefined;
++       }
+
+─── server/src/computer/gateway.ts:1277-1284 ───
+[bug · medium] 写入先扣减配额、post 失败后不回冲：全代码库确认 `chargeWrite` 仅此一处、`resetUsage` 仅在 wipe
+时调用，没有任何回冲或周期性对账。网络抖动、计算机重启等暂时性写失败会持续消耗配额，反复几次后该 Bot 的写入路径被 413 永久锁死，只能靠 workspace
+重置解封；且覆盖写同一文件（即便写得更小）也按全量字节计费。代码注释以“保守”解释 over-count，但把恢复手段（写文件腾空间）也堵死是可用性缺陷。建议 post 失败时回冲本次扣减。
+
+          async () => {
+            // Charged before the write is sent, so a refused write writes nothing. See capacity.ts.
+-           capacity.chargeWrite(
+-             botId,
+-             Buffer.byteLength(input.contents, "utf8"),
+-           );
+-           return post<WriteFileResult>(botId, "/files/write", input);
++           const bytes = Buffer.byteLength(input.contents, "utf8");
++           capacity.chargeWrite(botId, bytes);
++           try {
++             return await post<WriteFileResult>(botId, "/files/write", input);
++           } catch (error) {
++             // A write that never landed must not eat the budget: refund so transient
++             // failures cannot lock this Bot's write path shut until a workspace wipe.
++             capacity.refundWrite(botId, bytes);
++             throw error;
++           }
+          },
+
+─── server/src/computer/capacity.ts:223-226 ───
+[bug · medium] “人持租约永不中断”的保护完全依赖 control 咨询成功，而 gateway 构造的 consult 捕获一切异常返回 undefined（capacity.ts
+注释自己也说“A computer that cannot be asked is not one a sweep may judge on
+control”，但实现恰恰在咨询失败时继续判）。一旦争用触发 sweep 时咨询暂时失败，`control?.holder === "human"` 防线失效，sweep 退化为仅凭
+startedAt/lastRunActivity 判断——持有人握着租约但 15
+分钟未发输入的计算机会被停机，会话浏览器状态被丢弃，直接违背此处注释的承诺。建议在网关本地记录持有人状态（take/release/revoke/humanInput
+均流经网关）作为咨询失败时的兜底判据，或让 consult 失败可区分并在无法确认时跳过停机。
+
+            const control = await options.control?.(computer.botId);
+            // A person holding the wheel is activity no timestamp captures, and the one activity that
+            // must never be interrupted: a held lease is not idle however long it has been held.
+-           if (control?.holder === "human") continue;
++           // A failed consult must not undo that promise — judge on the last locally recorded
++           // human-hold instead of falling through to startedAt alone.
++           if (control === undefined) {
++             const heldAt = lastHumanHold.get(computer.botId);
++             if (heldAt !== undefined) continue;
++           } else if (control.holder === "human") {
++             continue;
++           }
+
+─── server/src/computer/capacity.ts:180-183 ───
+[performance · medium] 争用时完整清扫在全局 `reserving` 串行链内执行：list → 逐台运行中计算机 `provider.locate`（/ensure）+
+`/control` 两次往返 → 再 list。期间进程内所有 locate（即所有计算机动作与人类手势输入）全部排队等待；sweepIdle 已确认是空闲停机的唯一触发点，20
+台规模下次数不设上限，且被拒调用方每次重试都会重新触发全量清扫，人类输入延迟被成倍放大。建议把清扫移出串行段（持锁内只收集候选、锁外执行停机与咨询），或对清扫做时间节流，避免每次拒绝都重付全量成本。
+
+-         await sweepIdle(now(), botId);
++         // Sweep outside the serialized section: the chain above must not hold every
++         // action hostage to a full-fleet list + per-computer /control consultation.
++         void sweepIdle(now(), botId).finally(() => {
++           reserving = reserving.then(() => undefined);
++         });
+          if ((await others()) >= maxActive) {
+            throw new ComputerCapacityError(maxActive);
+          }
+
+─── server/src/computer/capacity.ts:102-107 ───
+[style · low] `latestOf` 使用了三元嵌套三元（分支内再嵌分支），违反代码规范（禁止嵌套三元表达式），可读性差。建议改为 if 分支。
+
+-     const ms =
+-       typeof candidate === "number"
+-         ? candidate
+-         : candidate === undefined
+-           ? Number.NaN
+-           : Date.parse(candidate);
++     let ms: number;
++     if (typeof candidate === "number") {
++       ms = candidate;
++     } else if (candidate === undefined) {
++       ms = Number.NaN;
++     } else {
++       ms = Date.parse(candidate);
++     }
+
+─── server/src/computer/capacity.ts:124-127 ───
+[maintainability · low] `lastRunActivity` 与 `charged` 两张 Map 除 `resetUsage`（仅 workspace wipe
+时）外没有任何清理路径：sweep 停机、`stopComputer`、Bot 删除后对应条目永久残留，长生命周期进程随历史 Bot 数缓慢增长。建议在 sweep 停机与 stopComputer
+成功时删除对应 Bot 的条目（charged 尤其应随停机清零，与 supervisor 保卷不保进程的语义对齐需另行确认）。
+
+    /** When each Bot last acted through this gateway. One more action is the run being alive. */
+    const lastRunActivity = new Map<string, number>();
+    /** What each Bot's workspace has been charged, in bytes. See chargeWrite for the approximation. */
+    const charged = new Map<string, number>();
++ 
++   /** Called wherever a Bot's computer stops for good (sweep stop, stopComputer), so the
++    *  per-Bot bookkeeping does not outlive the computer it describes. */
++   function forget(botId: string) {
++     lastRunActivity.delete(botId);
++     charged.delete(botId);
++   }
+
+─── server/src/computer/stream-auth.ts:65-67 ───
+[documentation · low] 注释与实现不符：“Non-browser clients send no Origin and are judged by the token below”
+—— 下方并不存在对调用方 token 的任何校验，只有向上游 URL 附加
+COMPUTER_TOKEN（供计算机认证服务器代理，而非认证调用方）。非浏览器客户端实际由上方的会话校验（resolveRequestActor 401）与 Bot
+访问校验裁决。这句会误导审阅者以为存在调用方凭证校验这一层防线，建议修正表述。
+
+       * SameSite=None ones (multi-origin serves, mobile H5), where without it a hostile page opens
+       * this socket with the victim's session and watches their Bot's screen. Non-browser clients
+-      * send no Origin and are judged by the token below.
++      * send no Origin and are judged by the session and Bot-access checks above; the COMPUTER_TOKEN
++      * below authenticates this server to the computer, not the caller to this server.
+
+─── server/src/index.ts:4033-4037 ───
+[maintainability · medium] 这段守卫选择逻辑（singleUser → createDevRequireUser；auth+roleRepository →
+createRequireUser；否则 503）与 app.ts:1012-1016 中 createApp 内部构造 requireUser 的代码逐行重复，包括同一段『Unreachable
+in a booted deployment』注释和相同的 503 错误文案。这是认证策略的第二份副本：同一 /api/mobile 前缀族现在由两个不同实例守卫——files 子应用经
+mobile-bff 用的是 app.ts 的 requireUser，而 inspect/fill（documents 路由）、mail、calendar
+等用这份副本。今后任一侧加入校验（如组织级限定、会话缓存策略）都会造成同一前缀下行为静默分叉。建议抽成共享工厂（如 guards.ts 中导出
+createDeploymentRequireUser(config, auth, roleRepository)），app.ts 与此处共用同一实现。
+
+- const openMuseGoogleGuard: MiddlewareHandler<{ Variables: AppVariables }> =
+-   config.singleUser
+-     ? createDevRequireUser()
+-     : auth && roleRepository
+-       ? createRequireUser(auth, roleRepository)
++ // guards.ts：单一实现，两个装配点共用
++ export function createDeploymentRequireUser(
++   config: { singleUser: boolean },
++   auth?: AuthService,
++   roleRepository?: RoleRepository,
++ ): MiddlewareHandler<{ Variables: AppVariables }> {
++   if (config.singleUser) return createDevRequireUser();
++   if (auth && roleRepository) return createRequireUser(auth, roleRepository);
++   return async (context) =>
++     context.json({ error: "No identity provider is configured." }, 503);
++ }
++ 
++ // index.ts / app.ts 两侧：
++ const openMuseGoogleGuard = createDeploymentRequireUser(config, auth, roleRepository);
+
+─── server/src/computer/capacity.ts:169-184 ───
+[bug · medium] 容量准入只统计"其他计算机"(others)，从不检查本 Bot 自己的计算机是否已在运行。locate 语义是
+/ensure：自身计算机已在运行时它只是刷新、不新启任何计算机，但只要 others >= maxActive 就仍抛 ComputerCapacityError，该 Bot
+的所有动作（包括人类手势输入、控制交接、撤销自己的租约）被 503 拒之门外。该状态实际可达：多副本部署按进程计数（本文件注释明确 by design，且 gateway.ts
+快照注释表明这是受支持拓扑，每副本看到的是 supervisor 的全量 fleet）；RESERVE_THROTTLE_MS 窗口内两个不同 Bot 先后通过 reserve 而各自 /ensure
+尚未落地的瞬时超额（如 19→21）；运维下调
+OPENMUSE_MAX_ACTIVE_COMPUTERS；或旁路启动的计算机。且争用清扫刻意排除自身计算机（下方注释自己也承认该场景存在），只能等无关计算机转闲才能解锁——一台正在运行的计算机对它的
+主人变成不可用。建议在同一个 provider.list() 结果中同时判断自身计算机状态：已运行则视为刷新直接放行。
+
++     const fleet = async () => running();
++     const others = async () =>
++       (await fleet()).filter((computer) => computer.botId !== botId).length;
++     // A refresh, not a start: when this Bot's computer is already running, /ensure starts
++     // nothing, so the cap must not refuse it.
++     const ownRunning = async () =>
++       (await fleet()).some((computer) => computer.botId === botId);
+      try {
+-       if ((await others()) >= maxActive) {
+-         /*
+-          * Contended, so the deployment's spare capacity is tried before the caller is refused:
+-          * computers idle past the limit are exactly the ones the contract wants stopped, and
+-          * the sweep on contention is the whole of the idle-stop trigger — no timer, no new service.
+-          *
+-          * The reserving Bot is excluded: stopping its own computer frees nothing (`others`
+-          * already omits it) and only throws away the browser state its own /ensure is about to
+-          * restart.
+-          */
++       if (!(await ownRunning()) && (await others()) >= maxActive) {
+          await sweepIdle(now(), botId);
+-         if ((await others()) >= maxActive) {
++         if (!(await ownRunning()) && (await others()) >= maxActive) {
+            throw new ComputerCapacityError(maxActive);
+          }
+        }
+
+─── server/src/computer/capacity.ts:227-234 ───
+[bug · medium] 闲置判定的时间戳来源与判定范围不匹配：sweep 判定的是 supervisor 返回的全量 fleet，但 lastRunActivity 只记录本进程经
+gateway 触发的活动；跨进程可见的 startedAt / control.since / request.updatedAt 都是"开始时刻"而非"最近活动时刻"。多副本部署下（gateway
+快照注释与 capacity 注释均表明这是受支持形态），run 在 A 副本上持续执行时，B 副本触发争用清扫看到的全部是陈旧的开始时间戳，15 分钟后就会 stop
+一台正在工作的计算机——holder==="human" 只保护人类租约，不保护 bot run，控制咨询成功也无法挽回（它返回的 since 同样是开始时刻）。后果是该 run 的容器被停掉、动作以
+ComputerUnavailableError 失败。建议：由 control 咨询补充计算机侧真正可跨副本看到的"最近活动"信息（如最近一次输入/命令时刻）参与
+latestOf，或将清扫范围限定在本进程有活动记录可依的计算机。
+
+            const last = latestOf(
+-             // The run's start, read off the list rather than asked of the computer: asking means
+-             // locating, and locating means /ensure, which starts the very computer being judged.
+              computer.startedAt,
+              lastRunActivity.get(computer.botId),
+              control?.since,
+              control?.request?.updatedAt,
++             // Cross-replica-visible last activity, so a run being driven through another
++             // replica does not read as idle here.
++             control?.lastActivity,
+            );
+
+─── server/src/computer/routes.ts:1052-1055 ───
+[security · low] errorBody 经 describe() 把 error.message 原样下发：新引入的 ComputerCapacityError /
+WorkspaceQuotaError 消息携带运维指引（"raise OPENMUSE_MAX_ACTIVE_COMPUTERS"、"raise
+OPENMUSE_COMPUTER_DISK_GIB"），会随 503/413 直接暴露给终端浏览器。同一 PR 的 stream-auth.ts 对同一容量拒绝刻意做了净化（注释明确 "the
+env guidance in the refusal is for an operator, not a browser … no OPENMUSE_* advice sent
+out"），两条面向客户端的路径策略互相矛盾，且向不可信调用方泄露内部配置项名称。建议浏览器响应使用中性文案（已加的稳定 code 字段足以让前端区分），含 env 指引的完整消息仅写入日志。
+
+      // Stable codes, so a surface can tell a capacity refusal apart from a generic failure without
+-     // parsing prose.
+-     ...(error instanceof ComputerCapacityError ? { code: error.code } : {}),
+-     ...(error instanceof WorkspaceQuotaError ? { code: error.code } : {}),
++     // parsing prose. The env guidance in these errors is for the operator (see stream-auth.ts's
++     // refusal), so the browser-facing message is neutralised here.
++     ...(error instanceof ComputerCapacityError
++       ? {
++           code: error.code,
++           error: "This deployment's computers are all in use.",
++         }
++       : {}),
++     ...(error instanceof WorkspaceQuotaError
++       ? {
++           code: error.code,
++           error: "That write would exceed this Bot's workspace cap.",
++         }
++       : {}),
+
+─── server/src/db/schema/openmuse.ts:244-246 ───
+[other · medium] openmuse_oauth_pending 没有任何清理路径，与 §9 删除完整性目标矛盾：(1) schema 注释自述过期数据 "never cleaned
+by this ticket"，但经全仓检索该表只有 insert/select/update（openmuse-connectors/store.ts），没有任何 delete；(2) 它不在
+openmuse-deletion 的 manifest 枚举里（清单只含
+file/task/reviewed-action/goal/idea/memory/notification/bot/channel/连接各类），purge-relational/purge-con
+nectors 均不触达；(3) userId 是无外键的裸 text 列，账号硬删后用户表行被删除，这些 pending 行永久成为孤儿。结果是：行随 OAuth 尝试次数无界增长，且账号
+"completed" 级删除后仍残留指向已删用户的行。建议给 userId 补 users 外键（onDelete: cascade，与同文件 openmuseFiles.ownerUserId
+做法一致），或增加按 expiresAt 的定期清扫并纳入 §9 枚举。
+
+  export const openmuseOauthPending = pgTable("openmuse_oauth_pending", {
+    state: text("state").primaryKey(),
+-   userId: text("user_id").notNull(),
++   userId: text("user_id")
++     .notNull()
++     .references(() => users.id, { onDelete: "cascade" }),
+
+─── server/src/db/schema/coworker.ts:84-86 ───
+[style · low] 同一批变更里两个部分唯一索引的谓词写法不一致：这里用 sql`${table.deletedAt} IS NULL` 模板（渲染为
+"agent_profiles"."deleted_at" IS NULL），openmuse.ts 的 openmuse_files_owner_idem_uq 用原生字符串
+"openmuse_files"."deleted_at" is null。两者生成的 SQL 语义等价，但字面大小写不同，未来 drizzle-kit generate/snapshot
+比对时易产生不必要的差异噪音；建议统一为一种写法（推荐表引用模板，避免手写列名字符串漂移）。
+
+─── server/src/db/schema/openmuse.ts:1-11 ───
+[bug · high] 本文件从 drizzle-orm/pg-core 导入了原生 jsonb,违反项目强制约定。server/src/db/schema/json.ts 的自定义 jsonb
+明确要求 "Use this everywhere instead of jsonb from drizzle-orm/pg-core":服务端使用 drizzle-orm/bun-sql
+驱动(server/src/db/client.ts),原生 jsonb() 的输出会被 Bun SQL 二次序列化,值落库为 jsonb 字符串(jsonb_typeof = "string")而非
+JSON 对象。全部 21 个既有 schema 文件(含本次变更的 coworker.ts)均从 "./json" 导入,唯独本文件例外。风险路径具体存在:同一变更的
+openmuse-tasks/store.ts 对这些列使用 JSON 操作符——monitor 重 arm CAS 的 `monitorCondition ->>
+'intervalMinutes'`(store.ts:1297)、人工等待认领 CAS 的 `wait ->> 'waitId'` / `->>
+'answeredAt'`(store.ts:1446-1447);若列被双重编码为字符串,这些谓词恒为 NULL,monitor 永不重 arm、input/review
+等待无法被认领。受影响列包括
+steps/evidence/artifact_ids/wait/monitor_condition/canonical_payload/scopes/granted_scopes/attachmen
+t_version_ids/milestones/ideas.evidence/reconciliation。建议改为 `import { jsonb } from "./json";`(自定义类型经
+$type<T>() 泛型收窄后用法不变,与其他 schema 文件一致)。
+
+  import { sql } from "drizzle-orm";
+  import {
+    boolean,
+    index,
+    integer,
+-   jsonb,
+    pgTable,
+    text,
+    timestamp,
+    uniqueIndex,
+  } from "drizzle-orm/pg-core";
++ import { jsonb } from "./json";
+
+─── server/src/agents/profile-store.ts:826-831 ───
+[bug · medium] 幂等重跑路径会以空数组调用 inArray:当 manifest 记账的 id 已全部不属于该 owner(典型场景:purge 流程中本 seam 已成功删除但
+markDeleted 落账前进程崩溃,重试 walk 携带已删除的 id 再次调用),owned 为 [],drizzle-orm ^0.45.2 的 inArray 对空数组会抛出
+"inArray requires at least one value" 而非生成 false 条件。这使 openmuse-bot kind 永远无法标记
+deleted,删除清剿在重试时持续失败,直接违反本方法文档承诺的 "a repeat (the idempotent re-cleanup) deletes nothing either"。同批
+channels/routes.ts 的同类 hardDelete 刻意采用子查询形式的
+inArray(空子查询天然为假),本实现物化数组后失去了这层免疫。建议补空集守卫,与事务回调内直接返回即可(空事务提交,语义为 no-op)。
+
++         // 幂等:manifest 记账的 id 可能已在本事务外被前次成功删除(落账窗口),
++         // 空集直接提交空事务,而不是以空数组构造 inArray。
++         if (owned.length === 0) return;
+          await transaction.delete(agents).where(
+            inArray(
+              agents.id,
+              owned.map((row) => row.id),
+            ),
+          );
+
+─── server/src/agents/openmuse-template-store.ts:555-560 ───
+[bug · low] CAS 谓词与 load 侧的版本回退语义不一致:load 经 storedTemplateVersion 对缺失 openMuse.templateVersion
+的行回退为出厂版本 1(OPENMUSE_TEMPLATE_VERSION),而此 SQL 谓词对缺失标记判
+NULL、永不匹配。当前三条写入路径(createFromTemplate、reviveTombstonedTemplate、profile-store update 的 ...previous
+展开)均会写入/保留标记,尚无现实触发;但一旦出现无标记行(数据修复、未来写路径),preview 会正常报告 storedVersion=1 并给出可应用的 diff,apply 却永远 0
+行命中,落入 lost-race 分支抛出误导性的通用 Error(500),且每次重试都复现。建议两侧统一定义:要么 load 在标记缺失时返回 null(管理员得到明确错误),要么谓词用
+coalesce 缺失标记为出厂版本。
+
+          .where(
+            and(
+              eq(agents.id, agentId),
+-             sql`(${agents.configuration} -> 'openMuse' ->> 'templateVersion')::int = ${expectedVersion}`,
++             // 与 load 侧 storedTemplateVersion 的回退语义对齐:标记缺失视作出厂版本。
++             sql`coalesce((${agents.configuration} -> 'openMuse' ->> 'templateVersion')::int, ${OPENMUSE_TEMPLATE_VERSION}) = ${expectedVersion}`,
+            ),
+          )
+
+─── server/src/admin/openmuse-template-routes.ts:20-23 ───
+[maintainability · low] 版本上界 1..2 硬编码了两次(targetVersion 常量与 previewQuery 内联各一次),与
+openmuse-template-store 的 OPENMUSE_TEMPLATE_REVISIONS 键集构成三处对"已知版本集合"的重复表达。后续新增 revision 3 时,store
+端就绪而路由会以 400 拒绝合法请求,属于典型的双处漂移。建议从 OPENMUSE_TEMPLATE_REVISIONS 导出已知版本列表(或直接导出 bound 常量),路由侧复用单一事实来源。
+
++ const targetVersionSchema = z.coerce
++   .number()
++   .int()
++   .refine(
++     (v) => v in OPENMUSE_TEMPLATE_REVISIONS,
++     "Unknown template revision.",
++   );
++ 
+  const previewQuery = z.strictObject({
+    ownerUserId,
+-   targetVersion: z.coerce.number().int().min(1).max(2),
++   targetVersion: targetVersionSchema,
+  });
+
+─── server/src/agents/openmuse-template-store.ts:102-107 ───
+[maintainability · low] 本投影与 profile-store 中私有的 joinedProjection 13
+列完全重复(注释自认因"本工单不负责加宽它")。两处列清单的漂移风险真实存在:profile 侧后续新增列(如
+templateKey、grants)时,模板读取会静默落后于正式列表对同一行的投影。joinedProjection 已是模块级独立对象,导出共享的改动成本很低;两处 join
+谓词本就合理不同(此处按 ownerUserId 而非 actor.id 关联 preferences),只需共享 select 投影即可消除重复。
+
++ // profile-store.ts: export const joinedProjection = { ... } 后
++ import { joinedProjection } from "./profile-store";
++ 
+  function templateProfileRows(database: DatabaseExecutor) {
+    return database
+-     .select({
+-       id: agents.id,
+-       name: agents.name,
+-       title: agentProfiles.title,
++     .select(joinedProjection)
++     .from(agents)
++     .innerJoin(agentProfiles, eq(agentProfiles.agentId, agents.id));
+
+─── server/src/channels/routes.ts:866-869 ───
+[bug · medium] archive/unarchive/rename 均未发布 CHANNEL_ACTIVITY_TOPIC 活动,而既有的 softDelete 专门向全体成员广播
+deleted:true、setPinned 向本人广播 pinned——理由注释写得很清楚:否则"a second tab and a second replica keep rendering a
+row whose channel no longer resolves"。archive 同样是 channel 级变更(archivedAt 落在 channels 行而非
+membership),会让所有成员(包括操作者自己的其他标签页)的 roster 在主动重拉前一直显示已被归档的会话;rename 改名同理。ChannelActivityEvent 目前只有
+deleted/pinned/busy 增量,没有 archived/renamed 字段。建议比照 softDelete:在同一事务内从 channelMemberships 解析
+memberIds,pg_notify 一条带 archived(及 renamed)增量的活动事件;若确属有意取舍(靠客户端重连重拉兜底),请在 store 方法注释中明确写出,与
+softDelete 的注释保持同一论证标准。
+
+-     async archive(actor, channelId) {
+-       const [row] = await database
+-         .select({ archivedAt: channels.archivedAt })
+-         .from(channels)
++         .set({ archivedAt: new Date(), updatedAt: new Date() })
++         .where(
++           and(
++             eq(channels.id, channelId),
++             isNull(channels.deletedAt),
++             isNull(channels.archivedAt),
++           ),
++         )
++         .returning({ id: channels.id });
++       if (stamped.length === 0) return false;
++       // 与 softDelete 同理:archive 对所有成员的 roster 生效,广播一条增量,
++       // 免得其他标签页/副本在重拉前一直渲染一个已消失的行。
++       const members = await database
++         .select({ userId: channelMemberships.userId })
++         .from(channelMemberships)
++         .where(eq(channelMemberships.channelId, channelId));
++       const event: ChannelActivityEvent = {
++         channelId,
++         memberIds: members.map((m) => m.userId),
++         lastMessage: null,
++         lastMessageAt: null,
++         lastMessageAgentId: null,
++         archived: true,
++       };
++       await database.execute(
++         sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
++       );
++       return true;
+
+─── server/src/channels/routes.ts:915-924 ───
+[bug · low] unarchive 的前置 select 与后续 update 之间存在并发窗口:若另一请求抢先清除了 archivedAt,本次 update 命中 0
+行却静默返回成功(204),与接口注释"从未归档才抛 ChannelNotArchivedError"的语义有偏差。archive 用 returning().length
+区分了同样形式的竞争,这里保持一致更精确。后果良性(最终状态仍为未归档),仅契约表述与实现不完全一致。
+
+-       await database
++       const cleared = await database
+          .update(channels)
+          .set({ archivedAt: null, updatedAt: new Date() })
+          .where(
+            and(
+              eq(channels.id, channelId),
+              isNull(channels.deletedAt),
+              isNotNull(channels.archivedAt),
+            ),
+-         );
++         )
++         .returning({ id: channels.id });
++       // 输给了并发的 unarchive:与前置检查同样回答 ChannelNotArchivedError。
++       if (cleared.length === 0) throw new ChannelNotArchivedError(channelId);
+
+─── server/src/mobile-bff/workspace.ts:75-78 ───
+[maintainability · low] 每页 100 与封顶 5 页均为硬编码魔法数字(合计 500 条归档会话进单个冷启动响应),与 channels 模块已有的
+MAX_CHANNEL_PAGE 常量体系脱节;后续调参需要改两处魔法数字。上限本身是注释明示的有界取舍且溢出经 archivedNextCursor
+可观测,故仅建议提取具名常量并注明与渠道页大小的关系,便于维护与调整。
+
+-         for (let page = 0; page < 5; page++) {
++         const ARCHIVED_COLD_START_PAGE = 100;
++         const ARCHIVED_COLD_START_MAX_PAGES = 5;
++         for (let page = 0; page < ARCHIVED_COLD_START_MAX_PAGES; page++) {
+            const result = await deps.channelStore.list(actor, {
+-             limit: 100,
++             limit: ARCHIVED_COLD_START_PAGE,
+              archived: true,
+
+─── server/src/channels/routes.ts:1363-1369 ───
+[style · low] ?archived=(空字符串)被网开一面视作缺省,而其余任何非 "true"/"false" 取值一律 400。宽松与严格并存:注释声称参数按 limit
+同等严格解析,但空串实际走的是静默缺省,可能掩盖客户端拼接查询参数的 bug。建议要么把空串也纳入 400(与注释的严格立场一致),要么在注释中说明放行空串的理由。
+
+        const archived = url.searchParams.get("archived");
+-       if (
+-         archived !== null &&
+-         archived !== "" &&
+-         archived !== "true" &&
+-         archived !== "false"
+-       ) {
++       if (archived !== null && archived !== "true" && archived !== "false") {
++         return context.json(
++           { error: 'Query parameter "archived" must be "true" or "false".' },
++           400,
++         );
++       }
+
+─── server/src/admin/openmuse-template-routes.ts:72-79 ───
+[security · medium] POST /apply 是对他人用户 Bot 的受管配置变更(改写 agents.configuration 里的
+openMuse.templateVersion/grants/systemPromptRevision,grants 是私有 Bot 运行时工具的闸门,见 index.ts C07
+注释),但成功后不留任何审计记录。server/src/admin/ 目录的既有约定是每次变更都经 recordAuditEvent 落审计(admin/routes.ts 的
+capability.changed / enterprise.setting_changed / network_policy.changed、admin/gate.ts 等)。本路由 deps
+里连审计回调都没有,事后无法回答"谁在何时把谁的 Bot 应用到哪个 revision"。建议在 deps 中增加可选 audit 回调(app.ts 已持有
+auditStore,可直接注入),apply 成功(含 noop)后记录 actorUserId、ownerUserId、stored/target 版本与 status。
+
++ export function createOpenMuseTemplateAdminRoutes(deps: {
++   requireUser: MiddlewareHandler<{ Variables: AppVariables }>;
++   revisions: OpenMuseTemplateRevisionService;
++   /** 管理员变更审计;app.ts 以 auditStore 注入 recordAuditEvent 的包装。 */
++   audit?: (input: {
++     eventType: string;
++     targetType: string;
++     targetId: string;
++     actorUserId: string;
++     payload: Record<string, unknown>;
++   }) => Promise<void>;
++ }) {
++   // ...
++   routes.post("/apply", async (context) => {
++     // ...parse...
+      try {
+-       return context.json(
+-         await deps.revisions.applyRevision(
++       const result = await deps.revisions.applyRevision(
+-           parsed.data.ownerUserId,
++         parsed.data.ownerUserId,
+-           parsed.data.targetVersion,
++         parsed.data.targetVersion,
+-         ),
+        );
++       await deps.audit?.({
++         eventType: "openmuse_template.revision_applied",
++         targetType: "agent",
++         targetId: parsed.data.ownerUserId,
++         actorUserId: context.var.actor.id,
++         payload: {
++           ownerUserId: parsed.data.ownerUserId,
++           targetVersion: parsed.data.targetVersion,
++           status: result.status,
++           storedVersion: result.storedVersion,
++           by: context.var.actor.email,
++         },
++       });
++       return context.json(result);
+      } catch (error) {
++       // ...原有错误映射不变...
++     }
++   });
+
+─── server/src/agents/openmuse-template-store.ts:455-457 ───
+[bug · low] preview 与 apply 在"版本标记相等但 managed 值漂移"时不一致:previewRevision 纯按值比较,此时仍会把
+grants/systemPromptRevision 差异列为带 new 提议的 managed 变更;而这里版本相等直接返回
+noop,永远不会收敛这些漂移值(漂移只能来自带外改库或未来某个只升版本号不齐改 grants 的写入路径)。这违背本文件对 preview 的契约——"an administrator sees
+exactly what apply will and will not touch":管理员看到 apply 将写入,实际却不会写。建议二选一:版本相等但 managed 值有差异时继续走
+applyManaged(此时 CAS 谓词 = expectedVersion 恰好匹配,可正常收敛);或 preview 在 storedVersion === targetVersion
+时不再对 managed 键提议 new。
+
+-       if (stored.templateVersion === revision.version) {
++       const managedDrifted =
++         grantsDiffer(stored.grants, revision.grants) ||
++         stored.systemPromptRevision !== revision.systemPromptRevision;
++       if (stored.templateVersion === revision.version && !managedDrifted) {
+          return { status: "noop", storedVersion: stored.templateVersion };
+        }
++       // 版本相等但 managed 值漂移时继续向下走 applyManaged:
++       // CAS 谓词 (= expectedVersion) 此时恰好匹配,漂移被收敛到目标 revision。
+
+─── server/src/agents/openmuse-template-store.ts:131-138 ───
+[maintainability · low] isPostgresUniqueViolation 与同一 PR 新增的 mobile-bff/openmuse-bot.ts 里的
+isUniqueViolation(74-83 行)是同一段"沿 cause 链查找 23505"驱动错误遍历的两份拷贝。两份逻辑会漂移:一侧日后补上 name ===
+"UNIQUE_TEMPLATE" 判断或适配新驱动的错误包装时,另一侧很容易漏改,造成 provision 端与 store
+端对同一次冲突的判定不一致。建议把该谓词抽成单一来源(openmuse-bot.ts 已有的 isUniqueViolation 直接导出复用即可——store 侧错误在本文件抛出前不会带
+UNIQUE_TEMPLATE 名,复用无副作用),本文件删除本地拷贝。
+
+- function isPostgresUniqueViolation(error: unknown): boolean {
+-   let candidate = error as { code?: string; cause?: unknown };
+-   while (candidate) {
+-     if (candidate.code === "23505") return true;
+-     candidate = candidate.cause as typeof candidate;
+-   }
+-   return false;
+- }
++ // mobile-bff/openmuse-bot.ts:export function isUniqueViolation(...)
++ // openmuse-template-store.ts:
++ import { isUniqueViolation } from "../mobile-bff/openmuse-bot";
++ // ...catch (error) {
++ //   if (isUniqueViolation(error)) {
++ //     const revived = await reviveTombstonedTemplate(ownerUserId, template);
+
+─── server/src/mobile-bff/routes.ts:87-92 ───
+[bug · high] 类身份不匹配:真实挂载的 openmuse-files 子应用抛出的是 openmuse-files/store.ts 自己定义的
+OpenMuseOwnerDisabledError(store.ts:146,直接 extends Error),与本文件从 ../openmuse-connectors/google-oauth
+导入的同名类是两个不同的类,instanceof 永远为 false。本分支实际上是对真实流量恒不命中的死分支——被禁用 owner 的文件请求会穿透到这里之下的 503 兜底("The mobile
+workspace is unavailable. Try again."),恰好是本段注释承诺要避免的"the 403 of a disabled owner ... degrades to
+this layer's 503"。测试未暴露此问题:mobile-bff.test.ts 用合成子应用抛的正是 google-oauth 版类。建议改为导入
+../openmuse-files/store 的类;考虑到代码库中已有三处同名类(files/tasks/notifications 的 store 与 google-oauth),按
+error.name === "OpenMuseOwnerDisabledError" 匹配更稳健(也能顺带覆盖 openmuse-tasks 子应用逃逸的同名错误)。
+
+-     if (error instanceof OpenMuseOwnerDisabledError) {
++     // openmuse-files/store.ts throws its OWN OpenMuseOwnerDisabledError — a
++     // different class from the connectors' one imported above — so instanceof
++     // against that class never matches and the 403 still degrades to the 503
++     // below. Match by name: three same-named classes exist across the stores.
++     if (
++       error instanceof OpenMuseOwnerDisabledError ||
++       error.name === "OpenMuseOwnerDisabledError"
++     ) {
+        return context.json(
+          { error: "This owner's files are unavailable." },
+          403,
+        );
+      }
+
+─── server/src/mobile-bff/routes.ts:99-104 ───
+[bug · medium] 挂载层错误映射不完整:openmuse-files 子应用自身的 onError 还会把手 OpenMuseFileQuotaError 映射为带稳定 code 的
+413(routes.ts:91-101),但既然 route() 不合并子应用 onError(本文件第 3 轮注释已实证),该错误会原样落到这里且没有任何分支接住,最终退化为此层的 503
+重试语义。配额超限是"删掉一些文件再试"的确定性回答,不是可重试故障,与 §4 的稳定契约一致地应在此补上 413 分支。
+
+      if (error instanceof OpenMuseVendorUnavailableError) {
+        return context.json({ error: error.message }, 503);
+      }
+      if (error instanceof OpenMuseMailVendorError) {
+        return context.json({ error: error.message }, 502);
++     }
++     if (error instanceof OpenMuseFileQuotaError) {
++       // The files sub-app's own onError answers this 413 standalone; mounted
++       // here its onError never runs, so the quota contract is restated at the
++       // mount — a determinate "delete some files first", never a retry-me 503.
++       return context.json(
++         {
++           error: `That upload would pass this owner's ${error.capBytes}-byte Files quota. Delete some files first.`,
++           code: error.code,
++         },
++         413,
++       );
+      }
+

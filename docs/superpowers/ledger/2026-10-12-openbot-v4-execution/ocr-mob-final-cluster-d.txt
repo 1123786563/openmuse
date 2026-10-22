@@ -1,0 +1,179 @@
+# ocr-openmuse-final split — cluster D: tasks/task-view/pdf-view (tasks, task-view, pdf-view)
+# source: ocr-openmuse-final.txt (12 findings)
+# repo: /Users/wuyongjun/trea/openmuse/.worktrees/v4-base (branch v4/openbot-exec)
+
+─── apps/mobile/src/openbot/pdf-view.tsx:143-145 ───
+[bug · medium] open 的 catch 分支在入口处校验了代数（"a dead request's failure/error must not land under the new
+selection"），但随后 await clearVersionCache（真实的文件系统 I/O，存在时间窗口）之后无条件执行 setError。若用户在该 await 期间点击其他版本
+chip，select 已推进 openGeneration 并 setError(null)，随后此废弃请求的错误文案会落在新选中的版本之下，恰好违背了上方注释声明的不变量，造成 UI
+状态串扰（用户可能误以为新版本打开失败）。建议在 setError 前复查代数。
+
+          ).catch(() => undefined);
+        }
++       if (openGeneration.current !== request) return; // 用户在清理期间切换了版本
+        setError(e instanceof OpenBotError ? e.message : String(e));
+
+─── apps/mobile/src/openbot/pdf-view.tsx:86-92 ───
+[style · low] loadVersions 的 setListHint 使用三级嵌套三元表达式（not_found / 其他 OpenBotError /
+未知错误），违反检查清单"禁止嵌套三元表达式"的规则，可读性差。建议提取为模块内的独立错误描述函数。
+
+-       setListHint(
+-         e instanceof OpenBotError && e.code === "not_found"
+-           ? COPY.listUnavailable
+-           : e instanceof OpenBotError
+-             ? e.message
+-             : String(e),
+-       );
++ function describeVersionListError(e: unknown): string {
++   if (e instanceof OpenBotError && e.code === "not_found") return COPY.listUnavailable;
++   return e instanceof OpenBotError ? e.message : String(e);
++ }
++ 
++ // loadVersions 内：
++       setListHint(describeVersionListError(e));
+
+─── apps/mobile/src/openbot/pdf-view.tsx:66-66 ───
+[maintainability · low] useState 直接传入调用结果 nativeCacheAdapter：该工厂函数会在组件的每一次渲染时都被求值（React
+仅丢弃多余结果），而非只在首次挂载时执行。虽然当前实现开销很小（require 有模块缓存），但这偏离了 React 的惰性初始化约定——一旦 adapter
+探测逻辑变重或带副作用，每次渲染都会重复触发。建议改用惰性初始化函数形式，保证探测只执行一次。
+
+-   const [adapter] = useState(nativeCacheAdapter);
++   const [adapter] = useState(() => nativeCacheAdapter());
+
+─── apps/mobile/src/openbot/pdf-view.tsx:217-217 ───
+[style · low]
+错误文案直接拼接「（打开预览）」，渲染结果形如「服务端返回的字节不属于所选版本，已拒绝显示。（打开预览）」，括号里的按钮名读起来像错误的一部分，用户难以理解为重试提示。建议写明动作语义，例如「（点「打
+开预览」重试）」。
+
+-             {error}（{COPY.open}）
++             {error}（点「{COPY.open}」重试）
+
+─── apps/mobile/src/openbot/tasks.tsx:147-156 ───
+[bug · low] 错误重试路径错位：open(id) 拉取详情失败时设置的 error 也会渲染进这个区块，但"重试"固定调用
+load()（刷新列表），并不会重发刚失败的详情请求；错误文案却是"任务没有加载出来"，用户点重试后看到的仍是列表，需自行重新点击任务卡片。建议记录失败的详情 id（如
+failedDetailId，在 open 成功或返回列表时清除），重试时优先重新 open 它。另外 load 与 open 共用 busy 且 load 的 finally 无 seq
+守卫：刷新进行中点开任务时，先完成的 load 会提前 setBusy(false)，使刷新按钮在详情请求仍在途时被重新启用（可通过分离 busy 状态或对 load 也做序号守卫修复）。
+
+-         {error && (
+-           <View style={s.error}>
+-             <Text style={styles.errorText}>
+-               {COPY.errorTitle}（{error}）
+-             </Text>
+-             <Button small onPress={() => void load()}>
++             <Button
++               small
++               onPress={() => void (failedDetailId ? open(failedDetailId) : load())}
++             >
+                {COPY.retry}
+              </Button>
+-           </View>
+-         )}
+
+─── apps/mobile/src/openbot/tasks.tsx:132-132 ───
+[other · low] 详情态头部标题直接展示原始 task.id（长串、无语义），而详情体内标题用的是 view.kind，两处口径不一致；同时列表项的 accessibilityLabel
+也是原始 id，读屏用户听到的是无意义长串。建议标题与读屏标签统一使用 task.kind（id 本身已在卡片正文与详情元信息行以 s.small 展示，不缺入口）。
+
+-           <Text style={s.heading}>{detail ? detail.id : COPY.title}</Text>
++           <Text style={s.heading}>{detail ? detail.kind : COPY.title}</Text>
+
+─── apps/mobile/src/openbot/tasks.tsx:211-213 ───
+[other · low] updatedAt 是服务端原始字符串直接拼接输出（ISO 时间串对用户可读性差），且代码库已有本地格式化惯例可循（agent-ui.tsx 用
+toLocaleString、files.tsx 有 formatDate）。建议格式化后再展示；注意 schema 只校验 string，转换前对非法日期做兜底，避免渲染出 "Invalid
+Date"。
+
+        <Text style={[s.small, { marginBottom: 8 }]}>
+-         {view.taskId} · {task.updatedAt}
++         {view.taskId} · {formatUpdatedAt(task.updatedAt)}
+        </Text>
+
+─── apps/mobile/src/openbot/tasks.tsx:157-159 ───
+[style · low] 渲染主体为三层嵌套三元（detail → tasks === null → tasks.length ===
+0），违反"不允许嵌套三元表达式"的规范，阅读时需人工配对分支边界。建议抽为局部函数，用 if 提前返回替代。
+
+-         {detail ? (
+-           <TaskDetailBody
+-             task={detail}
++   const renderBody = () => {
++     if (detail) return <TaskDetailBody task={detail} onBack={handleBack} />;
++     if (tasks === null) return <LoadingRow />;
++     if (tasks.length === 0) return <Text style={s.muted}>{COPY.emptyList}</Text>;
++     return tasks.map((task) => <TaskCard key={task.id} task={task} onOpen={open} />);
++   };
+
+─── apps/mobile/src/openbot/tasks.tsx:120-129 ───
+[style · low] 头部导航行、各区块间距等大量静态样式以内联对象书写，而本模块已为 card/errorText 建了
+StyleSheet.create——同一文件两套做法，且内联对象每次渲染都新建实例。建议将纯静态布局提取为 StyleSheet 常量（仅保留真正动态的部分内联），与本模块既有 styles
+保持一致。
+
+-       <View
+-         style={{
++ const styles = StyleSheet.create({
++   card: {
++     backgroundColor: colors.card,
++     borderRadius: 18,
++     borderWidth: 1,
++     borderColor: colors.line,
++     padding: 14,
++     marginVertical: 6,
++   },
++   errorText: { color: colors.danger, fontSize: 13, lineHeight: 19 },
++   header: {
+-           flexDirection: "row",
++     flexDirection: "row",
+-           alignItems: "center",
++     alignItems: "center",
+-           justifyContent: "space-between",
++     justifyContent: "space-between",
+-           paddingHorizontal: 18,
++     paddingHorizontal: 18,
+-           paddingTop: 8,
++     paddingTop: 8,
+-           paddingBottom: 4,
++     paddingBottom: 4,
+-         }}
+-       >
++   },
++ });
++ 
++       <View style={styles.header}>
+
+─── apps/mobile/src/openbot/task-view.ts:42-42 ───
+[style · low] byId 比较器使用嵌套三元，违反"不允许嵌套三元表达式"的规范。展开为 if 形式语义相同、更易读，也便于日后把比较逻辑抽成通用工具。
+
+- const byId = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
++ const byId = (a: { id: string }, b: { id: string }) => {
++   if (a.id < b.id) return -1;
++   if (a.id > b.id) return 1;
++   return 0;
++ };
+
+─── apps/mobile/src/openbot/task-view.ts:109-110 ───
+[maintainability · low] TaskStepRow.result 与 evidenceIds 在全仓（含
+openbot-task-view.test.ts）均无消费点：详情屏步骤行只渲染 title/statusLabel/errorText，证据区按 evidence 聚合展示而非通过
+step.evidenceIds 建立步骤↔证据关联。当前属于视图模型的死产出，会随 DTO 演化悄然腐化；建议要么在本屏渲染步骤结果与证据关联，要么先从视图模型移除这两个字段，待有真实消费者再加回。
+
+─── apps/mobile/src/openbot/task-view.ts:57-64 ───
+[maintainability · low] 摘要裁剪策略不一致：user 文本裁到 80、step error 裁到 200，但 mail 的 subject/from、file 的
+name、web 的 url/title 完全不限长。这些字段来自服务端 payload，长度不可控，一条超长 URL 或邮件主题会在证据行原样整段渲染，与模块"one-line
+summary"的定位不符。建议对 mail/file/web 三类也套用 clip（如 120 字符），保持与 user/error 一致的裁剪口径。
+
+  function evidenceSummary(kind: string, payload: Record<string, unknown> | undefined): string {
+    switch (kind) {
+      case "mail":
+-       return payloadText(payload, "subject") ?? payloadText(payload, "from") ?? EMPTY_SUMMARY;
++       return clip(payloadText(payload, "subject") ?? payloadText(payload, "from") ?? EMPTY_SUMMARY, 120);
+      case "file":
+-       return payloadText(payload, "name") ?? EMPTY_SUMMARY;
++       return clip(payloadText(payload, "name") ?? EMPTY_SUMMARY, 120);
+      case "web":
+-       return payloadText(payload, "url") ?? payloadText(payload, "title") ?? EMPTY_SUMMARY;
++       return clip(payloadText(payload, "url") ?? payloadText(payload, "title") ?? EMPTY_SUMMARY, 120);
+
+
+LLM retry report summary: 1 of 232 requests affected -- 1 request recovered after retry
+
+Core review (1 request):
+- apps/mobile/App.tsx,apps/mobile/package.json,apps/mobile/src/openbot/api.ts,apps/mobile/src/openbot/client.ts,apps/mobile/src/openbot/config.ts,apps/mobile/src/openbot/errors.ts,apps/mobile/src/openbot/types.ts: rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> rate limited (HTTP 429) -> succeeded
+
+Per-attempt detail: --format json (retry_report).
+

@@ -1,0 +1,18 @@
+OCR final-pass repair — cluster D (45 findings: server/src/computer + agent-computer + mobile-bff + baseline script + templates/agents + app wiring + db/drizzle + .gitmodules).
+
+TARGET repo: /Users/wuyongjun/trea/OpenBot/.worktrees/v4-base (branch v4/openbot-exec; ~214 uncommitted files are prior repair waves — do NOT commit, stash, or reset anything).
+Findings list (authoritative, one block per finding, 45 total): /Users/wuyongjun/trea/openmuse/docs/superpowers/ledger/2026-10-12-openbot-v4-execution/ocr-final-cluster-d.txt
+Context: FINAL confirming pass of the OCR review-repair loop (ledger: LEDGER.md in the same directory). Earlier rounds already repaired many issues — verify each finding against current code before acting; some are stale or invalid.
+
+CHANGE: For EACH finding: (1) verify against current code; (2) if valid, implement the minimal correct fix, extending the relevant suite where practical; (3) if invalid or already fixed, no code change, record disposition with file:line citation. The two .gitmodules findings are infra-level (biome/test scoping vs apps/openmuse submodule, CI submodule pin verification): implement the repo-config parts that are safe locally (biome excludes, test scoping) and disposition CI-workflow parts with concrete recommended changes in the report if the workflow edit is not verifiable here.
+
+OWNERSHIP — you may edit ONLY: server/src/computer/**, agent-computer/src/**, server/src/mobile-bff/**, scripts/openmuse-v4-baseline.sh, server/src/agents/**, server/src/admin/**, server/src/index.ts, server/src/app.ts, server/src/channels/**, server/src/db/**, server/drizzle/**, server/drizzle.config.ts, .gitmodules, biome.json, bunfig.toml, .github/workflows/**, plus server/tests/{computer-*,stream-auth,mobile-bff,openmuse-template-revision,openmuse-bot}.test.ts, agent-computer/tests/control*.test.ts, and new tests inside your owned paths. Never edit other clusters' openmuse-* module files.
+
+CONSTRAINTS: minimal diffs, match existing style, no drive-by refactors; if a drizzle migration is genuinely required, add a new numbered migration (never edit an applied one) and note it; leave everything uncommitted.
+
+ACCEPTANCE (all required):
+1. Suites green for touched areas: cd /Users/wuyongjun/trea/OpenBot/.worktrees/v4-base && bun test server/tests/computer-capacity.test.ts server/tests/computer-routes.test.ts server/tests/stream-auth.test.ts server/tests/mobile-bff.test.ts server/tests/openmuse-template-revision.test.ts agent-computer/tests/control.test.ts agent-computer/tests/control-http.test.ts (+ any suite covering files you touched) — 0 fail.
+2. bun run --filter server typecheck — clean (also agent-computer if you touch it).
+3. bunx biome lint <each file you touched> — clean.
+4. Write /Users/wuyongjun/trea/openmuse/docs/superpowers/ledger/2026-10-12-openbot-v4-execution/ocr-final-disposition-cluster-d.md — table: finding (file:lines) | verdict fixed/fixed-before/invalid | action | evidence; end with totals + dependencies.
+Then send worker_done exactly once with --outcome succeeded|failed, --report-path, and --files-modified.

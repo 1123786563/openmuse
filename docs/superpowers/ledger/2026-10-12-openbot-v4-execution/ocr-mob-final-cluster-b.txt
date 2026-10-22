@@ -1,0 +1,248 @@
+# ocr-openmuse-final split — cluster B: chat/computer/control/channels/tools (chat+state, computer, control+state, channels, channel-actions, tool-cards)
+# source: ocr-openmuse-final.txt (17 findings)
+# repo: /Users/wuyongjun/trea/openmuse/.worktrees/v4-base (branch v4/openbot-exec)
+
+─── apps/mobile/src/openbot/chat.tsx:264-264 ───
+[bug · medium] 防重发守卫未包含 awaitingReply ref:send() 在入口同步置位 awaitingReply.current = true,但这里的守卫只读渲染闭包里的
+agent.isRunning。按钮 onPress 与 TextInput 的 onSubmitEditing 两个入口都指向 send,若两次触发落在同一帧内(重渲染尚未把
+isRunning=true 带进闭包,低端机/卡顿场景现实存在),两次调用都会通过守卫,产生重复 addMessage + 两次 runAgent——用户同一句话会在持久 Thread
+上落两条,并可能并发两个 run。awaitingReply 恰好精确追踪"本实例已发起、在途的回合",把它加入守卫即可无条件关闭该窗口,与 SDK 何时翻转 isRunning 无关。
+
+-     if (!text || agent.isRunning || restoring || restoreFailed) return;
++     if (!text || awaitingReply.current || agent.isRunning || restoring || restoreFailed) return;
+
+─── apps/mobile/src/openbot/tool-cards.ts:185-193 ───
+[style · low] kind 的回退计算是四层嵌套三元表达式,违反"禁止嵌套三元"的团队规范;链式回退可读性与后续维护性差(新增一个 status 枚举值就要再深一层)。改为先算回退值再 ??
+合并即可,逻辑完全等价。
+
+-   const kind: ToolCardKind =
+-     named ??
+-     (event.status === "start"
+-       ? "tool_start"
+-       : event.status === "error"
+-         ? "tool_error"
+-         : event.status === "result"
+-           ? "tool_result"
+-           : "unknown");
++   let fallback: ToolCardKind = "unknown";
++   if (event.status === "start") fallback = "tool_start";
++   else if (event.status === "error") fallback = "tool_error";
++   else if (event.status === "result") fallback = "tool_result";
++   const kind: ToolCardKind = named ?? fallback;
+
+─── apps/mobile/src/openbot/tool-cards.ts:158-159 ───
+[bug · low] computer_screenshot 的 summary 是无条件的固定文案:status 为 "start" 的在途调用卡(未解析的 toolCalls 渲染的 start
+卡也走 classifyToolEvent,kind 命中 computer_screenshot 而非
+tool_start)同样渲染"已获取屏幕截图"——卡片宣称了一个事件尚未报告的结果,违反本模块自己声明的"no outcome is claimed the event did not
+report"契约,且 start 卡与 result 卡视觉上完全无法区分。应按 status 区分文案。
+
+      case "computer_screenshot":
+-       return "已获取屏幕截图";
++       // 在途(start)与已解析(result)必须可区分:未完成的调用不得宣称已完成。
++       return "已获取屏幕截图"; // 仅限已解析状态;调用方应传入 status 或改由 classifyToolEvent 按 status 生成
+
+─── apps/mobile/src/openbot/chat-state.ts:93-95 ───
+[maintainability · low] historyKey 在生产代码中无任何调用点(仅 openbot-chat-state.test.ts 引用):chat.tsx 的乐观回显走
+agent.addMessage,从不读写本地存储,而此处的文档注释声称它"Used ONLY for optimistic
+echo"——所描述的用途并未在任何生产代码中实现,注释具有误导性。同类情况还有 stop-state.ts 的 terminalOf、stream-resume.ts 的
+dedupeByEventId 与 RenderSet.lastEventId(round-2 修复后生产游标已改取 messagesRef 的消息 id,这些 seam
+仅剩测试引用)。建议删除,或在注释中明确标注为 test-only seam,保持 API 面积诚实。
+
+─── apps/mobile/src/openbot/chat.tsx:427-428 ───
+[bug · low] RN 对 multiline TextInput 的 onSubmitEditing 不可靠:iOS 上多行输入按回车插入换行、不触发 onSubmitEditing(需
+blurOnSubmit 配合才触发),因此键盘回车发送路径在 iOS 上静默失效,实际只有发送按钮可用;Android 行为也因 blurOnSubmit 而异。若产品预期支持多行草稿(占位文案与
+multiline 表明如此),建议移除 onSubmitEditing 以免暗示回车可发送;若预期回车即发送,需设置 blurOnSubmit={true}(代价是回车不再换行)。
+
+─── apps/mobile/src/openbot/channel-actions.ts:47-47 ───
+[style · low] 评审规范禁止宽松不等比较（==/!=）。注意此处不能简单改为 `!== null`：archivedAt 类型为 string | null |
+undefined（types.ts 标注 optional 以兼容未含归档字段的旧服务端，省略即视为活跃），若只判 !== null 会把 undefined
+行误分类为已归档。请显式双判以保持语义等价。
+
+-     (channel.archivedAt != null ? archived : active).push(channel);
++   for (const channel of channels) {
++     const isArchived = channel.archivedAt !== null && channel.archivedAt !== undefined;
++     (isArchived ? archived : active).push(channel);
++   }
+
+─── apps/mobile/src/openbot/channels.tsx:188-188 ───
+[style · low] 同 partitionArchived：评审规范禁止 !=；archivedAt 为 string | null | undefined，需显式双判（仅 !== null
+会把 undefined 误判为已归档，影响按钮文案与 disabled 行为）。
+
+-           const archivedRow = channel.archivedAt != null;
++           const archivedRow =
++             channel.archivedAt !== null && channel.archivedAt !== undefined;
+
+─── apps/mobile/src/openbot/channels.tsx:135-138 ───
+[bug · low] 重命名提交存在双入口竞态：TextInput 的 onSubmitEditing 与"保存"按钮都会触发 submitRename，而 runAction/setBusyId
+无防重入保护——busyId 状态在同一帧内尚未生效，极短窗口内可重复发出两次 renameChannel PATCH 请求。重命名幂等、实际影响小，但建议用 ref 做在途守卫，彻底消除重复提交。
+
++   const renameInFlightRef = useRef<string | null>(null);
++ 
++   const submitRename = useCallback(
++     (channel: WorkspaceChannel) => {
++       if (renameInFlightRef.current !== null) return;
++       const validated = validateChannelName(renameDraft);
++       if (!validated.ok) {
++         setError(validated.error);
++         return;
++       }
++       renameInFlightRef.current = channel.id;
+        void runAction(channel.id, async () => {
++         try {
+-         onRenamed(await renameChannel(channel.id, validated.name));
++           onRenamed(await renameChannel(channel.id, validated.name));
+-         setRenamingId(null);
++           setRenamingId(null);
++         } finally {
++           renameInFlightRef.current = null;
++         }
+        });
++     },
++     [onRenamed, renameDraft, runAction],
++   );
+
+─── apps/mobile/src/openbot/channels.tsx:163-166 ───
+[style · low] 多处纯静态内联样式可迁入文件顶部已有的 StyleSheet.create：顶部标题行 View（flexRow/space-between/padding
+组合）、ScrollView 的 contentContainerStyle、底部创建按钮容器及 busy 行布局。按规范内联样式仅保留动态场景（当前频道高亮
+styles.current、rowBusy 分支等已是正确用法）。
+
+-       <ScrollView
+-         contentContainerStyle={{ paddingHorizontal: 18, paddingVertical: 12, flexGrow: 1 }}
+-         keyboardShouldPersistTaps="handled"
+-       >
++ const styles = StyleSheet.create({
++   // ……现有样式
++   headerRow: {
++     flexDirection: "row",
++     alignItems: "center",
++     justifyContent: "space-between",
++     paddingHorizontal: 18,
++     paddingTop: 8,
++     paddingBottom: 4,
++   },
++   scrollContent: { paddingHorizontal: 18, paddingVertical: 12, flexGrow: 1 },
++ });
++ 
++       <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
+
+─── apps/mobile/src/openbot/chat.tsx:194-202 ───
+[bug · medium] run 出错路径没有标记"运行已终结":fail() 释放了 pending stop,但 stopOutcome.current 仍为 null,而 stop 的
+catch 仅以 `if (stopOutcome.current) return;` 抑制迟到拒绝。当网络故障同时导致 run 报错(RUN_ERROR/RUN_FAILED)和 stopAgent
+请求迟到 reject 时,catch 会穿过守卫执行 setError(COPY.stopFailed),把信息量更大的 run 错误详情覆盖成"没有停止这次回复,请再试一次。",并带出共享的
+retry 按钮(把 lastSent 填回草稿——但该消息其实已持久化发出)。这正是 stopOutcome 镜像(round-2 #12)意图覆盖却遗漏的分支:注释里"the run is
+over, there is nothing left to stop"对 run-error 同样成立。建议 fail() 同步置位一个 runEnded ref(或将 stopOutcome
+扩展为含 error 终态),stop 的 catch 一并检查。
+
++     const runEnded = useRef(false); // 与 stopOutcome 一并作为迟到 stop 拒绝的抑制信号
+      const fail = (message?: string) => {
+        if (!awaitingReply.current) return;
+        awaitingReply.current = false;
++       runEnded.current = true; // run 已死:迟到的 stop 拒绝与终态结果一样是 no-op
+        const detail = message?.trim();
+        setError(detail ? `${COPY.errorTitle}（${detail}）` : COPY.errorTitle);
+        // The run died without a terminal outcome: release a pending stop so the
+        // next turn starts from a clean flow (no chip — the error UI owns this one).
+        setStopFlow((prev) => (prev.pending ? { ...prev, pending: false } : prev));
+      };
++     // stop 的 catch 相应改为: if (stopOutcome.current || runEnded.current) return;
+
+─── apps/mobile/src/openbot/chat.tsx:292-296 ───
+[bug · low] stop 的"至多一次 stopAgent"不变量只靠渲染闭包里的 stopFlow state 保证:reducer
+的幂等守卫(pending/outcome)要等下一次重渲染后才对外可见。同一帧内两次 onPress(快速双击,ui Button 的 Pressable 无防抖)都会读到旧的
+stopFlow,双双通过 `next === stopFlow` 检查,发出两次 stopAgent,且 stopRequests 计数也随后被同值覆盖而失真。先例 src/chat.tsx 用同步
+ref 闸(runLock)防同类竞态,这里同样应在入口用 ref 同步判重(置位/检查都在 dispatch 之前),与已确认的 send 防重发问题同构。
+
++   const stopPendingRef = useRef(false);
+    const stop = useCallback(() => {
++     if (stopPendingRef.current || stopFlow.outcome) return; // 同步闸:state 只在重渲染后可见
+      const next = stopFlowReducer(stopFlow, { type: "stop_clicked" });
+      if (next === stopFlow) return; // pending or terminal: idempotent no-op
++     stopPendingRef.current = true;
+      setStopFlow(next);
+-     void Promise.resolve(copilotkit.stopAgent({ agent })).catch(() => {
++     void Promise.resolve(copilotkit.stopAgent({ agent }))
++       .catch(() => { /* …原逻辑… */ })
++       .finally(() => { stopPendingRef.current = false; });
+
+─── apps/mobile/src/openbot/tool-cards.ts:200-201 ───
+[style · low] status 的计算在 false 分支内嵌套了另一层三元表达式,违反团队"禁止嵌套三元"规范(与本文件下方已确认的 kind
+四层嵌套回退是同一规则、同一文件)。改为命令式赋值即可消除嵌套,可读性更好。
+
+-   const status: ToolCardStatus =
+-     event.status === "error" ? "error" : event.status === "start" ? "neutral" : "ok";
++   let status: ToolCardStatus = "ok";
++   if (event.status === "start") status = "neutral";
++   if (event.status === "error") status = "error";
+
+─── apps/mobile/src/openbot/control.tsx:225-226 ───
+[bug · medium] cancel() 通过 initialControlState() 将 generation 重置为 0，违反 control-state.ts 中 generation
+字段自述的不变量「+1 on every take, never reset」。碰撞序列：request→take（gen=1）→派发输入 seq=1 在途→release→再次
+request→cancel（此处归零）→request→take（gen 又回到 1、seq=0）→派发新输入 seq=1。此时旧租约 seq=1/gen=1 的迟到 403/409 会同时满足
+controlInputFailed
+的全部守卫条件（phase=controlling、seq===state.seq、generation===state.generation），错误终结刚接管成功的健康租约，误报「接管被拒/控制已断
+开，本次输入未发送」——这正是 generation 守卫注释声称要防止的碰撞。release 路径（controlReleased）保留 generation 故无此问题；现有测试只覆盖
+release 重取路径，未覆盖 cancel。建议在 control-state.ts 新增 controlCancelled 转换：phase(state, "viewing", null)（回到
+viewing 但保留 generation），此处改用它。
+
+-       // A cancelled request was never held: the screen returns to viewing.
+-       commit(initialControlState());
++       // A cancelled request was never held: back to viewing, but keep the
++       // generation monotonic — initialControlState() resets it to 0, so the
++       // next take re-enters gen 1 and a prior gen-1 lease's late 403/409
++       // satisfies every controlInputFailed guard and evicts the healthy
++       // lease.
++       commit(controlCancelled(stateRef.current));
+
+─── apps/mobile/src/openbot/computer.tsx:199-203 ───
+[style · low] 预览区使用两层嵌套三元表达式（connecting→loading / source→Image / 兜底占位），违反检查项「不允许嵌套三元」。建议先计算 preview
+节点变量再渲染。
+
+-         {state.connection === "connecting" && !state.image ? (
+-           <View style={{ flexDirection: "row", gap: 10, alignItems: "center", padding: 8 }}>
+-             <ActivityIndicator size="small" color={colors.blueDark} />
+-             <Text style={s.muted}>{COPY.loading}</Text>
+-           </View>
++         {previewNode}
+
+─── apps/mobile/src/openbot/computer.tsx:58-66 ───
+[maintainability · low] chipBase/chipTint 徽标样式在本文件与
+calendar.tsx、connections.tsx、control.tsx、tasks.tsx 中逐字重复定义（chipBase 完全相同的 8 个属性已确认存在于 5
+个文件）。状态徽标属于跨屏统一视觉元素，建议抽取到共享模块（如 ../ui 或 openbot 内共享样式文件），避免后续配色调整在各屏漂移。
+
+- const chipBase = {
+-   fontSize: 11,
+-   lineHeight: 16,
+-   fontWeight: "600" as const,
+-   paddingHorizontal: 8,
+-   paddingVertical: 2,
+-   borderRadius: 9,
+-   overflow: "hidden" as const,
+- };
++ // 建议移入共享模块，各屏引用同一份定义
++ import { chipBase } from "./shared-chip";
+
+─── apps/mobile/src/openbot/computer.tsx:179-188 ───
+[style · low] 头部行、flex:1 容器、loading 行等纯静态布局以对象字面量内联 style 编写，应在 StyleSheet.create
+中声明，仅保留真正动态的样式内联。control.tsx 同样存在该模式（控制卡片头行、controlling 区 gap 容器等），建议一并整理。
+
+-       <View
+-         style={{
+-           flexDirection: "row",
+-           alignItems: "center",
+-           justifyContent: "space-between",
+-           paddingHorizontal: 18,
+-           paddingTop: 8,
+-           paddingBottom: 4,
+-         }}
+-       >
++       <View style={styles.header}>
+
+─── apps/mobile/src/openbot/control-state.ts:123-124 ───
+[maintainability · low] controlSignedOut 在整个 src/ 下无任何生产调用点（仅被自身测试 openbot-control-state.test.ts
+引用），实际登出路径依赖 control.tsx 的卸载清理（release/cancel
+best-effort）。属于死导出，与模块「纯状态机、无外部依赖」定位无冲突但违反死代码检查项。建议删除该转换及其测试，或在真实登出流程中接线使用。
+
+- export function controlSignedOut(state: ControlState): ControlState {
+-   // Nothing held or already terminal: sign-out ends nothing.
++ // 若登出流程确需本地终结租约，应在 gate/App 登出处调用；否则删除此导出。
+

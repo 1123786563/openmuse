@@ -1,0 +1,18 @@
+OCR final-pass repair — cluster B (37 findings, incl. 9 high: openmuse-deletion / openmuse-notifications / openmuse-activity / openmuse-personal / openmuse-ops).
+
+TARGET repo: /Users/wuyongjun/trea/OpenBot/.worktrees/v4-base (branch v4/openbot-exec; ~214 uncommitted files are prior repair waves — do NOT commit, stash, or reset anything).
+Findings list (authoritative, one block per finding, 37 total): /Users/wuyongjun/trea/openmuse/docs/superpowers/ledger/2026-10-12-openbot-v4-execution/ocr-final-cluster-b.txt
+Context: FINAL confirming pass of the OCR review-repair loop (ledger: LEDGER.md in the same directory). Earlier rounds already repaired many issues — verify each finding against current code before acting; some are stale or invalid.
+
+CHANGE: For EACH finding: (1) verify against current code; (2) if valid, implement the minimal correct fix, extending the module's suite where practical; (3) if invalid or already fixed, no code change, record disposition with file:line citation. Prioritize the 9 high-severity findings first.
+
+OWNERSHIP — you may edit ONLY: server/src/openmuse-deletion/**, server/src/openmuse-notifications/**, server/src/openmuse-activity/**, server/src/openmuse-personal/**, server/src/openmuse-ops/**, plus server/tests/openmuse-{deletion,notifications,activity,memories,ideas,goals,personal-tools,ops-signals}.test.ts and new tests inside your owned src paths. Never edit files outside ownership; cross-module concerns (shared schema, app wiring, db/drizzle migrations) go in your report as dependencies.
+
+CONSTRAINTS: minimal diffs, match existing style, no drive-by refactors; no schema/migration edits (record as dependency); leave everything uncommitted.
+
+ACCEPTANCE (all required):
+1. Suites green: cd /Users/wuyongjun/trea/OpenBot/.worktrees/v4-base && bun test server/tests/openmuse-deletion.test.ts server/tests/openmuse-notifications.test.ts server/tests/openmuse-activity.test.ts server/tests/openmuse-memories.test.ts server/tests/openmuse-ideas.test.ts server/tests/openmuse-goals.test.ts server/tests/openmuse-personal-tools.test.ts server/tests/openmuse-ops-signals.test.ts (+ any suite covering files you touched) — 0 fail.
+2. bun run --filter server typecheck — clean.
+3. bunx biome lint <each file you touched> — clean.
+4. Write /Users/wuyongjun/trea/openmuse/docs/superpowers/ledger/2026-10-12-openbot-v4-execution/ocr-final-disposition-cluster-b.md — table: finding (file:lines) | verdict fixed/fixed-before/invalid | action | evidence; end with totals + dependencies.
+Then send worker_done exactly once with --outcome succeeded|failed, --report-path, and --files-modified.

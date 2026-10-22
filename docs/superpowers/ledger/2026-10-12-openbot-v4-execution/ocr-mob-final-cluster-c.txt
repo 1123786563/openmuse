@@ -1,0 +1,256 @@
+# ocr-openmuse-final split — cluster C: files/connections/private-state/calendar (files, connections, private-state, calendar, calendar-view)
+# source: ocr-openmuse-final.txt (12 findings)
+# repo: /Users/wuyongjun/trea/openmuse/.worktrees/v4-base (branch v4/openbot-exec)
+
+─── apps/mobile/src/openbot/connections.tsx:106-108 ───
+[bug · low] connect() 未纳入 requestSeq 序号体系，且 finally 中无条件 `setBusy(false)`：当其与 load/disconnect
+并发时，connect 先返回会提前释放全局 busy，使仍在途请求的按钮互锁提前失效（如连接进行中可再点断开/刷新），与 load/disconnect 的 seq 守卫模式不一致。属 UI
+层竞态，不损数据一致性，建议统一走 seq。
+
+    const connect = useCallback(async (provider: string) => {
++     const seq = ++requestSeq.current;
+      setBusy(true);
+      setError(null);
+
+─── apps/mobile/src/openbot/connections.tsx:142-151 ───
+[style · low] 头部行等静态样式以内联对象书写，每次渲染重建样式对象，违反"避免内联样式（动态样式除外）"的规范，也与同文件既有
+StyleSheet.create（styles.card/errorText/chipBase）的做法不统一；email-signin.tsx 的
+FieldError（fontSize/marginTop）等处同样如此。建议将纯静态样式收敛进 StyleSheet.create。
+
+-       <View
+-         style={{
+-           flexDirection: "row",
+-           alignItems: "center",
+-           justifyContent: "space-between",
+-           paddingHorizontal: 18,
+-           paddingTop: 8,
+-           paddingBottom: 4,
+-         }}
+-       >
++       <View style={styles.header}>
++ // styles.header 移入下方 StyleSheet.create：
++ //   header: {
++ //     flexDirection: "row",
++ //     alignItems: "center",
++ //     justifyContent: "space-between",
++ //     paddingHorizontal: 18,
++ //     paddingTop: 8,
++ //     paddingBottom: 4,
++ //   },
+
+─── apps/mobile/src/openbot/connections.tsx:117-122 ───
+[bug · low] 错误横幅的固定标题 COPY.errorTitle（"连接状态没有读取出来"）只对 load 的失败成立：connect() 在这里写入的
+`${COPY.openFailed}（${copy}）`、disconnect() 写入的
+connectionErrorCopy(e)，在渲染处同样被套上"连接状态没有读取出来（…）"前缀，断开/连接失败会被误报为"状态读取失败"，误导用户去点"重试"（重新
+load）而非重试动作本身。建议让 error 携带各自的标题（或至少断开/连接共用一个中性标题），渲染处不再拼接固定前缀。
+
+- } catch (e) {
+-       const copy = connectionErrorCopy(e);
+-       setError(isAuthFailure(e) ? copy : `${COPY.openFailed}（${copy}）`);
+-     } finally {
+-       setBusy(false);
+-     }
++ // 状态改为携带来源标题：
++ const [error, setError] = useState<{ title: string; detail: string } | null>(null);
++ 
++ // load 失败：
++ setError({ title: COPY.errorTitle, detail: connectionErrorCopy(e) });
++ // connect 失败：
++ setError({ title: COPY.openFailed, detail: copy });
++ // disconnect 失败：
++ setError({ title: COPY.disconnectFailed, detail: connectionErrorCopy(e) });
++ 
++ // 渲染：
++ <Text style={styles.errorText}>
++   {error.title}（{error.detail}）
++ </Text>
+
+─── apps/mobile/src/openbot/connections.tsx:224-232 ───
+[style · low] 操作按钮的分支是两层嵌套的三元表达式（disconnected/revoked → 连接，connected/refresh_required → 断开，否则
+null），违反检查清单"禁止嵌套三元表达式"，且状态→动作的映射内联在 JSX 里不利于后续新增状态（如 refresh_required
+未来可能要"仅刷新权限"按钮）。建议抽成早返回的辅助函数，在 ConnectionCard 体内调用。
+
+- {row.status === "disconnected" || row.status === "revoked" ? (
+-         <Button small busy={busy} style={{ alignSelf: "flex-start" }} onPress={onConnect}>
+-           {COPY.connect}
+-         </Button>
+-       ) : row.status === "connected" || row.status === "refresh_required" ? (
+-         <Button small danger busy={busy} style={{ alignSelf: "flex-start" }} onPress={onDisconnect}>
+-           {COPY.disconnect}
++ function connectionAction(row: ConnectionRow): { label: string; danger: boolean; onAction: () => void } | null {
++   if (row.status === "disconnected" || row.status === "revoked") {
++     return { label: COPY.connect, danger: false, onAction: onConnect };
++   }
++   if (row.status === "connected" || row.status === "refresh_required") {
++     return { label: COPY.disconnect, danger: true, onAction: onDisconnect };
++   }
++   return null;
++ }
++ 
++ // ConnectionCard 组件体内：
++ const action = connectionAction(row);
++ // JSX 中：
++ {action ? (
++   <Button small danger={action.danger} busy={busy} style={{ alignSelf: "flex-start" }} onPress={action.onAction}>
++     {action.label}
+-         </Button>
++   </Button>
+-       ) : null}
++ ) : null}
+
+─── apps/mobile/src/openbot/calendar.tsx:59-62 ───
+[bug · medium] load 缺少请求序号与取消守卫，与本仓库已建立的防护模式不一致：connections.tsx 用 requestSeq
+保证「只有最后一次请求的响应落地」，computer.tsx 用 AbortController 在 effect cleanup 中中止轮询；此处 fetchCalendarEvents 虽已支持
+signal 参数却未传入。后果：(1) 分页中途卸载屏幕（返回对话）后，do..while 仍会继续串行请求（上限 50 页）并对已卸载组件 setState；(2) 同帧双击刷新或
+StrictMode 开发环境双挂载时，慢的旧响应可能后到并覆盖新响应（last-write-wins）。建议接入 AbortController（cleanup 中 abort）并对所有
+setState 加 seq 守卫。
+
++   const requestSeq = useRef(0); // 需在 react 导入中加入 useRef
++   const abortRef = useRef<AbortController | null>(null);
++ 
+    const load = useCallback(async () => {
++     const seq = ++requestSeq.current;
++     const controller = new AbortController();
++     abortRef.current = controller;
+      setBusy(true);
+      setError(null);
+      try {
++       // do..while 分页不变，每页传入 controller.signal：
++       // const page = await fetchCalendarEvents({ timeMin, timeMax, cursor }, controller.signal);
++       // ...
++       if (seq === requestSeq.current) {
++         setEvents(collected);
++         setTruncated(sawTruncated);
++       }
++     } catch (e) {
++       if (seq === requestSeq.current) setError(e instanceof OpenBotError ? e.message : String(e));
++     } finally {
++       if (seq === requestSeq.current) setBusy(false);
++     }
++   }, []);
++ 
++   useEffect(() => {
++     void load();
++     return () => abortRef.current?.abort();
++   }, [load]);
+
+─── apps/mobile/src/openbot/calendar-view.ts:194-196 ───
+[bug · medium] 脏数据兜底对 timed 事件存在 NaN 缺口。zod schema（types.ts:161-162）只保证 start/end 为非空字符串，但无法解析的
+timed 日期并不会像注释声称的那样「在下方 throw」：Date.parse 返回 NaN 会无异常地流过 renderTimedRange（Intl format/formatToParts
+对 Invalid Date 返回 "Invalid Date"/NaN part，不抛错）与 formatDurationHours（Math.round(NaN)=NaN，`NaN <= 0` 与
+`NaN === 0` 均为 false，最终返回 "NaN 小时 NaN 分"）。结果行内渲染出 "Invalid Date … · NaN 小时 NaN
+分"，而非注释承诺的降级为原始字符串——只有 all-day 路径因 toISOString 对 Invalid Date 抛 RangeError 才能进 catch。建议在 try 内对
+timed 事件的解析结果做 Number.isFinite 校验，不合法时主动抛出，让既有 catch 按设计降级。
+
+    try {
+      const resolved = zoneOf(event.start, event.timeZone || zone);
++     // Unparseable timed dates do NOT throw (Date.parse -> NaN flows through
++     // Intl and formatDurationHours), so validate finiteness here and let the
++     // catch below degrade to the raw strings as documented.
++     if (
++       !event.allDay &&
++       (!Number.isFinite(instantOf(event.start, resolved.zone)) ||
++         !Number.isFinite(instantOf(event.end, resolved.zone)))
++     ) {
++       throw new RangeError(`unparseable timed date: ${event.start} / ${event.end}`);
++     }
+      const range = event.allDay
+
+─── apps/mobile/src/openbot/files.tsx:221-225 ───
+[style · low] 下载按钮状态使用了两级嵌套三元表达式（cached → downloading → 默认），违反检查清单"禁止嵌套三元表达式"。新增状态（如 failed
+提示）时嵌套会继续加深且易漏分支。建议提取为模块级辅助函数（不得在组件内声明新组件），用早返回的 if/else 扁平化分支。
+
+-                   {row.phase === "cached" ? (
+-                     <Text style={styles.action}>{COPY.cached}</Text>
+-                   ) : row.phase === "downloading" ? (
+-                     <Text style={styles.actionBusy}>{COPY.downloading}</Text>
+-                   ) : (
++ // 模块级辅助：
++ function downloadAction(row: RowState, enabled: boolean, onDownload: () => void) {
++   if (row.phase === "cached") return <Text style={styles.action}>{COPY.cached}</Text>;
++   if (row.phase === "downloading") return <Text style={styles.actionBusy}>{COPY.downloading}</Text>;
++   return (
++     <Pressable
++       accessibilityRole="button"
++       accessibilityLabel={COPY.download}
++       disabled={!enabled}
++       onPress={onDownload}
++     >
++       <Text style={enabled ? styles.action : styles.actionDisabled}>{COPY.download}</Text>
++     </Pressable>
++   );
++ }
++ 
++ // 渲染处：
++ {downloadAction(row, !!adapter, () => void download(file))}
+
+─── apps/mobile/src/openbot/files.tsx:86-90 ───
+[maintainability · low] load() 与 download() 均无卸载取消：useEffect 未返回清理函数，未向 fetchFiles/ensureCached 传递
+AbortSignal，下载中退出文件页后仍会对已卸载组件 setFiles/setRows/setBusy。React 18 已移除该告警、后果轻微，但副作用处理不完整。fetchFiles 已支持
+signal 形参（api.ts:459），接入成本低，建议用挂载 ref 守卫并透传 AbortSignal。
+
+-   const load = useCallback(async () => {
++   useEffect(() => {
++     const controller = new AbortController();
++     void load(controller.signal);
++     return () => controller.abort();
++   }, [load]);
++ 
++   const load = useCallback(async (signal?: AbortSignal) => {
+      setBusy(true);
+      setError(null);
+      try {
+-       setFiles((await fetchFiles()).files);
++       setFiles((await fetchFiles(null, signal)).files);
+
+─── apps/mobile/src/openbot/private-state.ts:24-27 ───
+[security · medium] 注册表缺口：auth.ts 在 web 上把 localStorage 包装为 expoClient 的 storage 并传入同一
+storagePrefix（secureStorePrefix），因此插件在 web 端也会把 _cookie/_session_data 及 .N 分块写入 localStorage 的
+`openmuse-openbot-…` 前缀下。本注册表 exact/prefixes 均未覆盖该前缀，clearWebPrivateState 清不到——前一用户的插件
+jar（含会话令牌材料）会在新用户登录后残留在同一浏览器的 localStorage。建议把 secureStorePrefix（需上移定义位置）加入 prefixes，并配合 gate.tsx
+中新登录写入前的清扫时机使用（成功登录后再清会误删当前用户的 jar）。
+
+  export const webPrivateStorageKeys: { exact: readonly string[]; prefixes: readonly string[] } = {
+    exact: [OPENBOT_SESSION_STORAGE_KEY],
+-   prefixes: ["copilotkit-"],
++   // secureStorePrefix (hoist its declaration above this block) is not native-
++   // only: auth.ts wires the same storagePrefix into expoClient's localStorage
++   // storage on web, so the plugin jar lands under it in web localStorage too.
++   prefixes: ["copilotkit-", secureStorePrefix],
+  };
+
+─── apps/mobile/src/openbot/private-state.ts:129-129 ───
+[style · low] import 语句位于文件中部，应上移到文件顶部与其余导入并列。file-cache.ts 自身仅依赖 ./errors（纯模块、无 react-native/expo
+导入），上移不会破坏本模块声明的 node:test 约束。
+
++ import { openbotEndpoint } from "./config";
+  import { FILES_CACHE_DIR, joinUri } from "./file-cache";
+
+─── apps/mobile/src/openbot/private-state.ts:140-141 ───
+[bug · medium] 顶层 infoAsync 的 `.catch(() => null)` 把"探测 IO 失败"与"目录不存在"混为一谈：infoAsync
+一旦瞬时失败（目录其实存在），这里按不存在提前 return，整个 PDF 下载缓存清扫静默变成 no-op，NativeClearReport
+仍显示零失败——恰好是本函数注释声称要避免的"silently degrading the sweep to a no-op while the caller's report still says
+'cleared'"，也违背了 openbot-native-private-state.test.ts 第 289 行钉住的契约（"an unreadable cache directory
+surfaces instead of silently degrading the sweep to a no-op"；该测试只覆盖 readDirectoryAsync 失败，stub 的
+infoAsync 永不失败，探测失败路径无测试）。后果是瞬时 IO 故障下前一用户下载的文件跨用户残留。建议根目录探测仅在 `exists === false`
+时视为不存在，让探测拒绝向上传播（与注释一致）；递归内部逐项探测可保留 catch，因为其 null 分支会落入幂等删除并把失败计入 failedDeletes，是诚实的。
+
+-   const info = await fs.infoAsync(dir).catch(() => null);
+-   if (!info?.exists) return;
++   const info = await fs.infoAsync(dir);
++   if (!info.exists) return;
+
+─── apps/mobile/src/openbot/private-state.ts:151-155 ───
+[documentation · low] 注释已过时且与事实相反：同一变更集中 file-cache.ts + native-cache-adapter.ts +
+files.tsx/pdf-view-state.ts（F04/F07）已经把下载字节写入 `<cache>/openmuse-files/`（files.tsx:107 实际调用
+ensureCached），本清扫在登出/401 时是实际生效的隐私路径，不再是"proven no-op"。文件头第 9-10 行的 "plus, later, downloaded PDF
+bytes" 同样过时。这类描述会让后续维护者把该清扫误判为惰性逻辑而放松对它的回归保护，请更新为现状描述。
+
+  /**
+   * Lists every file under <cacheDirectory>/openmuse-files/** recursively — the
+-  * native PDF download cache F04/F07 will write. Today that directory does not
+-  * exist yet, so this returns [] and the clear below is a proven no-op.
++  * owner-scoped download cache F04/F07 write (file-cache.ts ensureCached via
++  * native-cache-adapter.ts), swept on sign-out and on any 401.
+   */
+
