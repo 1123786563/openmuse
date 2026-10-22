@@ -4,11 +4,11 @@
 
 ### Issue tracker
 
-Issues and specs for this repository are tracked in GitHub Issues at `1123786563/openmuse`. See `docs/agents/issue-tracker.md`.
+OpenBot integration Issues are tracked in GitHub at `1123786563/OpenBot`. Before reading, creating, or updating one, read the parent repository's `../../docs/agents/issue-tracker.md`.
 
 ### Domain docs
 
-This repository uses a single domain context at the root. See `docs/agents/domain.md`.
+For OpenBot shared terms, read `../../CONTEXT.md`; for OpenMuse-specific terms, read this submodule's `CONTEXT.md`. See `../../docs/agents/domain.md` for their boundaries.
 
 # Agent 开发工作流
 
@@ -17,10 +17,10 @@ This repository uses a single domain context at the root. See `docs/agents/domai
 
 ## 事实源
 
-- `docs/specs/`：已批准需求、行为、范围、非目标和验收标准。
-- `docs/adr/`：架构决策与约束。
-- `CONTEXT.md`：统一的领域术语和领域模型。
-- `docs/plans/`：Superpowers 实施计划。
+- `../../docs/specs/`：Spec 所在目录；逐份核对状态，只有明确批准的 Spec 才作为实施依据。
+- `../../docs/adr/`：OpenBot 架构决策与约束。
+- `../../CONTEXT.md`：OpenBot 共享术语；本目录 `CONTEXT.md`：OpenMuse 局部术语。
+- `../../docs/plans/`：OpenBot 的 Superpowers 实施计划。
 - Git + Superpowers Ledger：执行历史和已完成任务的证据。
 
 如果实施 Plan 与已批准 Spec 冲突，以 Spec 为准。
@@ -62,7 +62,16 @@ This repository uses a single domain context at the root. See `docs/agents/domai
 - `verification-before-completion`
 - `finishing-a-development-branch`
 
-开始实现前先读取 `CONTEXT.md`、已批准 Spec、相关 ADR 和当前 Ticket，然后再创建 Implementation Plan。
+开始实现 OpenBot 集成前先读取 `../../CONTEXT.md`、本目录 `CONTEXT.md`、已批准 Spec、相关 ADR 和当前 Ticket，然后再创建 Implementation Plan。
+上述 Superpowers Skill 必须在当前会话中可调用；若未暴露，记录能力缺口并报告，不能声称已执行相应 Skill 或通过其关卡。
+
+### 测试与容器
+
+验证 OpenBot 集成改动时遵守父仓库 `../../docs/agents/testing.md`。测试结束时确认本次新建的测试容器已关闭。
+
+### 分支与 Worktree
+
+创建、复用或清理 Orca 工作区及 Git 分支前，遵守父仓库 `../../docs/agents/worktrees.md`；本子模块属于独立 Git 仓库，分别核对其状态与提交。
 
 ### 冲突规则
 
@@ -82,7 +91,7 @@ Matt Ticket 应是“业务完整的纵向切片”；Superpowers Task 是 Ticke
 
 ### 子 Agent 上下文
 
-给子 Agent 提供最小必要上下文，并尽量使用这些文件指针：`CONTEXT.md`、相关 ADR、批准 Spec、当前 Ticket、Task Brief、前置任务接口。
+给子 Agent 提供最小必要上下文，并尽量使用这些文件指针：`../../CONTEXT.md`、本目录 `CONTEXT.md`、相关 ADR、批准 Spec、当前 Ticket、Task Brief、前置任务接口。
 不要把整个父会话复制给每个 Child Agent。长上下文是储备容量，不是信息倾倒场。
 
 ### TDD
@@ -99,15 +108,16 @@ Superpowers 负责实现阶段的 TDD 编排。
 ### Review
 
 每个任务和实现阶段最终 Review 由 Superpowers 负责。
-之后可选运行 Matt `code-review`，再做一轮 Standards + Spec Compliance 独立审查。
+之后可选运行  `open-code-review`，再做一轮 Standards + Spec Compliance 独立审查。
 Review Agent 默认应保持只读。
+OpenBot 集成任务还须遵守父仓库 `../../AGENTS.md` 的“Open Code Review（OCR）”两级审查关卡。
 
 ## 长上下文 / Context Management 策略
 
 本项目假设存在 1M 级原生上下文，但可持久化项目文件仍然是事实源。
 
 - 不要因为模型能记更多，就推迟记录重要决策。
-- 决策一旦稳定，应更新 `CONTEXT.md`、ADR 或 Spec。
+- 决策一旦稳定，应更新对应范围的 `CONTEXT.md`、ADR 或 Spec。
 - 工具输出保持针对性；大体积证据保存到文件，只读取相关范围。
 - 到达阶段边界时，如果前一阶段的大量聊天细节已经无用，优先使用新任务 / 新 Session / 干净子 Agent Context。
 - 自动压缩或上下文滚动后，从文件 + Git + Superpowers Ledger 重建状态，不依赖模型自己的回忆。
