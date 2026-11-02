@@ -21,6 +21,11 @@ import { assertApiDeploymentConfig, type Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
+import {
+  createEnterpriseApp,
+  createOpenbotAuthority,
+  type OpenbotAuthority,
+} from "./enterprise.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
@@ -30,7 +35,7 @@ import { WorkspaceService } from "./workspace.ts";
 export async function createApp(
   db: Store,
   config: Config,
-  options: { docker?: DockerRunner } = {},
+  options: { docker?: DockerRunner; authority?: OpenbotAuthority } = {},
 ) {
   assertApiDeploymentConfig(config);
   const auth = await createAuth(db, config),
@@ -49,6 +54,22 @@ export async function createApp(
   const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
   const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
   const runtime = makeRuntime(config, agent, auth, intelligence);
+  // T07.05 (#595): an enterprise deployment keeps every service above but
+  // serves the enterprise supply only — no accessKey session, no sample seed,
+  // no "local-user" owner route is mounted at all. The authority is injected
+  // by tests and built from deployment config in production.
+  if (config.authMode === "enterprise") {
+    const authority = options.authority ?? createOpenbotAuthority(config);
+    return {
+      app: createEnterpriseApp(db, config, { authority }),
+      auth,
+      files,
+      actions,
+      workspace,
+      agent,
+      computer,
+    };
+  }
   const app = new Hono<{ Variables: { owner: string } }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
   app.use("*", async (c, next) => {
