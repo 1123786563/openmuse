@@ -10,6 +10,17 @@ import { AppError } from "./errors.ts";
 
 const FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+/**
+ * T07.07 (#597): the bounded byte face the enterprise media proxy reads a
+ * file through — size first, then offset-addressed pulls with a per-call
+ * ceiling, closed by the proxy when the response stream ends.
+ */
+export interface MediaByteSource {
+  readonly sizeBytes: number;
+  read(offset: number, maxBytes: number): Promise<Uint8Array>;
+  close(): Promise<void>;
+}
+
 export function sanitizeFileName(name: string): string {
   const base = name.split(/[\\/]/).at(-1) ?? "document.pdf";
   // Slice code points, not UTF-16 units, so a surrogate pair is never split in half.
@@ -123,6 +134,33 @@ export class Files {
   async bytes(owner: string, id: string) {
     await this.get(owner, id);
     return readFile(this.pathFor(id));
+  }
+  /**
+   * T07.07 (#597): the bounded streaming face the enterprise media proxy
+   * reads through. Every pull names its own offset and ceiling, so the
+   * proxy controls the batch discipline (≤262144 bytes per pull, per the
+   * P15 contract the BFF inherits) and never buffers a whole file for an
+   * unauthorized reader. The metadata read happens first, as `bytes` does.
+   */
+  async stream(owner: string, id: string): Promise<MediaByteSource> {
+    const _file = await this.get(owner, id);
+    const path = this.pathFor(id);
+    const { stat, open } = await import("node:fs/promises");
+    const info = await stat(path);
+    const handle = await open(path, "r");
+    return {
+      sizeBytes: info.size,
+      async read(offset: number, maxBytes: number): Promise<Uint8Array> {
+        const want = Math.max(0, Math.min(maxBytes, info.size - offset));
+        if (want === 0) return new Uint8Array(0);
+        const buffer = Buffer.alloc(want);
+        const { bytesRead } = await handle.read(buffer, 0, want, offset);
+        return buffer.subarray(0, bytesRead);
+      },
+      async close(): Promise<void> {
+        await handle.close();
+      },
+    };
   }
   async fill(
     owner: string,
