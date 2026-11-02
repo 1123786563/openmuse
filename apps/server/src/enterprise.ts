@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { MessageSchema } from "@ag-ui/core";
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
+import { z } from "zod";
 import type {
   ActionProposal,
   ActivityEntry,
@@ -13,11 +15,20 @@ import type {
   Mail,
   Workspace,
 } from "../../../packages/domain/src/index.ts";
+import {
+  calendarRangeSchema,
+  emailDraftSchema,
+  proposalSchema,
+} from "../../../packages/domain/src/index.ts";
+import { ActionService } from "./actions.ts";
+import { createAuth } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
+import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { rateLimit } from "./rate-limit.ts";
+import { WorkspaceService } from "./workspace.ts";
 
 /*
  * T07.05 (#595, original task P17; BA interfaces §5.2): the enterprise BFF.
@@ -149,6 +160,79 @@ export const ENTERPRISE_OPERATIONS = {
   copilotkitInvoke: "copilotkit.invoke",
 } as const;
 
+/** The original /api/calendar/events query the standalone app accepts. */
+const calendarQuery = z.object({
+  calendarId: z.string().min(1).max(1024).optional(),
+  timeMin: z.iso.datetime({ offset: true }).optional(),
+  timeMax: z.iso.datetime({ offset: true }).optional(),
+});
+
+interface ContentRouteRule {
+  test: (path: string, method: string) => boolean;
+  /**
+   * Reads answer `workspace.read`; writes and approvals answer the same
+   * frozen team-scoped word: the authority re-checks the actor and the
+   * company/team selection on every single request either way.
+   */
+  operation: "workspace.read";
+}
+
+/**
+ * T07.17 (#607): the mail/calendar/drafts/conversation/approval surfaces this
+ * BFF answers for an enterprise supply, each named with the action class its
+ * routes perform. The operation words are the authority's frozen admissible
+ * list (`MOBILE_ADMISSIBLE_OPERATIONS`, interfaces §5.2): every content read
+ * and every workspace-scoped write/approval asks `workspace.read` online, one
+ * admission per request; no new operation word is invented here.
+ */
+const CONTENT_ROUTES: readonly ContentRouteRule[] = [
+  {
+    test: (path) => path === "/api/calendars" || path === "/api/calendar/events",
+    operation: "workspace.read",
+  },
+  { test: (path) => /^\/api\/mail\/threads\/[^/]+$/.test(path), operation: "workspace.read" },
+  {
+    test: (path, method) => path === "/api/drafts" && method === "GET",
+    operation: "workspace.read",
+  },
+  {
+    test: (path, method) => path === "/api/drafts" && method === "POST",
+    operation: "workspace.read",
+  },
+  {
+    test: (path, method) => path === "/api/conversation" && method === "GET",
+    operation: "workspace.read",
+  },
+  {
+    test: (path, method) => path === "/api/conversation" && method === "PUT",
+    operation: "workspace.read",
+  },
+  {
+    test: (path, method) => path === "/api/actions" && method === "POST",
+    operation: "workspace.read",
+  },
+  {
+    test: (path, method) => /^\/api\/actions\/[^/]+\/decide$/.test(path) && method === "POST",
+    operation: "workspace.read",
+  },
+];
+
+/**
+ * The one admission operation a request path/method maps to, or null when the
+ * route is not one this BFF wired for the enterprise supply.
+ */
+export function enterpriseOperationFor(path: string, method: string): string | null {
+  if (path === "/api/workspace") return ENTERPRISE_OPERATIONS.workspaceRead;
+  const isRunSurface =
+    path === "/api/copilotkit" ||
+    path.startsWith("/api/copilotkit/") ||
+    path === "/api/agent" ||
+    path.startsWith("/api/agent/");
+  if (isRunSurface) return ENTERPRISE_OPERATIONS.copilotkitInvoke;
+  for (const route of CONTENT_ROUTES) if (route.test(path, method)) return route.operation;
+  return null;
+}
+
 const SELECTOR_HEADER_TENANT = "x-openbot-tenant";
 const SELECTOR_HEADER_WORKSPACE = "x-openbot-workspace";
 
@@ -264,16 +348,11 @@ export function enterpriseSessionHandler(authority: OpenbotAuthority) {
  * enterprise supply are refused — they never fall back to the standalone
  * owner authentication.
  */
-export function enterpriseGuard(config: Config, authority: OpenbotAuthority): MiddlewareHandler {
+export function enterpriseGuard(_config: Config, authority: OpenbotAuthority): MiddlewareHandler {
   return async (context, next) => {
     const path = context.req.path;
-    const isWorkspace = path === "/api/workspace";
-    const isRunSurface =
-      path === "/api/copilotkit" ||
-      path.startsWith("/api/copilotkit/") ||
-      path === "/api/agent" ||
-      path.startsWith("/api/agent/");
-    if (!isWorkspace && !isRunSurface) throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
+    const operation = enterpriseOperationFor(path, context.req.method);
+    if (!operation) throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
     const authorization = context.req.header("authorization");
     if (!authorization?.startsWith("Bearer ")) throw AppError.fromCode("SESSION_EXPIRED", 401);
     const handle = authorization.slice(7);
@@ -287,11 +366,7 @@ export function enterpriseGuard(config: Config, authority: OpenbotAuthority): Mi
       "";
     if (!tenantId || !workspaceId) throw AppError.fromCode("SCOPE_REQUIRED", 400);
     const selector = { tenantId, workspaceId };
-    const admission = await authority.admission(
-      handle,
-      selector,
-      isWorkspace ? ENTERPRISE_OPERATIONS.workspaceRead : ENTERPRISE_OPERATIONS.copilotkitInvoke,
-    );
+    const admission = await authority.admission(handle, selector, operation);
     // The admitted scope must echo the request's one intent exactly.
     if (
       admission.scope?.tenantId !== selector.tenantId ||
@@ -570,8 +645,16 @@ export async function enterpriseWorkspaceSnapshot(
  * exact function, and the suite drives the same one.
  */
 export function mountEnterpriseRoutes<
-  Env extends { Variables: { enterpriseAdmission: EnterpriseAdmission } },
->(app: Hono<Env>, deps: { db: Store; config: Config; authority: OpenbotAuthority }): void {
+  Env extends {
+    Variables: { enterpriseAdmission: EnterpriseAdmission; owner: string };
+  },
+>(
+  app: Hono<Env>,
+  deps: { db: Store; config: Config; authority: OpenbotAuthority } & {
+    workspace: WorkspaceService;
+    actions: ActionService;
+  },
+): void {
   app.post("/api/session", enterpriseSessionHandler(deps.authority));
   app.use("/api/*", enterpriseGuard(deps.config, deps.authority));
   app.get("/api/workspace", async (context) => {
@@ -580,6 +663,73 @@ export function mountEnterpriseRoutes<
     return context.json(
       await enterpriseWorkspaceSnapshot(deps.db, deps.config, owner, context.req.query("q")),
       200,
+    );
+  });
+  // T07.17 (#607): the content and approval surfaces keep their ORIGINAL
+  // client wire schemas; only the credential half is replaced. Every route
+  // below answers from the server-admitted namespace the guard put on the
+  // context, so a cross-company id guess reads and writes only this
+  // company/team/principal's rows.
+  app.get("/api/calendars", async (context) =>
+    context.json(await deps.workspace.calendars(context.get("owner"))),
+  );
+  app.get("/api/calendar/events", async (context) => {
+    const query = calendarQuery.parse(context.req.query());
+    if (query.timeMin && query.timeMax) calendarRangeSchema.parse(query);
+    return context.json(await deps.workspace.events(context.get("owner"), query));
+  });
+  app.get("/api/mail/threads/:id", async (context) =>
+    context.json(await deps.workspace.thread(context.get("owner"), context.req.param("id"))),
+  );
+  app.get("/api/drafts", async (context) =>
+    context.json(await deps.db.list(context.get("owner"), "drafts")),
+  );
+  app.post("/api/drafts", async (context) => {
+    const body = emailDraftSchema
+      .extend({ id: z.string().uuid().optional() })
+      .parse(await context.req.json());
+    const existing = body.id
+      ? await deps.db.get<{ createdAt: string }>(context.get("owner"), "drafts", body.id)
+      : null;
+    if (body.id && !existing) throw new AppError("Draft not found", 404);
+    return context.json(
+      await deps.db.put(context.get("owner"), "drafts", {
+        ...body,
+        id: body.id ?? randomUUID(),
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+      }),
+      201,
+    );
+  });
+  app.get("/api/conversation", async (context) =>
+    context.json(
+      (await deps.db.get(context.get("owner"), "conversations", "default")) ?? {
+        messages: [],
+      },
+    ),
+  );
+  app.put("/api/conversation", async (context) => {
+    const body = (await context.req.json()) as { messages?: unknown };
+    const messages = z.array(z.unknown()).max(1000).parse(body.messages);
+    for (const message of messages) MessageSchema.parse(message);
+    await deps.db.put(context.get("owner"), "conversations", { id: "default", messages });
+    return context.json({ ok: true });
+  });
+  app.post("/api/actions", async (context) => {
+    const input = proposalSchema.parse(await context.req.json());
+    return context.json(await deps.actions.propose(context.get("owner"), input), 201);
+  });
+  app.post("/api/actions/:id/decide", async (context) => {
+    const body = z
+      .object({ hash: z.string(), decision: z.enum(["approve", "deny"]) })
+      .parse(await context.req.json());
+    return context.json(
+      await deps.actions.decide(
+        context.get("owner"),
+        context.req.param("id"),
+        body.hash,
+        body.decision,
+      ),
     );
   });
 }
@@ -609,16 +759,39 @@ export function enterpriseRefusalOf(error: unknown): {
  * limit) around the enterprise supply. app.ts mounts THIS app when the mode
  * is enterprise, and the suite drives the same one.
  */
-export function createEnterpriseApp(
+export async function createEnterpriseApp(
   db: Store,
   config: Config,
-  options: { authority?: OpenbotAuthority } = {},
-): Hono<{ Variables: { enterpriseAdmission: EnterpriseAdmission } }> {
+  options: {
+    authority?: OpenbotAuthority;
+    workspace?: WorkspaceService;
+    actions?: ActionService;
+  } = {},
+): Promise<Hono<{ Variables: { enterpriseAdmission: EnterpriseAdmission; owner: string } }>> {
   if (config.mode === "sample")
     throw new Error("The enterprise supply never serves a sample workspace");
   // The real authority client unless a test injects its seam.
   const authority = options.authority ?? createOpenbotAuthority(config);
-  const app = new Hono<{ Variables: { enterpriseAdmission: EnterpriseAdmission } }>();
+  // T07.17: the content surfaces answer through the same services the
+  // standalone app builds — an enterprise deployment keeps this server, so
+  // the original DTO behavior comes from the original services, only ever
+  // called with the server-admitted namespace owner.
+  const google = new GoogleAuth(db, config);
+  const workspace =
+    options.workspace ??
+    new WorkspaceService(db, config, new Files(db, config, await createAuth(db, config)), google);
+  const actions =
+    options.actions ??
+    new ActionService(db, {
+      execute: (owner, input, connectionId, targetVersion) =>
+        workspace.execute(owner, input, connectionId, targetVersion),
+      prepare: (owner, input, connectionId) => workspace.prepare(owner, input, connectionId),
+      connected: (owner) => workspace.connected(owner),
+      connection: (owner) => workspace.connection(owner),
+    });
+  const app = new Hono<{
+    Variables: { enterpriseAdmission: EnterpriseAdmission; owner: string };
+  }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
   app.use("*", async (context, next) => {
     const origin = context.req.header("origin");
@@ -649,6 +822,15 @@ export function createEnterpriseApp(
   app.onError((error, context) => {
     const refusal = enterpriseRefusalOf(error);
     if (refusal) return context.json(refusal.body, refusal.status);
+    // T07.17: the content surfaces keep their ORIGINAL client wire schema —
+    // an AppError from the shared services answers with its own status and
+    // message (a 404 for another namespace's id is the namespace boundary the
+    // client sees), exactly as the standalone app answers it. Zod validation
+    // stays 422. Everything else is a 502 without a stack or token bearing.
+    if (error instanceof AppError) return context.json({ error: error.message }, error.status);
+    if (error instanceof z.ZodError)
+      return context.json({ error: error.issues.map((issue) => issue.message).join("; ") }, 422);
+    if (error instanceof SyntaxError) return context.json({ error: "Invalid request data" }, 400);
     // Provider and document errors are useful, but raw stack traces and
     // token-bearing responses are not.
     console.error(`[OpenMuse enterprise] ${error.name}`);
@@ -658,6 +840,6 @@ export function createEnterpriseApp(
   app.get("/api/health", (context) =>
     context.json({ ok: true, mode: config.mode, authMode: "enterprise" }),
   );
-  mountEnterpriseRoutes(app, { db, config, authority });
+  mountEnterpriseRoutes(app, { db, config, authority, workspace, actions });
   return app;
 }

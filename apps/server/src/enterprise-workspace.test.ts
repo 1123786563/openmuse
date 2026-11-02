@@ -203,7 +203,7 @@ async function enterpriseApp(
   db: Store;
   directory: string;
   config: Config;
-  app: ReturnType<typeof createEnterpriseApp>;
+  app: Awaited<ReturnType<typeof createEnterpriseApp>>;
 }> {
   const directory = await mkdtemp(join(tmpdir(), "openmuse-enterprise-"));
   const db = await createStore({ dataDir: join(directory, "data") });
@@ -226,7 +226,7 @@ async function enterpriseApp(
   };
   // Production wiring: the real OpenBot authority client, pointed at the
   // stub's HTTP server by deployment config — no seam injection.
-  const app = createEnterpriseApp(db, config);
+  const app = await createEnterpriseApp(db, config);
   return { db, directory, config, app };
 }
 
@@ -243,7 +243,7 @@ function sessionBody(): Record<string, string> {
 describe("T07.05 enterprise session and workspace mapping", () => {
   const authority = new AuthorityStub();
   let db: Store;
-  let app: ReturnType<typeof createEnterpriseApp>;
+  let app: Awaited<ReturnType<typeof createEnterpriseApp>>;
   let directory: string;
   let token: string;
 
@@ -398,7 +398,10 @@ describe("T07.05 enterprise session and workspace mapping", () => {
   }, 60_000);
 
   test("unknown_routes_never_fall_back_to_standalone_owner", async () => {
-    const response = await app.request("/api/calendars", {
+    // T07.17 wired the content surfaces (/api/calendars among them); a route
+    // THIS BFF still has not wired — the media surfaces belong to T07.07 —
+    // keeps refusing instead of falling back to the standalone owner.
+    const response = await app.request("/api/files/some-file/content", {
       headers: {
         Authorization: `Bearer ${token}`,
         ...SELECTOR_HEADERS("tenant-acme", "ws-acme-ops"),
