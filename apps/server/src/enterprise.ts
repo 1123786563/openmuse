@@ -96,24 +96,23 @@ export interface OpenbotAuthority {
  * The error taxonomy the enterprise surface answers with, mapped onto the
  * frozen MobileBffError shape { error, code, requestId }.
  */
-export const ENTERPRISE_REFUSAL_STATUS: Readonly<
-  Record<string, 400 | 401 | 403 | 404 | 503>
-> = Object.freeze({
-  INVALID_REQUEST: 400,
-  SCOPE_REQUIRED: 400,
-  SCOPE_SELECTOR_CONFLICT: 400,
-  SESSION_EXPIRED: 401,
-  SESSION_REVOKED: 401,
-  ACCOUNT_CHANGED: 401,
-  BFF_CREDENTIAL_REQUIRED: 401,
-  BFF_CREDENTIAL_INVALID: 401,
-  CLIENT_ASSERTED_ACTOR: 403,
-  ADMISSION_REUSED: 403,
-  COMPANY_REAUTH_REQUIRED: 403,
-  IDENTITY_DISABLED: 403,
-  RESOURCE_NOT_FOUND: 404,
-  AUTHORITY_UNAVAILABLE: 503,
-});
+export const ENTERPRISE_REFUSAL_STATUS: Readonly<Record<string, 400 | 401 | 403 | 404 | 503>> =
+  Object.freeze({
+    INVALID_REQUEST: 400,
+    SCOPE_REQUIRED: 400,
+    SCOPE_SELECTOR_CONFLICT: 400,
+    SESSION_EXPIRED: 401,
+    SESSION_REVOKED: 401,
+    ACCOUNT_CHANGED: 401,
+    BFF_CREDENTIAL_REQUIRED: 401,
+    BFF_CREDENTIAL_INVALID: 401,
+    CLIENT_ASSERTED_ACTOR: 403,
+    ADMISSION_REUSED: 403,
+    COMPANY_REAUTH_REQUIRED: 403,
+    IDENTITY_DISABLED: 403,
+    RESOURCE_NOT_FOUND: 404,
+    AUTHORITY_UNAVAILABLE: 503,
+  });
 
 /** The one wire error this surface ever answers with. */
 export interface MobileBffError {
@@ -226,8 +225,7 @@ export function enterpriseSessionHandler(config: Config, authority: OpenbotAutho
       typeof body.code === "string" &&
       typeof body.codeVerifier === "string" &&
       typeof body.redirectUri === "string";
-    if (!enterpriseShape || "accessKey" in body)
-      throw AppError.fromCode("INVALID_REQUEST", 400);
+    if (!enterpriseShape || "accessKey" in body) throw AppError.fromCode("INVALID_REQUEST", 400);
     const session = await authority.exchange({
       authMode: "enterprise",
       intentId: body.intentId as string,
@@ -268,8 +266,7 @@ export function enterpriseGuard(config: Config, authority: OpenbotAuthority): Mi
       path.startsWith("/api/agent/");
     if (!isWorkspace && !isRunSurface) throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
     const authorization = context.req.header("authorization");
-    if (!authorization?.startsWith("Bearer "))
-      throw AppError.fromCode("SESSION_EXPIRED", 401);
+    if (!authorization?.startsWith("Bearer ")) throw AppError.fromCode("SESSION_EXPIRED", 401);
     const handle = authorization.slice(7);
     const tenantId =
       context.req.header(SELECTOR_HEADER_TENANT) ??

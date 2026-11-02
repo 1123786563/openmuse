@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
 import { after, describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 /*
  * T07.06 (#596, original task P17): the enterprise CopilotKit surface.
@@ -525,7 +525,9 @@ describe("T07.06 enterprise CopilotKit stream and run admission", () => {
     assert.equal(authority.calls.at(-1)?.operation, "copilotkit.invoke");
   });
 
-  test("revocation_before_first_model_dispatch_never_calls_the_model", { timeout: 180_000 }, async () => {
+  test("revocation_before_first_model_dispatch_never_calls_the_model", {
+    timeout: 180_000,
+  }, async () => {
     await ensureFixtures();
     authority.reset();
     model.reset();
@@ -547,7 +549,9 @@ describe("T07.06 enterprise CopilotKit stream and run admission", () => {
     assert.equal(model.requests.length, 0);
   });
 
-  test("two_enterprise_apps_keep_their_own_actor_scope_and_payer", { timeout: 180_000 }, async () => {
+  test("two_enterprise_apps_keep_their_own_actor_scope_and_payer", {
+    timeout: 180_000,
+  }, async () => {
     await ensureFixtures();
     authority.reset();
     model.reset();
@@ -589,7 +593,9 @@ describe("T07.06 enterprise CopilotKit stream and run admission", () => {
     }
   });
 
-  test("copilotkit_without_an_admitted_session_is_refused_before_the_stream", { timeout: 180_000 }, async () => {
+  test("copilotkit_without_an_admitted_session_is_refused_before_the_stream", {
+    timeout: 180_000,
+  }, async () => {
     await ensureFixtures();
     const serve = await ServeHost.start("enterprise");
     const anonymous = await fetch(

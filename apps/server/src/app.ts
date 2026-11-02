@@ -19,21 +19,21 @@ import { ComputerService, type DockerRunner } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
 import type { Store } from "./db.ts";
+import { agentRoutes } from "./engine/routes.ts";
+import { AgentService, EnterpriseRunAdmissions } from "./engine/service.ts";
 import {
   createEnterpriseActionGate,
   createOpenbotAuthority,
   ENTERPRISE_OPERATIONS,
   ENTERPRISE_REFUSAL_STATUS,
+  type EnterpriseActionGate,
+  type EnterpriseAdmission,
   enterpriseFacts,
   enterpriseGuard,
   enterpriseRequestSelection,
   enterpriseSessionHandler,
-  type EnterpriseActionGate,
-  type EnterpriseAdmission,
   type OpenbotAuthority,
 } from "./enterprise.ts";
-import { agentRoutes } from "./engine/routes.ts";
-import { AgentService, EnterpriseRunAdmissions } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
@@ -99,10 +99,14 @@ export async function createApp(
             if (existing) return existing;
             const selection = enterpriseRequestSelection(request);
             const gate = selection
-              ? createEnterpriseActionGate(enterprise.authority, selection.handle, selection.selector)
-              : Promise.reject(
+              ? createEnterpriseActionGate(
+                  enterprise.authority,
+                  selection.handle,
+                  selection.selector,
+                )
+              : (Promise.reject(
                   AppError.fromCode("SESSION_EXPIRED", 401),
-                ) as Promise<EnterpriseActionGate>;
+                ) as Promise<EnterpriseActionGate>);
             gates.set(request, gate);
             return gate;
           },

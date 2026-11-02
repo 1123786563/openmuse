@@ -28,6 +28,7 @@ import type { BrowserService } from "../browser.ts";
 import { ComputerService } from "../computer.ts";
 import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
+import type { EnterpriseActionGate, EnterpriseRunContext } from "../enterprise.ts";
 import { AppError } from "../errors.ts";
 import type { Files } from "../files.ts";
 import { backgroundFailure } from "../log.ts";
@@ -42,7 +43,6 @@ import {
   pageLines,
   withoutRelativeTimes,
 } from "./page-diff.ts";
-import type { EnterpriseActionGate, EnterpriseRunContext } from "../enterprise.ts";
 import { LostLeaseError, type TaskContext, TaskWorker } from "./worker.ts";
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");

@@ -52,9 +52,7 @@ export function agentRoutes(
       .parse(await c.req.json());
     return c.json(await service.createTask(runOwner(c), input, requestId), 201);
   });
-  app.get("/tasks/:id", async (c) =>
-    c.json(await service.detail(runOwner(c), c.req.param("id"))),
-  );
+  app.get("/tasks/:id", async (c) => c.json(await service.detail(runOwner(c), c.req.param("id"))));
   app.post("/tasks/:id/control", async (c) => {
     const { action } = z
       .object({ action: z.enum(["pause", "resume", "cancel", "retry"]) })
@@ -70,9 +68,7 @@ export function agentRoutes(
           .optional(),
       })
       .parse(await c.req.json());
-    return c.json(
-      await service.answer(runOwner(c), c.req.param("id"), body.answer, body.fields),
-    );
+    return c.json(await service.answer(runOwner(c), c.req.param("id"), body.answer, body.fields));
   });
   app.post("/goals", async (c) =>
     c.json(await service.createGoal(runOwner(c), await c.req.json()), 201),

@@ -1,17 +1,23 @@
+import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { serve } from "@hono/node-server";
-import { randomUUID } from "node:crypto";
-import { AdmittedConversationAgent } from "./agent.ts";
-import { createApp, scopedExecution } from "./app.ts";
-import { createAuth } from "./auth.ts";
 import { ActionService } from "./actions.ts";
+import { AdmittedConversationAgent } from "./agent.ts";
+import {
+  createApp,
+  SCOPED_COMPUTER_METHODS,
+  SCOPED_FILES_METHODS,
+  SCOPED_WORKSPACE_METHODS,
+  scopedExecution,
+} from "./app.ts";
+import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
 import { ComputerService } from "./computer.ts";
 import type { Config } from "./config.ts";
 import { createStore } from "./db.ts";
-import { AgentService, EnterpriseRunAdmissions } from "./engine/service.ts";
 import { ConversationAgent } from "./engine/conversation.ts";
+import { AgentService, EnterpriseRunAdmissions } from "./engine/service.ts";
 import {
   createEnterpriseActionGate,
   createOpenbotAuthority,
@@ -20,11 +26,6 @@ import {
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { WorkspaceService } from "./workspace.ts";
-import {
-  SCOPED_COMPUTER_METHODS,
-  SCOPED_FILES_METHODS,
-  SCOPED_WORKSPACE_METHODS,
-} from "./app.ts";
 
 /*
  * T07.06 (#596): the fixture process behind enterprise-copilotkit.test.ts.
@@ -55,7 +56,9 @@ import {
 
 const [mode, dataDir, authorityOrigin = "", serverMode = "enterprise"] = process.argv.slice(2);
 if (!mode || !dataDir) {
-  console.error("usage: enterprise-copilotkit.fixture.ts <serve|agent> <dataDir> [authorityOrigin] [enterprise|standalone]");
+  console.error(
+    "usage: enterprise-copilotkit.fixture.ts <serve|agent> <dataDir> [authorityOrigin] [enterprise|standalone]",
+  );
   process.exit(2);
 }
 await mkdir(dataDir, { recursive: true, mode: 0o700 });
@@ -87,7 +90,9 @@ function enterpriseConfig(): Config {
 
 if (mode === "serve") {
   const config: Config =
-    serverMode === "enterprise" ? enterpriseConfig() : { ...base, mode: "sample", agentBackend: "sample" };
+    serverMode === "enterprise"
+      ? enterpriseConfig()
+      : { ...base, mode: "sample", agentBackend: "sample" };
   const db = await createStore({ dataDir: `${dataDir}/data` });
   const { app } = await createApp(db, config);
   const server = serve({ fetch: app.fetch, hostname: config.host, port: 0 }, (info) => {

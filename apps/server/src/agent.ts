@@ -1,12 +1,12 @@
 import "./config.ts";
 import { AbstractAgent, HttpAgent } from "@ag-ui/client";
+import { type BaseEvent, EventType, type RunAgentInput } from "@ag-ui/core";
 import {
   type AgentsFactory,
   type CopilotKitIntelligence,
   CopilotRuntime,
   createCopilotHonoHandler,
 } from "@copilotkit/runtime/v2";
-import { type BaseEvent, EventType, type RunAgentInput } from "@ag-ui/core";
 import { Observable } from "rxjs";
 import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
