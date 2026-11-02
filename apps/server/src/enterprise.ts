@@ -115,6 +115,7 @@ export interface OpenbotAuthority {
     handle: string,
     selector: EnterpriseScopeSelector,
     operation: string,
+    resourceId?: string | null,
   ): Promise<EnterpriseAdmission>;
 }
 
@@ -170,66 +171,103 @@ const calendarQuery = z.object({
 interface ContentRouteRule {
   test: (path: string, method: string) => boolean;
   /**
-   * Reads answer `workspace.read`; writes and approvals answer the same
-   * frozen team-scoped word: the authority re-checks the actor and the
-   * company/team selection on every single request either way.
+   * T07.17: the route class. The operation words are the authority's frozen
+   * admissible list (`MOBILE_ADMISSIBLE_OPERATIONS`, interfaces §5.2): every
+   * content read, write and approval asks `workspace.read` online, one
+   * admission per request, because that is the only team-scoped content word
+   * the authority whitelists. Adding a dedicated write/approve word would be
+   * a T05.13 contract revision outside this task's files.
    */
   operation: "workspace.read";
+  /**
+   * The object this action names, bound onto the admission row so read,
+   * write and approve are each verified per object; null names a
+   * collection-level action (a new draft, a list read).
+   */
+  resourceId: (path: string) => string | null;
 }
 
 /**
  * T07.17 (#607): the mail/calendar/drafts/conversation/approval surfaces this
  * BFF answers for an enterprise supply, each named with the action class its
- * routes perform. The operation words are the authority's frozen admissible
- * list (`MOBILE_ADMISSIBLE_OPERATIONS`, interfaces §5.2): every content read
- * and every workspace-scoped write/approval asks `workspace.read` online, one
- * admission per request; no new operation word is invented here.
+ * routes perform and the object it binds. Collection reads and creations
+ * answer `null`; single-object actions bind that object's opaque id, so an
+ * admission is always for ONE read, OF ONE object, or ONE approval — never a
+ * reusable token.
  */
 const CONTENT_ROUTES: readonly ContentRouteRule[] = [
   {
     test: (path) => path === "/api/calendars" || path === "/api/calendar/events",
     operation: "workspace.read",
+    resourceId: () => null,
   },
-  { test: (path) => /^\/api\/mail\/threads\/[^/]+$/.test(path), operation: "workspace.read" },
+  {
+    test: (path) => /^\/api\/mail\/threads\/[^/]+$/.test(path),
+    operation: "workspace.read",
+    resourceId: (path) => `mail-thread:${path.split("/")[4]}`,
+  },
   {
     test: (path, method) => path === "/api/drafts" && method === "GET",
     operation: "workspace.read",
+    resourceId: () => null,
   },
   {
     test: (path, method) => path === "/api/drafts" && method === "POST",
     operation: "workspace.read",
+    resourceId: () => null,
+  },
+  {
+    test: (path, method) => path === "/api/main-thread" && method === "GET",
+    operation: "workspace.read",
+    resourceId: () => "conversation:main",
   },
   {
     test: (path, method) => path === "/api/conversation" && method === "GET",
     operation: "workspace.read",
+    resourceId: () => "conversation:default",
   },
   {
     test: (path, method) => path === "/api/conversation" && method === "PUT",
     operation: "workspace.read",
+    resourceId: () => "conversation:default",
   },
   {
     test: (path, method) => path === "/api/actions" && method === "POST",
     operation: "workspace.read",
+    resourceId: () => null,
   },
   {
     test: (path, method) => /^\/api\/actions\/[^/]+\/decide$/.test(path) && method === "POST",
     operation: "workspace.read",
+    resourceId: (path) => `action:${path.split("/")[3]}`,
   },
 ];
 
+/** The admission an admitted request asks: one operation, one optional object. */
+export interface EnterpriseActionAdmission {
+  operation: string;
+  resourceId: string | null;
+}
+
 /**
- * The one admission operation a request path/method maps to, or null when the
- * route is not one this BFF wired for the enterprise supply.
+ * The explicit operation/resource mapping for one request path/method, or
+ * null when the route is not one this BFF wired for the enterprise supply.
  */
-export function enterpriseOperationFor(path: string, method: string): string | null {
-  if (path === "/api/workspace") return ENTERPRISE_OPERATIONS.workspaceRead;
+export function enterpriseActionFor(
+  path: string,
+  method: string,
+): EnterpriseActionAdmission | null {
+  if (path === "/api/workspace")
+    return { operation: ENTERPRISE_OPERATIONS.workspaceRead, resourceId: null };
   const isRunSurface =
     path === "/api/copilotkit" ||
     path.startsWith("/api/copilotkit/") ||
     path === "/api/agent" ||
     path.startsWith("/api/agent/");
-  if (isRunSurface) return ENTERPRISE_OPERATIONS.copilotkitInvoke;
-  for (const route of CONTENT_ROUTES) if (route.test(path, method)) return route.operation;
+  if (isRunSurface) return { operation: ENTERPRISE_OPERATIONS.copilotkitInvoke, resourceId: null };
+  for (const route of CONTENT_ROUTES)
+    if (route.test(path, method))
+      return { operation: route.operation, resourceId: route.resourceId(path) };
   return null;
 }
 
@@ -294,12 +332,16 @@ export function createOpenbotAuthority(config: Config): OpenbotAuthority {
     authorityOrigin,
     exchange: (input) =>
       post<EnterpriseSessionResponse>("/api/enterprise/mobile/session/exchange", input),
-    admission: (handle, selector, operation) =>
+    admission: (handle, selector, operation, resourceId = null) =>
       post<EnterpriseAdmission>("/api/enterprise/mobile/session/authorize", {
         handle,
         requestId: randomUUID(),
         selectors: { tenantId: selector.tenantId, workspaceId: selector.workspaceId },
         operation,
+        // T07.17: the explicit per-object binding the authority records with
+        // the admission row (interfaces §5.2 optional resourceId). A null
+        // value names a collection-level action, never an object.
+        resourceId,
       }),
   };
 }
@@ -351,8 +393,10 @@ export function enterpriseSessionHandler(authority: OpenbotAuthority) {
 export function enterpriseGuard(_config: Config, authority: OpenbotAuthority): MiddlewareHandler {
   return async (context, next) => {
     const path = context.req.path;
-    const operation = enterpriseOperationFor(path, context.req.method);
-    if (!operation) throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
+    // T07.17: the explicit operation/resource map. An unknown route refuses
+    // here; a wired route asks ONE online admission for ONE object.
+    const action = enterpriseActionFor(path, context.req.method);
+    if (!action) throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
     const authorization = context.req.header("authorization");
     if (!authorization?.startsWith("Bearer ")) throw AppError.fromCode("SESSION_EXPIRED", 401);
     const handle = authorization.slice(7);
@@ -366,13 +410,22 @@ export function enterpriseGuard(_config: Config, authority: OpenbotAuthority): M
       "";
     if (!tenantId || !workspaceId) throw AppError.fromCode("SCOPE_REQUIRED", 400);
     const selector = { tenantId, workspaceId };
-    const admission = await authority.admission(handle, selector, operation);
+    const admission = await authority.admission(
+      handle,
+      selector,
+      action.operation,
+      action.resourceId,
+    );
     // The admitted scope must echo the request's one intent exactly.
     if (
       admission.scope?.tenantId !== selector.tenantId ||
       admission.scope.workspaceId !== selector.workspaceId
     )
       throw AppError.fromCode("SCOPE_SELECTOR_CONFLICT", 400);
+    // An object action must come back bound to THAT object; an admission
+    // that dropped or changed the resource id does not admit this request.
+    if (action.resourceId !== null && admission.resourceId !== action.resourceId)
+      throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
     context.set("enterpriseAdmission", admission);
     // Downstream handlers consume the server-admitted owner namespace, never
     // a client-supplied identity (T07.06: the run surfaces read this value).
@@ -387,6 +440,16 @@ export interface EnterpriseRequestFacts {
   principalId: string;
   userId: string;
   admissionId: string;
+}
+
+/**
+ * T07.17: the Rich Threads client the main-thread route needs, kept structural
+ * so this module never loads the CopilotKit runtime graph at import time
+ * (app.ts hands in its real `CopilotKitIntelligence`; a test hands in a
+ * stand-in with the same method).
+ */
+export interface MainThreadIntelligence {
+  getOrCreateThread(args: { threadId: string; userId: string; agentId: string }): Promise<unknown>;
 }
 
 /** Read the admitted facts the guard put on the request. */
@@ -653,6 +716,7 @@ export function mountEnterpriseRoutes<
   deps: { db: Store; config: Config; authority: OpenbotAuthority } & {
     workspace: WorkspaceService;
     actions: ActionService;
+    intelligence?: MainThreadIntelligence;
   },
 ): void {
   app.post("/api/session", enterpriseSessionHandler(deps.authority));
@@ -700,6 +764,33 @@ export function mountEnterpriseRoutes<
       }),
       201,
     );
+  });
+  // GET /api/main-thread keeps its original response DTO ({threadId,
+  // existing}) and its original Intelligence dependency; the admitted owner
+  // is what the thread is created for, never a client value.
+  app.get("/api/main-thread", async (context) => {
+    if (!deps.intelligence) throw AppError.fromCode("AUTHORITY_UNAVAILABLE", 503);
+    const owner = context.get("owner");
+    await deps.db.insertIfAbsent(owner, "conversation-settings", {
+      id: "main",
+      threadId: randomUUID(),
+      existing: false,
+    });
+    const main = await deps.db.get<{ threadId: string }>(owner, "conversation-settings", "main");
+    if (!main) throw new AppError("Main conversation could not be loaded", 503);
+    try {
+      await deps.intelligence.getOrCreateThread({
+        threadId: main.threadId,
+        userId: owner,
+        agentId: "default",
+      });
+    } catch {
+      throw new AppError(
+        "Main conversation is unavailable. Check the Rich Threads connection and try again.",
+        502,
+      );
+    }
+    return context.json({ threadId: main.threadId, existing: true });
   });
   app.get("/api/conversation", async (context) =>
     context.json(
@@ -766,6 +857,7 @@ export async function createEnterpriseApp(
     authority?: OpenbotAuthority;
     workspace?: WorkspaceService;
     actions?: ActionService;
+    intelligence?: MainThreadIntelligence;
   } = {},
 ): Promise<Hono<{ Variables: { enterpriseAdmission: EnterpriseAdmission; owner: string } }>> {
   if (config.mode === "sample")
@@ -840,6 +932,13 @@ export async function createEnterpriseApp(
   app.get("/api/health", (context) =>
     context.json({ ok: true, mode: config.mode, authMode: "enterprise" }),
   );
-  mountEnterpriseRoutes(app, { db, config, authority, workspace, actions });
+  mountEnterpriseRoutes(app, {
+    db,
+    config,
+    authority,
+    workspace,
+    actions,
+    intelligence: options.intelligence,
+  });
   return app;
 }

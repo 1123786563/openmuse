@@ -47,6 +47,7 @@ interface AdmissionCall {
   operation: string;
   tenantId: string;
   workspaceId: string;
+  resourceId: string | null;
 }
 
 class AuthorityStub {
@@ -134,6 +135,7 @@ class AuthorityStub {
       operation,
       tenantId: selectors.tenantId,
       workspaceId: selectors.workspaceId,
+      resourceId: typeof body.resourceId === "string" ? body.resourceId : null,
     });
     const user = this.handles.get(handle) ?? {
       userId: BFF.user.id,
@@ -161,7 +163,7 @@ class AuthorityStub {
       assurance: null,
       admissionId: randomUUID(),
       operation,
-      resourceId: null,
+      resourceId: typeof body.resourceId === "string" ? body.resourceId : null,
     });
   }
 }
@@ -208,6 +210,7 @@ function mailRow(id: string, subject: string): Mail {
   };
 }
 
+const threadSeeds: { threadId: string; userId: string; agentId: string }[] = [];
 const acmeOwner = `enterprise:${ACME.tenantId}:${ACME.workspaceId}:${BFF.user.principalId}`;
 const globexOwner = `enterprise:${GLOBEX.tenantId}:${GLOBEX.workspaceId}:principal-2`;
 
@@ -240,7 +243,16 @@ async function enterpriseApp(
   };
   // Production wiring: the real OpenBot authority client, pointed at the
   // stub's HTTP server by deployment config — no seam injection.
-  const app = await createEnterpriseApp(db, config);
+  const app = await createEnterpriseApp(db, config, {
+    // The Rich Threads seam app.ts hands its real platform to; the stand-in
+    // proves the thread is created for the ADMITTED owner, not a client value.
+    intelligence: {
+      getOrCreateThread: async (args) => {
+        threadSeeds.push(args);
+        return { threadId: args.threadId };
+      },
+    },
+  });
   return { db, directory, app };
 }
 
@@ -323,6 +335,10 @@ describe("T07.17 mail/calendar/drafts/conversation and approvals consume the con
     // Without a Google connection the thread read refuses (409) — but the
     // namespace check below uses the surfaces that answer from the store.
     expect([200, 409]).toContain(mailThread.status);
+    // The object-level read admission names the thread it reads.
+    const threadAdmission = authority.admissions.at(-1);
+    expect(threadAdmission?.operation).toBe("workspace.read");
+    expect(threadAdmission?.resourceId).toBe("mail-thread:thread-acme-mail");
 
     const drafts = await app.request("/api/drafts", {
       headers: {
@@ -421,6 +437,13 @@ describe("T07.17 mail/calendar/drafts/conversation and approvals consume the con
       body: JSON.stringify({ hash: crossProposal.hash, decision: "approve" }),
     });
     expect(cross.status).toBe(404);
+    // The decide admission names the object it decides AND stays in the
+    // admitted company/team selector; the client cannot name either.
+    const decideAdmission = authority.admissions.at(-1);
+    expect(decideAdmission?.operation).toBe("workspace.read");
+    expect(decideAdmission?.resourceId).toBe(`action:${crossProposal.id}`);
+    expect(decideAdmission?.tenantId).toBe(ACME.tenantId);
+    expect(decideAdmission?.workspaceId).toBe(ACME.workspaceId);
     const decisionsAfterRevoke = (await db.list(acmeOwner, "actions")).filter((row) =>
       ["approved", "executing", "succeeded", "denied"].includes(String(row.status)),
     ).length;
@@ -502,6 +525,32 @@ describe("T07.17 mail/calendar/drafts/conversation and approvals consume the con
     });
     expect(events.status).toBe(200);
     expect(count() - before).toBe(4);
+  }, 60_000);
+
+  test("main_thread_creates_for_the_admitted_owner_only", async () => {
+    const before = threadSeeds.length;
+    const response = await app.request("/api/main-thread", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...SELECTOR_HEADERS(ACME.tenantId, ACME.workspaceId),
+      },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { threadId: string; existing: boolean };
+    expect(body.existing).toBe(true);
+    // The thread is created FOR the server-admitted namespace owner, never a
+    // client-named identity, and the admission names the conversation object.
+    const seed = threadSeeds.at(-1);
+    expect(seed?.userId).toBe(acmeOwner);
+    expect(seed?.agentId).toBe("default");
+    const admission = authority.admissions.at(-1);
+    expect(admission?.resourceId).toBe("conversation:main");
+    expect(threadSeeds.length - before).toBe(1);
+    // The settings row lives in the admitted namespace.
+    const settings = await db.get<{ threadId: string }>(acmeOwner, "conversation-settings", "main");
+    expect(settings?.threadId).toBe(body.threadId);
+    const globexSettings = await db.get(globexOwner, "conversation-settings", "main");
+    expect(globexSettings).toBeNull();
   }, 60_000);
 
   test("unknown_content_route_never_falls_back_to_standalone_owner", async () => {
