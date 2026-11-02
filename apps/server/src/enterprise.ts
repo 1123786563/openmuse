@@ -1,8 +1,23 @@
 import { randomUUID } from "node:crypto";
 import type { Context, MiddlewareHandler } from "hono";
+import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import { cors } from "hono/cors";
+import type {
+  ActionProposal,
+  ActivityEntry,
+  Artifact,
+  BrowserSession,
+  CalendarEvent,
+  Connection,
+  Mail,
+  Workspace,
+} from "../../../packages/domain/src/index.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
+import { GoogleAuth } from "./google-auth.ts";
+import { rateLimit } from "./rate-limit.ts";
 
 /*
  * T07.05 (#595, original task P17; BA interfaces §5.2): the enterprise BFF.
@@ -211,7 +226,7 @@ export function createOpenbotAuthority(config: Config): OpenbotAuthority {
  * standalone credential shape is refused before the authority is called —
  * the enterprise surface has no standalone fallback.
  */
-export function enterpriseSessionHandler(config: Config, authority: OpenbotAuthority) {
+export function enterpriseSessionHandler(authority: OpenbotAuthority) {
   return async (context: Context) => {
     let body: Record<string, unknown>;
     try {
@@ -243,17 +258,11 @@ export function enterpriseSessionHandler(config: Config, authority: OpenbotAutho
 
 /**
  * The enterprise request gate: Bearer handle + explicit selection headers,
- * and ONE online admission for this request before any store or run work. The
+ * and ONE online admission for this request before any store read. The
  * admitted facts ride the request context; the actor is the authority's
- * answer, never the client's body or headers. Routes this BFF has not wired
- * for the enterprise supply are refused — they never fall back to the
- * standalone owner authentication.
- *
- * T07.06 (#596) adds the two run surfaces that keep their own wire contract:
- * `/api/copilotkit/*` (the fixed CopilotKit SDK routes — the runtime then
- * re-admits every new model dispatch and tool action) and `/api/agent*` (the
- * run API the CopilotKit tools and the app drive). The operation for both is
- * the authority's single frozen run operation, `copilotkit.invoke`.
+ * answer, never the client's. Routes this BFF has not wired for the
+ * enterprise supply are refused — they never fall back to the standalone
+ * owner authentication.
  */
 export function enterpriseGuard(config: Config, authority: OpenbotAuthority): MiddlewareHandler {
   return async (context, next) => {
@@ -290,7 +299,6 @@ export function enterpriseGuard(config: Config, authority: OpenbotAuthority): Mi
     )
       throw AppError.fromCode("SCOPE_SELECTOR_CONFLICT", 400);
     context.set("enterpriseAdmission", admission);
-    context.set("enterpriseConfig", config);
     // Downstream handlers consume the server-admitted owner namespace, never
     // a client-supplied identity (T07.06: the run surfaces read this value).
     context.set("owner", enterpriseOwner(selector, admission.actor));
@@ -419,7 +427,7 @@ export async function createEnterpriseActionGate(
       controller.abort();
       throw new EnterpriseStreamRefusal(refusal);
     }
-    // The authority must echo this stream's one intent; anything else ends it.
+    // The authority must echo this stream's one intent; a mismatch ends it.
     if (
       admission.scope?.tenantId !== selector.tenantId ||
       admission.scope.workspaceId !== selector.workspaceId
@@ -463,4 +471,193 @@ export function enterpriseRequestSelection(request: Request): {
   const workspaceId = request.headers.get(ENTERPRISE_SELECTOR_HEADERS.workspace) ?? "";
   if (!tenantId || !workspaceId) return null;
   return { handle: authorization.slice(7), selector: { tenantId, workspaceId } };
+}
+
+/**
+ * The enterprise Workspace projection (BA interfaces §5.2 field table), read
+ * from THIS namespace's scoped store. The batch answer is the ORIGINAL
+ * Workspace contract: mode is fixed live, profile never comes from an
+ * accessKey or the sample/local-user seed, content URLs are the BFF's own
+ * online proxy path (never a public signed storage link), connections expose
+ * public capabilities only, and runtime.provider is openbot with configured
+ * from the actual enterprise execution readiness — this request could only
+ * reach here after an online admission, so the adapter really answered.
+ */
+export async function enterpriseWorkspaceSnapshot(
+  db: Store,
+  config: Config,
+  owner: string,
+  query?: string,
+): Promise<Workspace> {
+  const mail = await db.list<Mail>(owner, "mail");
+  const events = await db.list<CalendarEvent>(owner, "events");
+  const files = await db.list<Artifact>(owner, "files");
+  const browsers = await db.list<BrowserSession>(owner, "browsers");
+  const actions = await db.list<ActionProposal>(owner, "actions");
+  const activity = await db.list<ActivityEntry>(owner, "activity");
+  // The namespace's own connection facts; a token is never returned here.
+  const tokens = config.mode === "live" ? await new GoogleAuth(db, config).tokens(owner) : null;
+  const words = (query ?? "").toLowerCase().trim().split(/\s+/).filter(Boolean);
+  const visibleMail = words.length
+    ? mail.filter((message) =>
+        words.every((word) =>
+          `${message.sender} ${message.subject} ${message.body}`.toLowerCase().includes(word),
+        ),
+      )
+    : mail;
+  const connections: Connection[] = [
+    {
+      id: "google",
+      name: "Google",
+      status: tokens ? "connected" : "disconnected",
+      account: tokens?.account,
+      capabilities: tokens?.scopes ?? [],
+    },
+    {
+      id: "browser",
+      name: "Browser",
+      status: config.workerUrl && config.workerToken ? "connected" : "unconfigured",
+      capabilities: ["Persistent sessions", "PDF downloads"],
+    },
+    {
+      id: "openbot",
+      name: "OpenBot",
+      status: "connected",
+      capabilities: ["Enterprise execution adapter"],
+    },
+  ];
+  return {
+    mode: "live",
+    profile: {
+      // The frozen authority DTOs carry the BA user's ids, not a display name
+      // or email; this neutral live label and the namespace's own bound
+      // account are used, never an accessKey or a sample/local-user seed.
+      name: "You",
+      email: tokens?.account ?? "",
+    },
+    mail: visibleMail.sort((a, b) => b.date.localeCompare(a.date)),
+    events: events.sort((a, b) => a.start.localeCompare(b.start)),
+    // Content URLs are the BFF's own online proxy path; the proxy route
+    // itself belongs to P17's media task (T07.07), so no standalone signed
+    // storage link ever appears here.
+    files: files.map((file) => ({
+      ...file,
+      url: `${config.publicUrl}/api/files/${file.id}/content`,
+    })),
+    // Browser preview/console need the online ticket path (T07.13), not the
+    // standalone signed URLs.
+    browsers: browsers.map((session) => {
+      const { previewUrl: _preview, consoleUrl: _console, ...rest } = session;
+      return rest;
+    }),
+    actions,
+    activity,
+    connections,
+    runtime: {
+      provider: "openbot",
+      configured: true,
+      openbotConfigured: true,
+      // Rich Threads is served by the enterprise execution stream (T07.06).
+      richThreads: true,
+    },
+  };
+}
+
+/**
+ * Mount the enterprise supply on a Hono app: the session exchange (its own
+ * one-time code, never an accessKey), the per-request gate for everything
+ * registered afterwards, and the original-Workspace read. app.ts mounts this
+ * exact function, and the suite drives the same one.
+ */
+export function mountEnterpriseRoutes<
+  Env extends { Variables: { enterpriseAdmission: EnterpriseAdmission } },
+>(app: Hono<Env>, deps: { db: Store; config: Config; authority: OpenbotAuthority }): void {
+  app.post("/api/session", enterpriseSessionHandler(deps.authority));
+  app.use("/api/*", enterpriseGuard(deps.config, deps.authority));
+  app.get("/api/workspace", async (context) => {
+    const facts = enterpriseFacts(context);
+    const owner = enterpriseOwner(facts.selector, { principalId: facts.principalId });
+    return context.json(
+      await enterpriseWorkspaceSnapshot(deps.db, deps.config, owner, context.req.query("q")),
+      200,
+    );
+  });
+}
+
+/**
+ * The refusal an enterprise surface answers with for a controller error, or
+ * null when the error is not one of the frozen taxonomy words. Both the
+ * standalone app's error hook and the enterprise app below use it, so the
+ * wire shape cannot drift between the two.
+ */
+export function enterpriseRefusalOf(error: unknown): {
+  status: 400 | 401 | 403 | 404 | 503;
+  body: MobileBffError;
+} | null {
+  if (!(error instanceof AppError) || !error.code) return null;
+  const status = ENTERPRISE_REFUSAL_STATUS[error.code];
+  if (!status) return null;
+  return {
+    status,
+    body: { error: "Request refused.", code: error.code, requestId: randomUUID() },
+  };
+}
+
+/**
+ * The complete enterprise BFF app: the same deployment transport discipline
+ * as the standalone app (trusted origins, no-store, CORS, body ceiling, rate
+ * limit) around the enterprise supply. app.ts mounts THIS app when the mode
+ * is enterprise, and the suite drives the same one.
+ */
+export function createEnterpriseApp(
+  db: Store,
+  config: Config,
+  options: { authority?: OpenbotAuthority } = {},
+): Hono<{ Variables: { enterpriseAdmission: EnterpriseAdmission } }> {
+  if (config.mode === "sample")
+    throw new Error("The enterprise supply never serves a sample workspace");
+  // The real authority client unless a test injects its seam.
+  const authority = options.authority ?? createOpenbotAuthority(config);
+  const app = new Hono<{ Variables: { enterpriseAdmission: EnterpriseAdmission } }>();
+  const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
+  app.use("*", async (context, next) => {
+    const origin = context.req.header("origin");
+    if (origin && !origins.has(origin))
+      return context.json({ error: "Origin is not allowed" }, 403);
+    context.header("X-Content-Type-Options", "nosniff");
+    context.header("Referrer-Policy", "no-referrer");
+    context.header("Cache-Control", "no-store");
+    await next();
+  });
+  app.use(
+    "*",
+    cors({
+      origin: (origin) => (origins.has(origin) ? origin : undefined),
+      allowHeaders: ["Content-Type", "Authorization"],
+      allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      credentials: true,
+    }),
+  );
+  app.use(
+    "*",
+    bodyLimit({
+      maxSize: 12 * 1024 * 1024,
+      onError: (context) => context.json({ error: "Request is too large" }, 413),
+    }),
+  );
+  app.use("/api/*", rateLimit(Boolean(config.trustProxy)));
+  app.onError((error, context) => {
+    const refusal = enterpriseRefusalOf(error);
+    if (refusal) return context.json(refusal.body, refusal.status);
+    // Provider and document errors are useful, but raw stack traces and
+    // token-bearing responses are not.
+    console.error(`[OpenMuse enterprise] ${error.name}`);
+    return context.json({ error: "Request failed. Check the server setup and try again." }, 502);
+  });
+  // The deployment probe carries no identity or tenant data.
+  app.get("/api/health", (context) =>
+    context.json({ ok: true, mode: config.mode, authMode: "enterprise" }),
+  );
+  mountEnterpriseRoutes(app, { db, config, authority });
+  return app;
 }

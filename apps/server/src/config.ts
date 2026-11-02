@@ -194,19 +194,25 @@ export function readConfig(): Config {
     openbotBffServiceId: process.env.OPENBOT_BFF_SERVICE_ID?.trim() || undefined,
     openbotBffServiceSecret: process.env.OPENBOT_BFF_SERVICE_SECRET?.trim() || undefined,
   };
-  if (
-    mode === "live" &&
-    !config.authMode &&
-    (!config.accessKey || config.accessKey.length < 24 || !config.encryptionKey)
-  )
+  if (mode === "live" && !config.encryptionKey)
     throw new Error(
-      "Live mode requires OPENMUSE_ACCESS_KEY (24+ characters) and TOKEN_ENCRYPTION_KEY (32-byte base64)",
+      "Live mode requires TOKEN_ENCRYPTION_KEY (32-byte base64) for connection secrets",
     );
+  if (mode === "live" && !config.authMode && (!config.accessKey || config.accessKey.length < 24))
+    throw new Error("Live mode requires OPENMUSE_ACCESS_KEY (24+ characters)");
   if (config.authMode === "enterprise") {
     // The enterprise deployment forbids the standalone fallbacks this surface
-    // must never consult: no access key auth, no sample seed.
+    // must never consult: no access key auth, no sample seed, no default origin.
     if (mode !== "live")
       throw new Error("ENTERPRISE_AUTH_MODE=enterprise requires WORKSPACE_MODE=live");
+    if (config.accessKey)
+      throw new Error(
+        "ENTERPRISE_AUTH_MODE=enterprise does not use OPENMUSE_ACCESS_KEY; remove it so no standalone credential is configured",
+      );
+    if (!process.env.PUBLIC_API_URL?.trim())
+      throw new Error(
+        "ENTERPRISE_AUTH_MODE=enterprise requires an explicit PUBLIC_API_URL (the App's API origin)",
+      );
     if (!config.openbotAuthorityOrigin || !config.openbotClientId)
       throw new Error(
         "ENTERPRISE_AUTH_MODE=enterprise requires OPENBOT_AUTHORITY_ORIGIN and OPENBOT_CLIENT_ID",

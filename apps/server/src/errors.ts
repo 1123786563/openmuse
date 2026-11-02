@@ -10,10 +10,7 @@ export class AppError extends Error {
   }
 
   /** Build a refusal from a MobileBffError taxonomy word (T07.05). */
-  static fromCode(
-    code: string,
-    status: 400 | 401 | 403 | 404 | 503,
-  ): AppError {
+  static fromCode(code: string, status: 400 | 401 | 403 | 404 | 503): AppError {
     return new AppError(code, status, code);
   }
 }

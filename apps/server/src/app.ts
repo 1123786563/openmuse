@@ -28,10 +28,10 @@ import {
   ENTERPRISE_REFUSAL_STATUS,
   type EnterpriseActionGate,
   type EnterpriseAdmission,
-  enterpriseFacts,
   enterpriseGuard,
   enterpriseRequestSelection,
   enterpriseSessionHandler,
+  enterpriseWorkspaceSnapshot,
   type OpenbotAuthority,
 } from "./enterprise.ts";
 import { AppError } from "./errors.ts";
@@ -189,7 +189,7 @@ export async function createApp(
   if (enterprise) {
     // Enterprise sign-in is the OpenBot handoff only: no accessKey body, no
     // sample seed, no "local-user" owner is ever created here.
-    app.post("/api/session", enterpriseSessionHandler(config, enterprise.authority));
+    app.post("/api/session", enterpriseSessionHandler(enterprise.authority));
   } else {
     app.post("/api/session", async (c) => {
       if (Date.now() - loginWindow > 60000) {
@@ -241,24 +241,9 @@ export async function createApp(
       // The ORIGINAL Workspace contract, filled from this server's real store
       // scoped to the named company/team/principal namespace. Every request
       // re-admitted above; nothing positive survives to the next one.
-      const facts = enterpriseFacts(c);
-      // The ORIGINAL Workspace contract, read from the admitted principal's
-      // namespace. T07.05 (#595) owns the dedicated enterpriseSnapshot
-      // projection (profile from the bound BA user, per-resource
-      // authorization); this branch carries its checkpoint until that ticket
-      // lands, and fixes only the runtime readiness the contract requires:
-      // enterprise execution answers to OpenBot, never to a sample backend.
-      const snapshot = await workspace.snapshot(c.get("owner"), c.req.query("q"));
-      return c.json({
-        ...snapshot,
-        mode: "live" as const,
-        runtime: {
-          provider: "openbot" as const,
-          configured: agentConfigured(config),
-          openbotConfigured: agentConfigured(config),
-          richThreads: true,
-        },
-      });
+      return c.json(
+        await enterpriseWorkspaceSnapshot(db, config, c.get("owner"), c.req.query("q")),
+      );
     }
     const [snapshot, reachable] = await Promise.all([
       workspace.snapshot(c.get("owner"), c.req.query("q")),
