@@ -59,6 +59,21 @@ export interface Config {
   e2bApiKey?: string;
   allowedOrigins: string[];
   trustProxy?: boolean;
+  /**
+   * T07.05 (#595): the enterprise auth mode. When this is "enterprise" the
+   * deployment keeps this server but its credential half answers to the
+   * OpenBot authority only — accessKey, sample seed and the default
+   * local-user owner are never consulted on the enterprise surface. The mode
+   * is never switched by a request body or header.
+   */
+  authMode?: "enterprise";
+  /** The OpenBot authority origin, from deployment-controlled config only. */
+  openbotAuthorityOrigin?: string;
+  /** The registered mobile client this BFF exchanges codes for. */
+  openbotClientId?: string;
+  /** The registered BFF service credential (id; the secret is never logged). */
+  openbotBffServiceId?: string;
+  openbotBffServiceSecret?: string;
 }
 
 export type ComputerProvider = "docker" | "e2b-desktop";
@@ -169,14 +184,44 @@ export function readConfig(): Config {
     // Only trust X-Forwarded-For/X-Real-IP when the deployment is known to sit
     // behind a proxy that sets them; otherwise a direct caller can spoof them.
     trustProxy: process.env.TRUST_PROXY === "true",
+    // T07.05: the enterprise auth half. ENTERPRISE_AUTH_MODE=enterprise keeps
+    // this server and answers to the OpenBot authority; the explicit
+    // authority/client/service origins below are deployment config, never
+    // request headers, and the mode is not switchable per request.
+    authMode: process.env.ENTERPRISE_AUTH_MODE === "enterprise" ? "enterprise" : undefined,
+    openbotAuthorityOrigin: process.env.OPENBOT_AUTHORITY_ORIGIN?.trim() || undefined,
+    openbotClientId: process.env.OPENBOT_CLIENT_ID?.trim() || undefined,
+    openbotBffServiceId: process.env.OPENBOT_BFF_SERVICE_ID?.trim() || undefined,
+    openbotBffServiceSecret: process.env.OPENBOT_BFF_SERVICE_SECRET?.trim() || undefined,
   };
-  if (
-    mode === "live" &&
-    (!config.accessKey || config.accessKey.length < 24 || !config.encryptionKey)
-  )
+  if (mode === "live" && !config.encryptionKey)
     throw new Error(
-      "Live mode requires OPENMUSE_ACCESS_KEY (24+ characters) and TOKEN_ENCRYPTION_KEY (32-byte base64)",
+      "Live mode requires TOKEN_ENCRYPTION_KEY (32-byte base64) for connection secrets",
     );
+  if (mode === "live" && !config.authMode && (!config.accessKey || config.accessKey.length < 24))
+    throw new Error("Live mode requires OPENMUSE_ACCESS_KEY (24+ characters)");
+  if (config.authMode === "enterprise") {
+    // The enterprise deployment forbids the standalone fallbacks this surface
+    // must never consult: no access key auth, no sample seed, no default origin.
+    if (mode !== "live")
+      throw new Error("ENTERPRISE_AUTH_MODE=enterprise requires WORKSPACE_MODE=live");
+    if (config.accessKey)
+      throw new Error(
+        "ENTERPRISE_AUTH_MODE=enterprise does not use OPENMUSE_ACCESS_KEY; remove it so no standalone credential is configured",
+      );
+    if (!process.env.PUBLIC_API_URL?.trim())
+      throw new Error(
+        "ENTERPRISE_AUTH_MODE=enterprise requires an explicit PUBLIC_API_URL (the App's API origin)",
+      );
+    if (!config.openbotAuthorityOrigin || !config.openbotClientId)
+      throw new Error(
+        "ENTERPRISE_AUTH_MODE=enterprise requires OPENBOT_AUTHORITY_ORIGIN and OPENBOT_CLIENT_ID",
+      );
+    if (!config.openbotBffServiceId || !config.openbotBffServiceSecret)
+      throw new Error(
+        "ENTERPRISE_AUTH_MODE=enterprise requires OPENBOT_BFF_SERVICE_ID and OPENBOT_BFF_SERVICE_SECRET",
+      );
+  }
   if (mode === "sample" && !["127.0.0.1", "localhost", "::1"].includes(config.host))
     throw new Error("Sample workspace is local-only. HOST must be a loopback address.");
   return config;

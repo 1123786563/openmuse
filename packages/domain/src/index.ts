@@ -198,6 +198,127 @@ export interface Workspace {
   };
 }
 
+/**
+ * T07.05 (#595): the runtime half of the ORIGINAL Workspace contract as a
+ * zod schema, so the enterprise BFF's /api/workspace answers are provable
+ * against the same contract the app consumes. parseWorkspace(body) checks the
+ * full Workspace shape; the OpenBot /api/mobile/workspace response is a
+ * different contract and must never parse with it.
+ */
+export const workspaceRuntimeSchema = z.object({
+  provider: z.enum(["sample", "model", "openbot"]),
+  configured: z.boolean(),
+  openbotConfigured: z.boolean(),
+  richThreads: z.boolean().optional(),
+});
+const mailSchema = z.object({
+  id: z.string(),
+  threadId: z.string(),
+  from: z.string(),
+  sender: z.string(),
+  to: z.array(z.string()),
+  subject: z.string(),
+  body: z.string(),
+  date: z.string(),
+  unread: z.boolean(),
+  label: z.string(),
+  attachments: z.array(z.string()),
+});
+const calendarEventSchema = z.object({
+  id: z.string(),
+  calendarId: z.string(),
+  title: z.string(),
+  start: z.string(),
+  end: z.string(),
+  allDay: z.boolean(),
+  timeZone: z.string(),
+  location: z.string(),
+  description: z.string(),
+  attendees: z.array(z.string()),
+});
+const artifactSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  mimeType: z.string(),
+  size: z.number(),
+  pageCount: z.number(),
+  url: z.string(),
+  createdAt: z.string(),
+  source: z.string(),
+  parentId: z.string().optional(),
+  fields: z
+    .array(
+      z.object({
+        name: z.string(),
+        value: z.string(),
+        type: z.enum(["text", "checkbox", "unsupported"]),
+      }),
+    )
+    .optional(),
+});
+const browserSessionSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  url: z.string(),
+  status: z.enum(["idle", "active", "closed", "error"]),
+  updatedAt: z.string(),
+  previewUrl: z.string().optional(),
+  consoleUrl: z.string().optional(),
+});
+const actionProposalSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  kind: z.enum(["email.send", "calendar.create", "calendar.update", "calendar.delete"]),
+  data: z.record(z.string(), z.unknown()),
+  status: z.enum([
+    "awaiting_review",
+    "executing",
+    "succeeded",
+    "failed",
+    "outcome_unknown",
+    "denied",
+    "cancelled",
+    "expired",
+  ]),
+  hash: z.string(),
+  createdAt: z.string(),
+  expiresAt: z.string(),
+  target: calendarEventSchema.optional(),
+  targetVersion: z.string().optional(),
+  taskId: z.string().optional(),
+  account: z.string().optional(),
+  connectionId: z.string().optional(),
+  result: z.string().optional(),
+  error: z.string().optional(),
+});
+const activityEntrySchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  detail: z.string(),
+  date: z.string(),
+  status: z.string(),
+  actionId: z.string().optional(),
+});
+const connectionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  status: z.enum(["connected", "disconnected", "sample", "unconfigured", "unavailable"]),
+  account: z.string().optional(),
+  capabilities: z.array(z.string()),
+});
+export const workspaceSchema = z.object({
+  mode: z.enum(["sample", "live"]),
+  profile: z.object({ name: z.string(), email: z.string() }),
+  mail: z.array(mailSchema),
+  events: z.array(calendarEventSchema),
+  files: z.array(artifactSchema),
+  browsers: z.array(browserSessionSchema),
+  actions: z.array(actionProposalSchema),
+  activity: z.array(activityEntrySchema),
+  connections: z.array(connectionSchema),
+  runtime: workspaceRuntimeSchema,
+});
+
 /** Provider-independent boundary: OpenBot/AG-UI runs never dictate presentation. */
 export interface ExecutionBackend {
   readonly kind: "standalone" | "openbot";
