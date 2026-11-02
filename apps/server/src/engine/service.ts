@@ -28,6 +28,7 @@ import type { BrowserService } from "../browser.ts";
 import { ComputerService } from "../computer.ts";
 import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
+import type { EnterpriseActionGate, EnterpriseRunContext } from "../enterprise.ts";
 import { AppError } from "../errors.ts";
 import type { Files } from "../files.ts";
 import { backgroundFailure } from "../log.ts";
@@ -49,6 +50,38 @@ const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 type MonitorPage = { id: string; hash?: string; timelessHash?: string; lines: string[] };
 const date = () => new Date().toISOString();
 const terminal = new Set(["succeeded", "failed", "cancelled"]);
+
+/**
+ * T07.06 (#596): the run admission registry.
+ *
+ * A CopilotKit stream is admitted once at its HTTP gate, but the authority's
+ * decision is only good for the one action it was asked about. The stream's
+ * gate is registered here under the admitted owner namespace, and every tool
+ * action the run performs (through the scoped execution adapters this app
+ * hands the AgentService) asks the gate again before it touches a store. A
+ * refusal aborts the stream and no later action starts. Standalone deployments
+ * have no registry and stay unchanged.
+ */
+export class EnterpriseRunAdmissions {
+  private readonly gates = new Map<string, EnterpriseActionGate>();
+  register(gate: EnterpriseActionGate): void {
+    this.gates.set(gate.context.owner, gate);
+  }
+  release(owner: string): void {
+    this.gates.delete(owner);
+  }
+  contextFor(owner: string): EnterpriseRunContext | undefined {
+    return this.gates.get(owner)?.context;
+  }
+  /** One online admission for THIS action; throws the stream refusal on failure. */
+  async admit(owner: string, action: "model" | "tool", name?: string): Promise<void> {
+    const gate = this.gates.get(owner);
+    if (!gate) return;
+    if (action === "model") await gate.authorizeModel();
+    else await gate.authorizeTool(name ?? "action");
+  }
+}
+
 export class AgentService {
   readonly worker: TaskWorker;
   readonly search: SearchService;
@@ -62,11 +95,37 @@ export class AgentService {
     readonly actions: ActionService,
     readonly browser: BrowserService,
     readonly computer: ComputerService = new ComputerService(db, config),
+    /** T07.06: the enterprise run admissions, absent in standalone deployments. */
+    readonly admissions?: EnterpriseRunAdmissions,
   ) {
     this.search = new SearchService(db);
-    this.worker = new TaskWorker(db, (owner, task, context) => this.execute(owner, task, context), {
-      settled: (owner, task) => this.publishOutcome(owner, task),
-    });
+    this.worker = new TaskWorker(
+      db,
+      (owner, task, context) => this.execute(owner, task, this.admittedRun(owner, context)),
+      { settled: (owner, task) => this.publishOutcome(owner, task) },
+    );
+  }
+  /** Register one admitted CopilotKit stream so its tool actions can re-verify. */
+  enterpriseStreamStarted(gate: EnterpriseActionGate): void {
+    this.admissions?.register(gate);
+  }
+  enterpriseStreamEnded(owner: string): void {
+    this.admissions?.release(owner);
+  }
+  /**
+   * T07.06: a delegated run's every checkpoint re-verifies online through the
+   * stream gate it belongs to. The lease guard stays first (losing the lease
+   * ends the run regardless), then the authority decides about this action.
+   */
+  private admittedRun(owner: string, context: TaskContext): TaskContext {
+    if (!this.admissions) return context;
+    return {
+      ...context,
+      guard: async () => {
+        await context.guard();
+        await this.admissions?.admit(owner, "tool", "run.checkpoint");
+      },
+    };
   }
   start() {
     this.worker.start();
@@ -190,6 +249,8 @@ export class AgentService {
     };
   }
   async createTask(owner: string, raw: unknown, idempotencyKey?: string, held = false) {
+    // T07.06: a new run is a new sensitive action — admitted online first.
+    await this.admissions?.admit(owner, "tool", "task.create");
     const input = createTaskSchema.parse(raw);
     const id = idempotencyKey ? hash(`task:${idempotencyKey}`) : randomUUID();
     const existing = await this.db.get<AgentTask>(owner, "tasks", id);
@@ -245,6 +306,8 @@ export class AgentService {
     return (await this.db.get<AgentTask>(owner, "tasks", id)) ?? task;
   }
   async control(owner: string, id: string, action: "pause" | "resume" | "cancel" | "retry") {
+    // T07.06: run control is a sensitive action on an existing run.
+    await this.admissions?.admit(owner, "tool", `task.${action}`);
     const task = await this.getTask(owner, id);
     if (action === "cancel" && task.status === "succeeded")
       throw new AppError("This task is already complete", 409);
@@ -796,6 +859,9 @@ export class AgentService {
     task: AgentTask,
     context: TaskContext,
   ): Promise<Partial<AgentTask>> {
+    // T07.06: the run's first model dispatch is admitted online, then every
+    // later model/tool checkpoint re-verifies through the wrapped guard.
+    await this.admissions?.admit(owner, "model", "run.start");
     await context.event(
       "status",
       task.attempts === 1 ? "Started working" : "Resumed work",

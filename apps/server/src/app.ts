@@ -20,10 +20,18 @@ import { computerRoutes } from "./computer-routes.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
-import { AgentService } from "./engine/service.ts";
+import { AgentService, EnterpriseRunAdmissions } from "./engine/service.ts";
 import {
-  createEnterpriseApp,
+  createEnterpriseActionGate,
   createOpenbotAuthority,
+  ENTERPRISE_OPERATIONS,
+  ENTERPRISE_REFUSAL_STATUS,
+  type EnterpriseActionGate,
+  type EnterpriseAdmission,
+  enterpriseGuard,
+  enterpriseRequestSelection,
+  enterpriseSessionHandler,
+  enterpriseWorkspaceSnapshot,
   type OpenbotAuthority,
 } from "./enterprise.ts";
 import { AppError } from "./errors.ts";
@@ -38,6 +46,14 @@ export async function createApp(
   options: { docker?: DockerRunner; authority?: OpenbotAuthority } = {},
 ) {
   assertApiDeploymentConfig(config);
+  // T07.05 (#595): the enterprise supply keeps every service below but
+  // replaces the standalone credential half. The authority is injected by
+  // tests and built from deployment config in production; nothing else in
+  // this app can switch the mode per request.
+  const enterprise =
+    config.authMode === "enterprise"
+      ? { authority: options.authority ?? createOpenbotAuthority(config) }
+      : null;
   const auth = await createAuth(db, config),
     files = new Files(db, config, auth),
     google = new GoogleAuth(db, config),
@@ -51,26 +67,55 @@ export async function createApp(
   });
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
-  const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
+  // T07.06 (#596): enterprise runs admit every new tool action online. The
+  // agent gets execution adapters that ask the stream's gate before a scoped
+  // store or sandbox call runs; standalone deployments keep the raw services.
+  const admissions = enterprise ? new EnterpriseRunAdmissions() : undefined;
+  const scoped = <T extends object>(service: T, label: string, methods: readonly string[]): T =>
+    admissions ? scopedExecution(service, admissions, label, methods) : service;
+  const agent = new AgentService(
+    db,
+    config,
+    scoped(workspace, "workspace", SCOPED_WORKSPACE_METHODS),
+    scoped(files, "files", SCOPED_FILES_METHODS),
+    actions,
+    browser,
+    scoped(computer, "computer", SCOPED_COMPUTER_METHODS),
+    admissions,
+  );
   const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
-  const runtime = makeRuntime(config, agent, auth, intelligence);
-  // T07.05 (#595): an enterprise deployment keeps every service above but
-  // serves the enterprise supply only — no accessKey session, no sample seed,
-  // no "local-user" owner route is mounted at all. The authority is injected
-  // by tests and built from deployment config in production.
-  if (config.authMode === "enterprise") {
-    const authority = options.authority ?? createOpenbotAuthority(config);
-    return {
-      app: createEnterpriseApp(db, config, { authority }),
-      auth,
-      files,
-      actions,
-      workspace,
-      agent,
-      computer,
-    };
-  }
-  const app = new Hono<{ Variables: { owner: string } }>();
+  // One gate per request: the runtime's agents factory and its identifyUser
+  // callback both read it, and both must see the same admitted context.
+  const gates = new WeakMap<Request, Promise<EnterpriseActionGate>>();
+  const runtime = makeRuntime(
+    config,
+    agent,
+    auth,
+    intelligence,
+    enterprise
+      ? {
+          gateFor: (request) => {
+            const existing = gates.get(request);
+            if (existing) return existing;
+            const selection = enterpriseRequestSelection(request);
+            const gate = selection
+              ? createEnterpriseActionGate(
+                  enterprise.authority,
+                  selection.handle,
+                  selection.selector,
+                )
+              : (Promise.reject(
+                  AppError.fromCode("SESSION_EXPIRED", 401),
+                ) as Promise<EnterpriseActionGate>);
+            gates.set(request, gate);
+            return gate;
+          },
+        }
+      : undefined,
+  );
+  const app = new Hono<{
+    Variables: { owner: string; enterpriseAdmission: EnterpriseAdmission };
+  }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
   app.use("*", async (c, next) => {
     const origin = c.req.header("origin");
@@ -84,7 +129,14 @@ export async function createApp(
     "*",
     cors({
       origin: (origin) => (origins.has(origin) ? origin : undefined),
-      allowHeaders: ["Content-Type", "Authorization"],
+      allowHeaders: [
+        "Content-Type",
+        "Authorization",
+        // T07.06 (#596): the enterprise supply names its company/team intent
+        // in these two headers on every run request.
+        "x-openbot-tenant",
+        "x-openbot-workspace",
+      ],
       allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       credentials: true,
     }),
@@ -98,6 +150,14 @@ export async function createApp(
   );
   app.use("/api/*", rateLimit(Boolean(config.trustProxy)));
   app.onError((error, c) => {
+    // The enterprise supply answers every refusal with the frozen
+    // MobileBffError shape; the standalone DTO stays untouched below.
+    const refusalCode = error instanceof AppError ? error.code : undefined;
+    if (enterprise && refusalCode && Object.hasOwn(ENTERPRISE_REFUSAL_STATUS, refusalCode))
+      return c.json(
+        { error: "Request refused.", code: refusalCode, requestId: randomUUID() },
+        ENTERPRISE_REFUSAL_STATUS[refusalCode],
+      );
     if (error instanceof z.ZodError)
       return c.json({ error: error.issues.map((i) => i.message).join("; ") }, 422);
     if (error instanceof AppError) return c.json({ error: error.message }, error.status);
@@ -126,20 +186,26 @@ export async function createApp(
   );
   let loginWindow = 0,
     loginAttempts = 0;
-  app.post("/api/session", async (c) => {
-    if (Date.now() - loginWindow > 60000) {
-      loginWindow = Date.now();
-      loginAttempts = 0;
-    }
-    if (++loginAttempts > 30)
-      throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
-    const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
-    const session = await auth.session(body.accessKey);
-    await workspace.ensureSample("local-user", actions);
-    await agent.ensure("local-user");
-    if (config.mode === "sample") await agent.refreshIdeas("local-user");
-    return c.json(session);
-  });
+  if (enterprise) {
+    // Enterprise sign-in is the OpenBot handoff only: no accessKey body, no
+    // sample seed, no "local-user" owner is ever created here.
+    app.post("/api/session", enterpriseSessionHandler(enterprise.authority));
+  } else {
+    app.post("/api/session", async (c) => {
+      if (Date.now() - loginWindow > 60000) {
+        loginWindow = Date.now();
+        loginAttempts = 0;
+      }
+      if (++loginAttempts > 30)
+        throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
+      const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
+      const session = await auth.session(body.accessKey);
+      await workspace.ensureSample("local-user", actions);
+      await agent.ensure("local-user");
+      if (config.mode === "sample") await agent.refreshIdeas("local-user");
+      return c.json(session);
+    });
+  }
   app.get("/api/google/callback", async (c) => {
     if (c.req.query("error"))
       return c.html("<h1>Google connection cancelled</h1><p>You can return to OpenMuse.</p>", 400);
@@ -152,6 +218,13 @@ export async function createApp(
     );
   });
   app.use("/api/*", async (c, next) => {
+    // T07.05 (#595): enterprise requests admit online, per request, and never
+    // fall back to a standalone owner. Routes this task has not wired for the
+    // enterprise supply are refused by the guard, not passed through.
+    if (enterprise) {
+      const guard = enterpriseGuard(config, enterprise.authority);
+      return guard(c, next);
+    }
     const signedRoute =
       /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
         c.req.path,
@@ -164,6 +237,14 @@ export async function createApp(
     await next();
   });
   app.get("/api/workspace", async (c) => {
+    if (enterprise) {
+      // The ORIGINAL Workspace contract, filled from this server's real store
+      // scoped to the named company/team/principal namespace. Every request
+      // re-admitted above; nothing positive survives to the next one.
+      return c.json(
+        await enterpriseWorkspaceSnapshot(db, config, c.get("owner"), c.req.query("q")),
+      );
+    }
     const [snapshot, reachable] = await Promise.all([
       workspace.snapshot(c.get("owner"), c.req.query("q")),
       browser.reachable(),
@@ -177,7 +258,7 @@ export async function createApp(
     );
     return c.json(snapshot);
   });
-  app.route("/api/agent", agentRoutes(agent));
+  app.route("/api/agent", agentRoutes(agent, { enterprise: Boolean(enterprise) }));
   app.route("/api/computer", computerRoutes(computer, files));
   app.get("/api/calendars", async (c) => c.json(await workspace.calendars(c.get("owner"))));
   app.get("/api/calendar/events", async (c) => {
@@ -373,3 +454,64 @@ export async function createApp(
   );
   return { app, auth, files, actions, workspace, agent, computer };
 }
+
+/**
+ * T07.06 (#596): the scoped execution adapter.
+ *
+ * Every NEW tool action a CopilotKit run performs through these services asks
+ * the run's gate for one online `copilotkit.invoke` admission immediately
+ * before the call. The list names the async, owner-scoped methods the chat
+ * tools reach; everything else (synchronous accessors, internal helpers) is
+ * passed through untouched, so the wrapper cannot change a method's shape.
+ */
+export function scopedExecution<T extends object>(
+  service: T,
+  admissions: EnterpriseRunAdmissions,
+  label: string,
+  methods: readonly string[],
+): T {
+  const scoped = new Set(methods);
+  return new Proxy(service, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof property !== "string" || !scoped.has(property) || typeof value !== "function")
+        return value;
+      return (...args: unknown[]) => {
+        const owner = args[0];
+        if (typeof owner !== "string") return value.apply(target, args);
+        return admissions
+          .admit(owner, "tool", `${label}.${property}`)
+          .then(() => value.apply(target, args));
+      };
+    },
+  });
+}
+
+/** The workspace reads the chat tools perform (all async, owner-first). */
+export const SCOPED_WORKSPACE_METHODS = [
+  "connection",
+  "connected",
+  "calendars",
+  "events",
+  "eventsPage",
+  "thread",
+  "searchMail",
+  "snapshot",
+  "sectionSnapshot",
+  "importAttachment",
+] as const;
+
+/** File reads and imports a chat tool can trigger. */
+export const SCOPED_FILES_METHODS = ["list", "get", "bytes", "import"] as const;
+
+/** The sandbox actions a chat tool can trigger (synchronous helpers stay as they are). */
+export const SCOPED_COMPUTER_METHODS = [
+  "execute",
+  "snapshot",
+  "start",
+  "stop",
+  "desktopAction",
+  "latestScreenshot",
+  "writePdf",
+  "pdfBytes",
+] as const;

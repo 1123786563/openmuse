@@ -139,6 +139,14 @@ export interface MobileBffError {
 /** The operations this task wires; unknown routes never fall back to standalone auth. */
 export const ENTERPRISE_OPERATIONS = {
   workspaceRead: "workspace.read",
+  /**
+   * T07.06 (#596): the CopilotKit stream and the run surface it drives. The
+   * authority's frozen admissible list (T05.13 / OpenBot
+   * `MOBILE_ADMISSIBLE_OPERATIONS`) names this one operation for the whole
+   * run: every new model dispatch and every new tool action asks again, with a
+   * fresh requestId, and nothing positive is cached between them.
+   */
+  copilotkitInvoke: "copilotkit.invoke",
 } as const;
 
 const SELECTOR_HEADER_TENANT = "x-openbot-tenant";
@@ -256,24 +264,33 @@ export function enterpriseSessionHandler(authority: OpenbotAuthority) {
  * enterprise supply are refused — they never fall back to the standalone
  * owner authentication.
  */
-export function enterpriseGuard(
-  authority: OpenbotAuthority,
-): MiddlewareHandler<{ Variables: { enterpriseAdmission: EnterpriseAdmission } }> {
+export function enterpriseGuard(config: Config, authority: OpenbotAuthority): MiddlewareHandler {
   return async (context, next) => {
-    if (context.req.path !== "/api/workspace") throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
+    const path = context.req.path;
+    const isWorkspace = path === "/api/workspace";
+    const isRunSurface =
+      path === "/api/copilotkit" ||
+      path.startsWith("/api/copilotkit/") ||
+      path === "/api/agent" ||
+      path.startsWith("/api/agent/");
+    if (!isWorkspace && !isRunSurface) throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
     const authorization = context.req.header("authorization");
     if (!authorization?.startsWith("Bearer ")) throw AppError.fromCode("SESSION_EXPIRED", 401);
     const handle = authorization.slice(7);
-    // The selection is an explicit header (interfaces §5.2): the batch read
-    // names the company/team it intends to read, and the authority decides.
-    const tenantId = context.req.header(SELECTOR_HEADER_TENANT) ?? "";
-    const workspaceId = context.req.header(SELECTOR_HEADER_WORKSPACE) ?? "";
+    const tenantId =
+      context.req.header(SELECTOR_HEADER_TENANT) ??
+      new URL(context.req.url).searchParams.get("tenantId") ??
+      "";
+    const workspaceId =
+      context.req.header(SELECTOR_HEADER_WORKSPACE) ??
+      new URL(context.req.url).searchParams.get("workspaceId") ??
+      "";
     if (!tenantId || !workspaceId) throw AppError.fromCode("SCOPE_REQUIRED", 400);
     const selector = { tenantId, workspaceId };
     const admission = await authority.admission(
       handle,
       selector,
-      ENTERPRISE_OPERATIONS.workspaceRead,
+      isWorkspace ? ENTERPRISE_OPERATIONS.workspaceRead : ENTERPRISE_OPERATIONS.copilotkitInvoke,
     );
     // The admitted scope must echo the request's one intent exactly.
     if (
@@ -282,6 +299,9 @@ export function enterpriseGuard(
     )
       throw AppError.fromCode("SCOPE_SELECTOR_CONFLICT", 400);
     context.set("enterpriseAdmission", admission);
+    // Downstream handlers consume the server-admitted owner namespace, never
+    // a client-supplied identity (T07.06: the run surfaces read this value).
+    context.set("owner", enterpriseOwner(selector, admission.actor));
     await next();
   };
 }
@@ -295,10 +315,9 @@ export interface EnterpriseRequestFacts {
 }
 
 /** Read the admitted facts the guard put on the request. */
-export function enterpriseFacts<
-  Env extends { Variables: { enterpriseAdmission: EnterpriseAdmission } },
->(context: Context<Env>): EnterpriseRequestFacts {
-  const admission = context.get("enterpriseAdmission");
+export function enterpriseFacts(context: Context): EnterpriseRequestFacts {
+  const admission = context.get("enterpriseAdmission") as EnterpriseAdmission | undefined;
+  if (!admission) throw AppError.fromCode("AUTHORITY_UNAVAILABLE", 503);
   return {
     selector: {
       tenantId: admission.scope?.tenantId ?? "",
@@ -308,6 +327,150 @@ export function enterpriseFacts<
     userId: admission.actor.userId,
     admissionId: admission.admissionId,
   };
+}
+
+/**
+ * T07.06 (#596): the SERVER-FIXED run context.
+ *
+ * One CopilotKit stream answers to exactly one actor, Run, company/team scope
+ * and payer, all derived from the authority's admission answer — never from
+ * the request body, the AG-UI `context` entries or `forwardedProps`. The
+ * runtime adapter hands this value to the agent and to the scoped execution
+ * adapters (tool actions); the client's own claims never reach either.
+ */
+export interface EnterpriseRunContext {
+  /** The record-owner namespace every scoped store call uses. */
+  readonly owner: string;
+  readonly userId: string;
+  readonly principalId: string;
+  readonly tenantId: string;
+  readonly workspaceId: string;
+  /** The server-fixed payer reference: the admitted company, never a body value. */
+  readonly payer: string;
+  /** One server-minted id per stream; never carried over between requests. */
+  readonly runId: string;
+}
+
+/** Derive the frozen run context from ONE admitted answer. */
+export function enterpriseRunContext(
+  admission: EnterpriseAdmission,
+  selector: EnterpriseScopeSelector,
+  runId: string,
+): EnterpriseRunContext {
+  if (!admission.scope || admission.actor.principalId === null)
+    throw AppError.fromCode("COMPANY_REAUTH_REQUIRED", 403);
+  return Object.freeze({
+    owner: enterpriseOwner(selector, admission.actor),
+    userId: admission.actor.userId,
+    principalId: admission.actor.principalId,
+    tenantId: selector.tenantId,
+    workspaceId: selector.workspaceId,
+    // T07.01: the payer is the admitted company's reference. The client body
+    // (AG-UI context/forwardedProps) never names it.
+    payer: `company:${selector.tenantId}`,
+    runId,
+  });
+}
+
+/** The one controlled error payload a refused bridge answers with. */
+export function mobileBffError(code: string, requestId: string = randomUUID()): MobileBffError {
+  return { error: "Request refused.", code, requestId };
+}
+
+/** A stream refusal: the code travels to the SSE error event, not a stack. */
+export class EnterpriseStreamRefusal extends Error {
+  constructor(readonly code: string) {
+    super(`enterprise stream refused: ${code}`);
+    this.name = "EnterpriseStreamRefusal";
+  }
+}
+
+/**
+ * ONE stream's live admission. Every new model dispatch and every new tool
+ * action awaits `authorize*` immediately before it happens: a fresh online
+ * admission, one per action, no positive result carried to the next action.
+ * A refusal aborts the stream so later actions cannot start, and carries the
+ * MobileBffError code the terminated stream reports.
+ */
+export interface EnterpriseActionGate {
+  readonly context: EnterpriseRunContext;
+  /** Aborted exactly when an action was refused; the runtime stops on it. */
+  readonly canceled: AbortSignal;
+  /** The code of the refusal that canceled the stream, when there was one. */
+  refusalCode(): string | null;
+  authorizeModel(): Promise<void>;
+  authorizeTool(name: string): Promise<void>;
+}
+
+/**
+ * Build one stream gate. The first model dispatch is authorized through the
+ * admission this factory performs; every later model/tool action asks again.
+ */
+export async function createEnterpriseActionGate(
+  authority: OpenbotAuthority,
+  handle: string,
+  selector: EnterpriseScopeSelector,
+  runId: string = randomUUID(),
+): Promise<EnterpriseActionGate> {
+  const controller = new AbortController();
+  let refusal: string | null = null;
+  const admit = async (): Promise<EnterpriseAdmission> => {
+    let admission: EnterpriseAdmission;
+    try {
+      admission = await authority.admission(
+        handle,
+        selector,
+        ENTERPRISE_OPERATIONS.copilotkitInvoke,
+      );
+    } catch (error) {
+      refusal = error instanceof AppError && error.code ? error.code : "AUTHORITY_UNAVAILABLE";
+      controller.abort();
+      throw new EnterpriseStreamRefusal(refusal);
+    }
+    // The authority must echo this stream's one intent; a mismatch ends it.
+    if (
+      admission.scope?.tenantId !== selector.tenantId ||
+      admission.scope.workspaceId !== selector.workspaceId
+    ) {
+      refusal = "SCOPE_SELECTOR_CONFLICT";
+      controller.abort();
+      throw new EnterpriseStreamRefusal(refusal);
+    }
+    return admission;
+  };
+  const first = await admit();
+  if (controller.signal.aborted) throw new EnterpriseStreamRefusal(refusal ?? "SESSION_REVOKED");
+  const context = enterpriseRunContext(first, selector, runId);
+  return {
+    context,
+    canceled: controller.signal,
+    refusalCode: () => refusal,
+    authorizeModel: async () => void (await admit()),
+    authorizeTool: async () => void (await admit()),
+  };
+}
+
+/** The two explicit selection headers, exported once for the runtime adapter. */
+export const ENTERPRISE_SELECTOR_HEADERS = {
+  tenant: SELECTOR_HEADER_TENANT,
+  workspace: SELECTOR_HEADER_WORKSPACE,
+} as const;
+
+/**
+ * Derive the handle and selector a CopilotKit request carries. This is
+ * deployment-defined wire input (Bearer handle + the two explicit selection
+ * headers), never the AG-UI body.
+ */
+export function enterpriseRequestSelection(request: Request): {
+  handle: string;
+  selector: EnterpriseScopeSelector;
+} | null {
+  const authorization = request.headers.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return null;
+  const tenantId = request.headers.get(ENTERPRISE_SELECTOR_HEADERS.tenant) ?? "";
+  const workspaceId = request.headers.get(ENTERPRISE_SELECTOR_HEADERS.workspace) ?? "";
+  if (!tenantId || !workspaceId) return null;
+  return { handle: authorization.slice(7), selector: { tenantId, workspaceId } };
 }
 
 /**
@@ -394,9 +557,8 @@ export async function enterpriseWorkspaceSnapshot(
       provider: "openbot",
       configured: true,
       openbotConfigured: true,
-      // Rich Threads needs the enterprise execution stream (T07.06); do not
-      // claim it before that adapter really serves it.
-      richThreads: false,
+      // Rich Threads is served by the enterprise execution stream (T07.06).
+      richThreads: true,
     },
   };
 }
@@ -411,7 +573,7 @@ export function mountEnterpriseRoutes<
   Env extends { Variables: { enterpriseAdmission: EnterpriseAdmission } },
 >(app: Hono<Env>, deps: { db: Store; config: Config; authority: OpenbotAuthority }): void {
   app.post("/api/session", enterpriseSessionHandler(deps.authority));
-  app.use("/api/*", enterpriseGuard(deps.authority));
+  app.use("/api/*", enterpriseGuard(deps.config, deps.authority));
   app.get("/api/workspace", async (context) => {
     const facts = enterpriseFacts(context);
     const owner = enterpriseOwner(facts.selector, { principalId: facts.principalId });
