@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { z } from "zod";
 import type {
   AgentIdentity,
@@ -26,23 +26,40 @@ const goalPatchSchema = z.object({
     .optional(),
 });
 
-export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: string } }> {
+export function agentRoutes(
+  service: AgentService,
+  options: { enterprise?: boolean } = {},
+): Hono<{ Variables: { owner: string } }> {
   const app = new Hono<{ Variables: { owner: string } }>();
-  app.get("/", async (c) => c.json(await service.snapshot(c.get("owner"))));
+  /**
+   * T07.06 (#596): an enterprise app's run routes consume only the owner the
+   * admission gate put on the request. The request's own online admission
+   * (the enterprise guard, per action) is what authorized this call; a route
+   * reached with a standalone session in an enterprise app is refused rather
+   * than silently reading a "local-user" namespace.
+   */
+  const runOwner = (c: Context) => {
+    const owner = c.get("owner");
+    if (typeof owner !== "string" || !owner) throw new AppError("Sign in to OpenMuse", 401);
+    if (options.enterprise && !owner.startsWith("enterprise:"))
+      throw new AppError("Enterprise session required", 401);
+    return owner;
+  };
+  app.get("/", async (c) => c.json(await service.snapshot(runOwner(c))));
   app.post("/tasks", async (c) => {
     const { requestId, ...input } = createTaskSchema
       .extend({ requestId: z.string().min(1).max(200).optional() })
       .parse(await c.req.json());
-    return c.json(await service.createTask(c.get("owner"), input, requestId), 201);
+    return c.json(await service.createTask(runOwner(c), input, requestId), 201);
   });
   app.get("/tasks/:id", async (c) =>
-    c.json(await service.detail(c.get("owner"), c.req.param("id"))),
+    c.json(await service.detail(runOwner(c), c.req.param("id"))),
   );
   app.post("/tasks/:id/control", async (c) => {
     const { action } = z
       .object({ action: z.enum(["pause", "resume", "cancel", "retry"]) })
       .parse(await c.req.json());
-    return c.json(await service.control(c.get("owner"), c.req.param("id"), action));
+    return c.json(await service.control(runOwner(c), c.req.param("id"), action));
   });
   app.post("/tasks/:id/input", async (c) => {
     const body = z
@@ -54,21 +71,21 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
       })
       .parse(await c.req.json());
     return c.json(
-      await service.answer(c.get("owner"), c.req.param("id"), body.answer, body.fields),
+      await service.answer(runOwner(c), c.req.param("id"), body.answer, body.fields),
     );
   });
   app.post("/goals", async (c) =>
-    c.json(await service.createGoal(c.get("owner"), await c.req.json()), 201),
+    c.json(await service.createGoal(runOwner(c), await c.req.json()), 201),
   );
   app.post("/goals/:id", async (c) => {
     const body = goalPatchSchema.parse(await c.req.json());
-    return c.json(await service.updateGoal(c.get("owner"), c.req.param("id"), body));
+    return c.json(await service.updateGoal(runOwner(c), c.req.param("id"), body));
   });
   app.post("/goals/:id/milestones/:milestoneId", async (c) => {
     const { done } = z.object({ done: z.boolean() }).parse(await c.req.json());
     return c.json(
       await service.setMilestoneDone(
-        c.get("owner"),
+        runOwner(c),
         c.req.param("id"),
         c.req.param("milestoneId"),
         done,
@@ -76,15 +93,15 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
     );
   });
   app.post("/monitors", async (c) =>
-    c.json(await service.createMonitor(c.get("owner"), await c.req.json()), 201),
+    c.json(await service.createMonitor(runOwner(c), await c.req.json()), 201),
   );
   app.post("/monitors/:id/control", async (c) => {
     const { action } = z
       .object({ action: z.enum(["pause", "resume", "stop", "check"]) })
       .parse(await c.req.json());
-    return c.json(await service.controlMonitor(c.get("owner"), c.req.param("id"), action));
+    return c.json(await service.controlMonitor(runOwner(c), c.req.param("id"), action));
   });
-  app.post("/ideas/refresh", async (c) => c.json(await service.refreshIdeas(c.get("owner"))));
+  app.post("/ideas/refresh", async (c) => c.json(await service.refreshIdeas(runOwner(c))));
   app.post("/ideas/:id", async (c) => {
     const body = z
       .object({
@@ -93,7 +110,7 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
       })
       .parse(await c.req.json());
     return c.json(
-      await service.decideIdea(c.get("owner"), c.req.param("id"), body.action, body.prompt),
+      await service.decideIdea(runOwner(c), c.req.param("id"), body.action, body.prompt),
     );
   });
   app.post("/memories", async (c) => {
@@ -104,12 +121,12 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
       source: body.source ?? "You",
       createdAt: new Date().toISOString(),
     };
-    return c.json(await service.db.put(c.get("owner"), "memories", memory), 201);
+    return c.json(await service.db.put(runOwner(c), "memories", memory), 201);
   });
   app.post("/memories/:id", async (c) => {
     const body = memorySchema.parse(await c.req.json());
     const memory = await service.db.compareAndSwap<AgentMemory>(
-      c.get("owner"),
+      runOwner(c),
       "memories",
       c.req.param("id"),
       {},
@@ -119,7 +136,7 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
     return c.json(memory);
   });
   app.post("/memories/:id/forget", async (c) => {
-    if (!(await service.db.take(c.get("owner"), "memories", c.req.param("id"))))
+    if (!(await service.db.take(runOwner(c), "memories", c.req.param("id"))))
       throw new AppError("Memory not found", 404);
     return c.json({ ok: true });
   });
@@ -132,7 +149,7 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
         showChatUpdates: z.boolean().optional(),
       })
       .parse(await c.req.json());
-    const owner = c.get("owner");
+    const owner = runOwner(c);
     await service.ensure(owner);
     const identity = await service.db.compareAndSwap<AgentIdentity>(
       owner,
@@ -145,11 +162,11 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
     return c.json(identity);
   });
   app.get("/notifications", async (c) =>
-    c.json(await service.db.list<AgentNotification>(c.get("owner"), "notifications")),
+    c.json(await service.db.list<AgentNotification>(runOwner(c), "notifications")),
   );
   app.post("/notifications/:id/read", async (c) => {
     const notification = await service.db.compareAndSwap<AgentNotification>(
-      c.get("owner"),
+      runOwner(c),
       "notifications",
       c.req.param("id"),
       {},
@@ -159,9 +176,11 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
     return c.json(notification);
   });
   app.post("/sample-page", async (c) => {
-    if (service.config.mode !== "sample") throw new AppError("Not found", 404);
+    // The sample workspace is a standalone-only surface; enterprise never seeds it.
+    if (options.enterprise || service.config.mode !== "sample")
+      throw new AppError("Not found", 404);
     const body = z.object({ text: z.string().max(100000) }).parse(await c.req.json());
-    await service.db.put(c.get("owner"), "sample-pages", { id: "availability", text: body.text });
+    await service.db.put(runOwner(c), "sample-pages", { id: "availability", text: body.text });
     return c.json({ ok: true });
   });
   return app;
