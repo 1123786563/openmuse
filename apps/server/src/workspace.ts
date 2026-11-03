@@ -13,7 +13,6 @@ import type {
 import { GoogleClient } from "../../../packages/integrations/src/google.ts";
 import { createSamplePdf } from "../../../packages/integrations/src/pdf.ts";
 import type { ActionService } from "./actions.ts";
-import { agentConfigured } from "./agent.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
@@ -319,6 +318,10 @@ export class WorkspaceService {
   }
 
   async snapshot(owner: string, query?: string): Promise<Workspace> {
+    // agent.ts carries the CopilotKit runtime graph (an ESM-only chain);
+    // importing it lazily keeps this module loadable under `bun test`, where
+    // its CJS dependencies cannot require async modules.
+    const { agentConfigured } = await import("./agent.ts");
     const { mail, events, connected } = await this.sourceSections(owner, true, true, query);
     const tokens = this.config.mode === "live" ? await this.googleAuth.tokens(owner) : null;
     return {
