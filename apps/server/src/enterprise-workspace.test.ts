@@ -398,10 +398,10 @@ describe("T07.05 enterprise session and workspace mapping", () => {
   }, 60_000);
 
   test("unknown_routes_never_fall_back_to_standalone_owner", async () => {
-    // T07.17 wired the content surfaces (/api/calendars among them); a route
-    // THIS BFF still has not wired — the media surfaces belong to T07.07 —
-    // keeps refusing instead of falling back to the standalone owner.
-    const response = await app.request("/api/files/some-file/content", {
+    // T07.17 wired the content surfaces and T07.07 wired the media byte
+    // routes (/api/files/:id/content among them); a route THIS BFF still has
+    // not wired keeps refusing instead of falling back to the standalone owner.
+    const response = await app.request("/api/admin/secrets", {
       headers: {
         Authorization: `Bearer ${token}`,
         ...SELECTOR_HEADERS("tenant-acme", "ws-acme-ops"),

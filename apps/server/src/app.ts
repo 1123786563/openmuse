@@ -15,6 +15,7 @@ import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
 import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
+import { browserConsole } from "./browser-console.ts";
 import { ComputerService, type DockerRunner } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
@@ -23,15 +24,17 @@ import { agentRoutes } from "./engine/routes.ts";
 import { AgentService, EnterpriseRunAdmissions } from "./engine/service.ts";
 import {
   createEnterpriseActionGate,
+  createEnterpriseMediaTickets,
   createOpenbotAuthority,
-  ENTERPRISE_OPERATIONS,
   ENTERPRISE_REFUSAL_STATUS,
   type EnterpriseActionGate,
   type EnterpriseAdmission,
+  type EnterpriseMediaDeps,
   enterpriseGuard,
   enterpriseRequestSelection,
   enterpriseSessionHandler,
   enterpriseWorkspaceSnapshot,
+  mountEnterpriseMediaRoutes,
   type OpenbotAuthority,
 } from "./enterprise.ts";
 import { AppError } from "./errors.ts";
@@ -52,7 +55,10 @@ export async function createApp(
   // this app can switch the mode per request.
   const enterprise =
     config.authMode === "enterprise"
-      ? { authority: options.authority ?? createOpenbotAuthority(config) }
+      ? {
+          authority: options.authority ?? createOpenbotAuthority(config),
+          tickets: createEnterpriseMediaTickets(config.publicUrl),
+        }
       : null;
   const auth = await createAuth(db, config),
     files = new Files(db, config, auth),
@@ -114,7 +120,11 @@ export async function createApp(
       : undefined,
   );
   const app = new Hono<{
-    Variables: { owner: string; enterpriseAdmission: EnterpriseAdmission };
+    Variables: {
+      owner: string;
+      enterpriseAdmission: EnterpriseAdmission;
+      enterpriseTickets: ReturnType<typeof createEnterpriseMediaTickets>;
+    };
   }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
   app.use("*", async (c, next) => {
@@ -122,7 +132,10 @@ export async function createApp(
     if (origin && !origins.has(origin)) return c.json({ error: "Origin is not allowed" }, 403);
     c.header("X-Content-Type-Options", "nosniff");
     c.header("Referrer-Policy", "no-referrer");
-    c.header("Cache-Control", "no-store");
+    // T07.07 (#597): the enterprise supply's answers are private as well as
+    // uncacheable (interfaces §5.2) — its media proxy streams private
+    // company documents, so no intermediate may retain them.
+    c.header("Cache-Control", enterprise ? "private, no-store" : "no-store");
     await next();
   });
   app.use(
@@ -222,7 +235,7 @@ export async function createApp(
     // fall back to a standalone owner. Routes this task has not wired for the
     // enterprise supply are refused by the guard, not passed through.
     if (enterprise) {
-      const guard = enterpriseGuard(config, enterprise.authority);
+      const guard = enterpriseGuard(config, enterprise.authority, enterprise.tickets);
       return guard(c, next);
     }
     const signedRoute =
@@ -236,6 +249,35 @@ export async function createApp(
     c.set("owner", owner);
     await next();
   });
+  if (enterprise) {
+    // T07.07 (#597): the media ticket mint, the online media reads and the
+    // three reauth proxies. These handlers run after the guard above, which
+    // has already admitted this request online and put the admitted
+    // namespace on the context; they re-admit per pull themselves.
+    const media: EnterpriseMediaDeps = {
+      async file(owner, id) {
+        const file = await files.get(owner, id);
+        return { id: file.id, size: file.size };
+      },
+      async open(owner, id) {
+        return files.stream(owner, id);
+      },
+      async browser(owner, id) {
+        return browser.get(owner, id);
+      },
+      async preview(owner, id) {
+        return browser.preview(owner, id);
+      },
+      console(previewUrl: string) {
+        return browserConsole(previewUrl);
+      },
+    };
+    mountEnterpriseMediaRoutes(app, {
+      authority: enterprise.authority,
+      tickets: enterprise.tickets,
+      media,
+    });
+  }
   app.get("/api/workspace", async (c) => {
     if (enterprise) {
       // The ORIGINAL Workspace contract, filled from this server's real store

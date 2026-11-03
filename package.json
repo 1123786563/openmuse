@@ -57,5 +57,15 @@
     "@types/pg": "^8.15.5",
     "tsx": "^4.20.0",
     "typescript": "~5.9.2"
+  },
+  "workspaces": [
+    "apps/mobile",
+    "apps/worker"
+  ],
+  "overrides": {
+    "image-size": "2.0.4"
+  },
+  "patchedDependencies": {
+    "metro@0.83.3": "patches/metro@0.83.3.patch"
   }
 }
