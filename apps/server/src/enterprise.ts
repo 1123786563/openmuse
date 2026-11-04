@@ -29,6 +29,12 @@ import { ActionService } from "./actions.ts";
 import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
 import { browserConsole } from "./browser-console.ts";
+import {
+  ComputerService,
+  computerPathSchema,
+  computerWriteSchema,
+  type DockerRunner,
+} from "./computer.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
@@ -298,6 +304,70 @@ export interface EnterpriseActionAdmission {
 }
 
 /**
+ * T07.18 (#608): one browser or computer control route, decomposed into the
+ * object the request names; every control action admits online under the one
+ * frozen team-scoped word the authority's admissible list whitelists for this
+ * surface (`workspace.read`, interfaces §5.2 — the same single word T07.17
+ * uses for the content surfaces, because adding a dedicated browser/computer
+ * control word would be a T05.13 contract revision outside this task's
+ * files), with the instance the action names bound onto the admission row.
+ * Browser collection actions (POST /api/browsers) name no object; every
+ * per-session action binds that session's opaque id. The computer surface is
+ * namespace-scoped rather than instance-addressed (one computer per
+ * namespace), so each sub-route names its own action object.
+ */
+export interface EnterpriseControlRoute {
+  readonly operation: "workspace.read";
+  readonly resourceId: string | null;
+}
+
+/**
+ * The complete per-action map of the browser and computer control surfaces
+ * (interfaces §5.2): POST /api/browsers, the navigate/close/reopen/
+ * import-downloads and console input routes, GET /api/browsers/:id/read, and
+ * every /api/computer sub-route. A route outside this table is not wired for
+ * the enterprise supply and never falls back to standalone auth.
+ */
+export function enterpriseControlRouteOf(
+  path: string,
+  method: string,
+): EnterpriseControlRoute | null {
+  const browserSession =
+    /^\/api\/browsers\/([^/]+)\/(navigate|close|read|reopen|import-downloads|console)$/.exec(path);
+  if (browserSession) {
+    const [, id, action] = browserSession;
+    // POST /api/browsers/:id/console is the console's input action; the GET
+    // console document is a media route the guard already admits (file.read).
+    if (action === "console" && method !== "POST") return null;
+    if (action !== "read" && method !== "POST") return null;
+    return {
+      operation: "workspace.read",
+      resourceId: `browser:${id}`,
+    };
+  }
+  if (path === "/api/browsers" && method === "POST")
+    return { operation: "workspace.read", resourceId: null };
+  if (path === "/api/computer" || path.startsWith("/api/computer/"))
+    return { operation: "workspace.read", resourceId: computerResourceId(path) };
+  return null;
+}
+
+/** The /api/computer sub-route object each request names. */
+function computerResourceId(path: string): string | null {
+  if (path === "/api/computer") return "computer:snapshot";
+  const sub = path.slice("/api/computer/".length).split("?")[0] ?? "";
+  if (sub === "start" || sub === "stop") return `computer:${sub}`;
+  if (sub === "desktop") return "computer:desktop";
+  if (sub === "desktop/actions") return "computer:desktop-action";
+  if (sub === "desktop/screenshot") return "computer:desktop-screenshot";
+  if (sub === "commands") return "computer:command";
+  if (sub === "files") return "computer:files";
+  const fileAction = /^files\/(read|write|mkdir|import|export)$/.exec(sub);
+  if (fileAction) return `computer:files-${fileAction[1]}`;
+  return "computer:unknown";
+}
+
+/**
  * The explicit operation/resource mapping for one request path/method, or
  * null when the route is not one this BFF wired for the enterprise supply.
  */
@@ -487,6 +557,9 @@ export function enterpriseGuard(
     // T07.07: the media surface joins the wired set (ticket mint, byte
     // routes, reauth proxies); T07.17 keeps the explicit operation/resource
     // map for the content surfaces, so both wiring tables answer here.
+    // T07.18: the browser and computer control surfaces join with their own
+    // per-action map — every control action admits online, one per request.
+    const control = enterpriseControlRouteOf(path, context.req.method);
     const mediaRoute = enterpriseMediaRouteOf(path);
     const isWorkspace = path === "/api/workspace";
     const isRunSurface =
@@ -497,7 +570,7 @@ export function enterpriseGuard(
     const isMediaTicketMint = path === "/api/media-tickets" && context.req.method === "POST";
     const proxy = enterpriseProxyRouteOf(path, context.req.method);
     const action = enterpriseActionFor(path, context.req.method);
-    if (!action && !mediaRoute && !isMediaTicketMint && !proxy)
+    if (!action && !mediaRoute && !isMediaTicketMint && !proxy && !control)
       throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
     const authorization = context.req.header("authorization");
     const ticket =
@@ -541,29 +614,32 @@ export function enterpriseGuard(
       )
         throw AppError.fromCode("SCOPE_SELECTOR_CONFLICT", 400);
     }
-    const operation = isWorkspace
-      ? ENTERPRISE_OPERATIONS.workspaceRead
-      : isRunSurface
-        ? ENTERPRISE_OPERATIONS.copilotkitInvoke
-        : isMediaTicketMint
-          ? ENTERPRISE_OPERATIONS.mediaTicket
-          : proxy
-            ? proxy.operation
-            : mediaRoute
-              ? ENTERPRISE_OPERATIONS.fileRead
-              : ENTERPRISE_OPERATIONS.workspaceRead;
+    const operation = control
+      ? control.operation
+      : isWorkspace
+        ? ENTERPRISE_OPERATIONS.workspaceRead
+        : isRunSurface
+          ? ENTERPRISE_OPERATIONS.copilotkitInvoke
+          : isMediaTicketMint
+            ? ENTERPRISE_OPERATIONS.mediaTicket
+            : proxy
+              ? proxy.operation
+              : mediaRoute
+                ? ENTERPRISE_OPERATIONS.fileRead
+                : ENTERPRISE_OPERATIONS.workspaceRead;
     // scope.discover is the one scope-free word (interfaces §5.2's
     // "未选范围时可发现"): discovery may run before a selection exists, so
     // it admits without selectors exactly as the authority's route does.
     // T07.17: a content-surface action carries its explicit object binding;
     // so the admission names that one object (null = collection-level).
+    // T07.18: a control action binds the instance it names the same way.
     const admission = scopeFree
       ? await authority.admissionDiscovery(handle, operation)
       : await authority.admission(
           handle,
           selector,
           operation,
-          action ? action.resourceId : (mediaRoute?.id ?? null),
+          control ? control.resourceId : action ? action.resourceId : (mediaRoute?.id ?? null),
         );
     // The admitted scope must echo the request's one intent exactly.
     if (
@@ -1129,6 +1205,8 @@ export function mountEnterpriseRoutes<
     workspace: WorkspaceService;
     actions: ActionService;
     intelligence?: MainThreadIntelligence;
+    /** T07.18: the browser/computer control seam; absent leaves the routes off. */
+    control?: EnterpriseControlDeps;
   },
 ): void {
   app.post("/api/session", enterpriseSessionHandler(deps.authority));
@@ -1236,6 +1314,207 @@ export function mountEnterpriseRoutes<
     );
   });
   mountEnterpriseMediaRoutes(app, deps);
+  mountEnterpriseControlRoutes(app, deps);
+}
+
+/**
+ * T07.18 (#608): the control seam — what the browser and computer control
+ * routes need from the deployment's services. Every call is owner-scoped to
+ * the namespace the guard admitted, so an instance of another company/team/
+ * principal answers the uniform 404 before the worker or sandbox is touched.
+ */
+export interface EnterpriseControlDeps {
+  /** POST /api/browsers — create and open a session in this namespace. */
+  browserCreate(owner: string, url: string): Promise<unknown>;
+  /** GET /api/browsers/:id — the session record, namespace-scoped (404). */
+  browserGet(owner: string, id: string): Promise<unknown>;
+  /** POST /api/browsers/:id/navigate — open the same session at a new URL. */
+  browserNavigate(owner: string, id: string, url: string): Promise<unknown>;
+  /** POST /api/browsers/:id/close — close the session. */
+  browserClose(owner: string, id: string): Promise<unknown>;
+  /** GET /api/browsers/:id/read — the page read of the session. */
+  browserRead(owner: string, id: string): Promise<unknown>;
+  /** POST /api/browsers/:id/reopen — reopen this namespace's own record. */
+  browserReopen(owner: string, id: string, url?: string): Promise<unknown>;
+  /** POST /api/browsers/:id/import-downloads — pull downloads into files. */
+  browserImportDownloads(owner: string, id: string): Promise<unknown>;
+  /** POST /api/browsers/:id/console — send one console input action. */
+  browserInput(owner: string, id: string, value: unknown): Promise<void>;
+  /** The /api/computer surface, mounted per-sub-route below. */
+  computer: EnterpriseComputerRoutes;
+}
+
+/**
+ * The computer sub-routes this BFF wires, each one an owner-scoped action.
+ * The shapes mirror computerRoutes' handlers exactly (original DTOs); only
+ * the credential half is replaced by the guard's admitted namespace.
+ */
+export interface EnterpriseComputerRoutes {
+  snapshot(owner: string): Promise<unknown>;
+  start(owner: string): Promise<unknown>;
+  stop(owner: string): Promise<unknown>;
+  desktopUrl(owner: string): Promise<unknown>;
+  desktopAction(
+    owner: string,
+    raw: unknown,
+  ): Promise<{ receipt: unknown } & Record<string, unknown>>;
+  latestScreenshot(
+    owner: string,
+    receiptId?: string,
+  ): Promise<{ mimeType: string; bytes: Uint8Array }>;
+  execute(owner: string, raw: unknown, signal?: AbortSignal): Promise<unknown>;
+  list(owner: string, path?: string): Promise<unknown>;
+  read(owner: string, path: string): Promise<unknown>;
+  write(owner: string, path: string, text: string): Promise<unknown>;
+  mkdir(owner: string, path: string): Promise<unknown>;
+  writePdf(owner: string, path: string, fileId: string): Promise<unknown>;
+  pdfBytesImport(owner: string, path: string): Promise<unknown>;
+}
+
+/** Map a service AppError 404 onto the uniform refusal word. */
+async function controlled<T>(read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (error) {
+    if (error instanceof AppError && error.status === 404)
+      throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
+    throw error;
+  }
+}
+
+/**
+ * T07.18 (#608): mount the browser and computer control routes for the
+ * enterprise supply. The guard above has already admitted THIS request online
+ * (one admission per action, the instance bound as the resourceId) and put
+ * the server-admitted namespace on the context; these handlers only ever
+ * call the services with that namespace's owner.
+ */
+export function mountEnterpriseControlRoutes<
+  Env extends {
+    Variables: {
+      enterpriseAdmission: EnterpriseAdmission;
+      enterpriseTickets: EnterpriseMediaTickets;
+      owner: string;
+    };
+  },
+>(app: Hono<Env>, deps: { control?: EnterpriseControlDeps }): void {
+  if (!deps.control) return;
+  const control = deps.control;
+  const ownerOf = (context: { get(key: "owner"): string }) => context.get("owner");
+
+  // ── the browser control surface ────────────────────────────────────────
+  app.post("/api/browsers", async (context) => {
+    const body = z.object({ url: z.url().max(4096) }).parse(await context.req.json());
+    return context.json(await control.browserCreate(ownerOf(context), body.url), 201);
+  });
+  app.get("/api/browsers/:id", async (context) =>
+    context.json(
+      await controlled(() => control.browserGet(ownerOf(context), context.req.param("id"))),
+    ),
+  );
+  app.post("/api/browsers/:id/navigate", async (context) => {
+    const body = z.object({ url: z.url().max(4096) }).parse(await context.req.json());
+    return context.json(
+      await controlled(() =>
+        control.browserNavigate(ownerOf(context), context.req.param("id"), body.url),
+      ),
+    );
+  });
+  app.post("/api/browsers/:id/close", async (context) =>
+    context.json(
+      await controlled(() => control.browserClose(ownerOf(context), context.req.param("id"))),
+    ),
+  );
+  app.get("/api/browsers/:id/read", async (context) =>
+    context.json(
+      await controlled(() => control.browserRead(ownerOf(context), context.req.param("id"))),
+    ),
+  );
+  app.post("/api/browsers/:id/reopen", async (context) => {
+    const raw = await context.req.text();
+    const body = z.object({ url: z.url().max(4096).optional() }).parse(raw ? JSON.parse(raw) : {});
+    return context.json(
+      await controlled(() =>
+        control.browserReopen(ownerOf(context), context.req.param("id"), body.url),
+      ),
+    );
+  });
+  app.post("/api/browsers/:id/import-downloads", async (context) =>
+    context.json(
+      await controlled(() =>
+        control.browserImportDownloads(ownerOf(context), context.req.param("id")),
+      ),
+    ),
+  );
+  app.post("/api/browsers/:id/console", async (context) => {
+    const value = await context.req.json();
+    await controlled(() => control.browserInput(ownerOf(context), context.req.param("id"), value));
+    return context.json({ ok: true });
+  });
+
+  // ── the computer control surface (original sub-route DTOs) ────────────
+  app.get("/api/computer", async (context) =>
+    context.json(await control.computer.snapshot(ownerOf(context))),
+  );
+  app.post("/api/computer/start", async (context) =>
+    context.json(await control.computer.start(ownerOf(context))),
+  );
+  app.post("/api/computer/stop", async (context) =>
+    context.json(await control.computer.stop(ownerOf(context))),
+  );
+  app.get("/api/computer/desktop", async (context) =>
+    context.json(await control.computer.desktopUrl(ownerOf(context))),
+  );
+  app.post("/api/computer/desktop/actions", async (context) => {
+    const { receipt, ...rest } = await control.computer.desktopAction(
+      ownerOf(context),
+      await context.req.json(),
+    );
+    return context.json({ receipt, ...rest });
+  });
+  app.get("/api/computer/desktop/screenshot", async (context) => {
+    const { mimeType, bytes } = await control.computer.latestScreenshot(
+      ownerOf(context),
+      context.req.query("receipt"),
+    );
+    context.header("Content-Type", mimeType);
+    context.header("Cache-Control", "no-store");
+    return context.body(new Uint8Array(bytes));
+  });
+  app.post("/api/computer/commands", async (context) =>
+    context.json(
+      await control.computer.execute(
+        ownerOf(context),
+        await context.req.json(),
+        context.req.raw.signal,
+      ),
+    ),
+  );
+  app.get("/api/computer/files", async (context) =>
+    context.json(await control.computer.list(ownerOf(context), context.req.query("path"))),
+  );
+  app.post("/api/computer/files/read", async (context) => {
+    const { path } = computerPathSchema.parse(await context.req.json());
+    return context.json(await control.computer.read(ownerOf(context), path));
+  });
+  app.post("/api/computer/files/write", async (context) => {
+    const { path, text } = computerWriteSchema.parse(await context.req.json());
+    return context.json(await control.computer.write(ownerOf(context), path, text));
+  });
+  app.post("/api/computer/files/mkdir", async (context) => {
+    const { path } = computerPathSchema.parse(await context.req.json());
+    return context.json(await control.computer.mkdir(ownerOf(context), path));
+  });
+  app.post("/api/computer/files/import", async (context) => {
+    const { path, fileId } = computerPathSchema
+      .extend({ fileId: z.string().min(1) })
+      .parse(await context.req.json());
+    return context.json(await control.computer.writePdf(ownerOf(context), path, fileId));
+  });
+  app.post("/api/computer/files/export", async (context) => {
+    const { path } = computerPathSchema.parse(await context.req.json());
+    return context.json(await control.computer.pdfBytesImport(ownerOf(context), path), 201);
+  });
 }
 
 /**
@@ -1502,6 +1781,10 @@ export async function createEnterpriseApp(
     workspace?: WorkspaceService;
     actions?: ActionService;
     intelligence?: MainThreadIntelligence;
+    /** T07.18: the control seam; the default wires this server's own services. */
+    control?: EnterpriseControlDeps;
+    /** T07.18: the DockerRunner the default ComputerService uses. */
+    docker?: DockerRunner;
   } = {},
 ): Promise<
   Hono<{
@@ -1598,8 +1881,100 @@ export async function createEnterpriseApp(
     workspace,
     actions,
     intelligence: options.intelligence,
+    control: options.control ?? controlDeps(db, config, options.docker),
   });
   return app;
+}
+
+/**
+ * T07.18 (#608): the default control seam over this server's own browser and
+ * computer services, exactly the ones the standalone app builds. Every method
+ * is owner-scoped: the caller passes the guard-admitted namespace's owner, so
+ * another company/team/principal's instance answers the service's own 404
+ * (mapped onto the uniform RESOURCE_NOT_FOUND word) before any worker or
+ * sandbox call is made for it.
+ */
+function controlDeps(db: Store, config: Config, docker?: DockerRunner): EnterpriseControlDeps {
+  const auth = createAuth(db, config);
+  const resolved = async () => {
+    const authService = await auth;
+    const files = new Files(db, config, authService);
+    const browser = new BrowserService(db, config, authService, files);
+    const computer = new ComputerService(db, config, docker);
+    return { auth: authService, files, browser, computer };
+  };
+  let services: Awaited<ReturnType<typeof resolved>> | undefined;
+  const lazy = async () => (services ??= await resolved());
+  return {
+    async browserCreate(owner, url) {
+      return (await lazy()).browser.create(owner, url);
+    },
+    async browserGet(owner, id) {
+      return (await lazy()).browser.get(owner, id);
+    },
+    async browserNavigate(owner, id, url) {
+      return (await lazy()).browser.navigate(owner, id, url);
+    },
+    async browserClose(owner, id) {
+      return (await lazy()).browser.close(owner, id);
+    },
+    async browserRead(owner, id) {
+      return (await lazy()).browser.read(owner, id);
+    },
+    async browserReopen(owner, id, url) {
+      return (await lazy()).browser.reopen(owner, id, url);
+    },
+    async browserImportDownloads(owner, id) {
+      return (await lazy()).browser.imports(owner, id);
+    },
+    async browserInput(owner, id, value) {
+      await (await lazy()).browser.input(owner, id, value);
+    },
+    computer: {
+      async snapshot(owner) {
+        return (await lazy()).computer.snapshot(owner);
+      },
+      async start(owner) {
+        return (await lazy()).computer.start(owner);
+      },
+      async stop(owner) {
+        return (await lazy()).computer.stop(owner);
+      },
+      async desktopUrl(owner) {
+        return (await lazy()).computer.desktopUrl(owner);
+      },
+      async desktopAction(owner, raw) {
+        return (await lazy()).computer.desktopAction(owner, raw);
+      },
+      async latestScreenshot(owner, receiptId) {
+        return (await lazy()).computer.latestScreenshot(owner, receiptId);
+      },
+      async execute(owner, raw, signal) {
+        return (await lazy()).computer.execute(owner, raw, { signal });
+      },
+      async list(owner, path) {
+        return (await lazy()).computer.list(owner, path);
+      },
+      async read(owner, path) {
+        return (await lazy()).computer.read(owner, path);
+      },
+      async write(owner, path, text) {
+        return (await lazy()).computer.write(owner, path, text);
+      },
+      async mkdir(owner, path) {
+        return (await lazy()).computer.mkdir(owner, path);
+      },
+      async writePdf(owner, path, fileId) {
+        const { files, computer } = await lazy();
+        return computer.writePdf(owner, path, await files.bytes(owner, fileId));
+      },
+      async pdfBytesImport(owner, path) {
+        const { files, computer } = await lazy();
+        const { name, bytes } = await computer.pdfBytes(owner, path);
+        return files.import(owner, name, bytes, `Computer: ${path}`);
+      },
+    },
+  };
 }
 
 /**
