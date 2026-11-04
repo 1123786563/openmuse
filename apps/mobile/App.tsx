@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   AppState,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -50,6 +51,7 @@ import { mergeCreated, sessionFor } from "./src/openbot/channel-state";
 import { OpenBotChannelsScreen } from "./src/openbot/channels";
 import { OpenBotChatScreen } from "./src/openbot/chat";
 import { setOpenbotTransportDefaults } from "./src/openbot/client";
+import { getCompanyAssurance, setCompanyAssurance } from "./src/openbot/company-assurance";
 import { OpenBotComputerScreen } from "./src/openbot/computer";
 import { openbotUrl } from "./src/openbot/config";
 import { OpenBotConnectionsScreen } from "./src/openbot/connections";
@@ -131,6 +133,44 @@ function OpenBotApp() {
       },
     });
   }, []);
+  /*
+   * T07.12 (#602): the company-assurance half. The client itself is built by
+   * the enterprise session wiring once it has the handle and tenancy store
+   * (T07.10 owns the handoff) and registered through
+   * setCompanyAssurance; until then getCompanyAssurance() answers null and
+   * every consumer keeps its legacy standalone contract — no invented
+   * handle, no guessed session. The deep-link listener is registered for the
+   * whole app life and routes a company-auth callback through the ONE live
+   * flow: it re-validates the ORIGINAL intent's selection (never the
+   * temporarily active one), and an account change kills the flow and clears
+   * identity through the same sign-out sweep as a 401.
+   */
+  useEffect(() => {
+    const onUrl = ({ url }: { url: string }) => {
+      if (!url.startsWith("openmuse://company-auth")) return;
+      const assurance = getCompanyAssurance();
+      if (!assurance) return;
+      void assurance
+        .completeCallback(url)
+        .then((outcome) => {
+          if (outcome.status !== "account-changed") return;
+          setCompanyAssurance(null);
+          void signOut()
+            .then(() => clearPrivateState())
+            .catch(() => undefined)
+            .finally(() => setEntry(undefined));
+        })
+        .catch(() => undefined);
+    };
+    const subscription = Linking.addEventListener("url", onUrl);
+    void Linking.getInitialURL().then(
+      (initial) => {
+        if (initial) onUrl({ url: initial });
+      },
+      () => undefined,
+    );
+    return () => subscription.remove();
+  }, []);
   return (
     <SafeAreaProvider>
       <StatusBar style="dark" />
@@ -143,7 +183,11 @@ function OpenBotApp() {
             // private key — web storage plus the native SecureStore registry
             // and PDF download cache (I07) — then drop the entry state so the
             // whole tree (workspace snapshot included) remounts fresh for the
-            // next user.
+            // next user. T07.12: the assurance sweep rides the same moment —
+            // pending media tickets and the pending company challenge die
+            // with the session, so nothing private survives it.
+            getCompanyAssurance()?.signOut();
+            setCompanyAssurance(null);
             void clearPrivateState().catch(() => undefined);
             setEntry(undefined);
           }}
