@@ -87,14 +87,20 @@ export async function readWorkspaceScopeListing(
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as {
       error?: unknown;
+      code?: unknown;
     } | null;
     const envelope = body?.error;
+    // Two refusal envelopes reach this reader: the web proxy's nested
+    // `{error:{code}}` and the frozen MobileBffError's flat
+    // `{error, code, requestId}`. Both name the same machine word.
     const code =
-      envelope !== null &&
-      typeof envelope === "object" &&
-      typeof (envelope as Record<string, unknown>).code === "string"
-        ? (envelope as { code: string }).code
-        : "WORKSPACE_SCOPE_REFUSED";
+      typeof body?.code === "string"
+        ? body.code
+        : envelope !== null &&
+            typeof envelope === "object" &&
+            typeof (envelope as Record<string, unknown>).code === "string"
+          ? (envelope as { code: string }).code
+          : "WORKSPACE_SCOPE_REFUSED";
     throw new WorkspaceScopeRefusedError(response.status, code);
   }
   const body = (await response.json().catch(() => null)) as unknown;

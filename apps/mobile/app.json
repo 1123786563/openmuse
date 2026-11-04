@@ -7,8 +7,33 @@
     "orientation": "default",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
-    "ios": { "supportsTablet": true, "bundleIdentifier": "app.openmuse.mobile" },
-    "android": { "package": "app.openmuse.mobile" },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.openmuse.mobile",
+      "infoPlist": {
+        "CFBundleURLTypes": [
+          {
+            "CFBundleURLName": "app.openmuse.mobile",
+            "CFBundleURLSchemes": ["openmuse"]
+          }
+        ]
+      }
+    },
+    "android": {
+      "package": "app.openmuse.mobile",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "category": ["BROWSABLE", "DEFAULT"],
+          "data": [{ "scheme": "openmuse", "host": "enterprise-auth" }]
+        },
+        {
+          "action": "VIEW",
+          "category": ["BROWSABLE", "DEFAULT"],
+          "data": [{ "scheme": "openmuse", "host": "company-auth" }]
+        }
+      ]
+    },
     "web": { "bundler": "metro", "name": "OpenMuse — 一方小天地，装下所有事" },
     "plugins": [
       "expo-document-picker",

@@ -17,7 +17,7 @@ import {
   SquareCheck,
   X,
 } from "lucide-react-native";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   AppState,
@@ -39,7 +39,7 @@ import {
   IdeasScreen,
 } from "./src/agent-ui";
 import { AgentWorkspaceProvider, useAgentWorkspace } from "./src/agent-workspace";
-import { API_URL, createSession, MuseApi } from "./src/api";
+import { API_URL, createStandaloneSession, MuseApi, mobileAuthConfig } from "./src/api";
 import { ChatScreen, WorkspaceTools } from "./src/chat";
 import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
@@ -51,7 +51,11 @@ import { mergeCreated, sessionFor } from "./src/openbot/channel-state";
 import { OpenBotChannelsScreen } from "./src/openbot/channels";
 import { OpenBotChatScreen } from "./src/openbot/chat";
 import { setOpenbotTransportDefaults } from "./src/openbot/client";
-import { getCompanyAssurance, setCompanyAssurance } from "./src/openbot/company-assurance";
+import {
+  createCompanyAssuranceClient,
+  getCompanyAssurance,
+  setCompanyAssurance,
+} from "./src/openbot/company-assurance";
 import { OpenBotComputerScreen } from "./src/openbot/computer";
 import { openbotUrl } from "./src/openbot/config";
 import { OpenBotConnectionsScreen } from "./src/openbot/connections";
@@ -59,6 +63,25 @@ import { OpenBotFilesScreen } from "./src/openbot/files";
 import { OpenBotGate } from "./src/openbot/gate";
 import { clearPrivateState } from "./src/openbot/private-state";
 import { OpenBotTasksScreen } from "./src/openbot/tasks";
+import {
+  createTenancyStore,
+  readWorkspaceScopeListing,
+  type ScopeSelection,
+  type WorkspaceScopeCompany,
+  type WorkspaceScopeListing,
+  type WorkspaceScopeTeam,
+} from "./src/openbot/tenancy";
+import {
+  createEnterpriseLogin,
+  createScopedFetch,
+  type EnterpriseLogin,
+  EnterpriseLoginRefused,
+  type EnterpriseSessionResponse,
+  type MobileAuthConfig,
+  type PendingLoginStorage,
+  TENANT_HEADER,
+  WORKSPACE_HEADER,
+} from "./src/openbot/transport";
 import type { OpenBotSession, OpenBotWorkspace } from "./src/openbot/types";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
 import { t } from "./src/strings";
@@ -106,11 +129,366 @@ setOpenbotTransportDefaults({
 });
 
 /**
- * OpenBot gate for every platform (I04 switched native over; the legacy local
- * flow below stays in tree, unreferenced, until B04 removes it).
+ * The app's one entry choice, from deployment configuration (T07.10):
+ * - enterprise: the explicit authority + OpenMuse BFF handoff below;
+ * - standalone: the explicit legacy access-key flow;
+ * - legacy (unset): the existing OpenBot-direct app, unchanged.
  */
 export default function App() {
+  let config: MobileAuthConfig;
+  try {
+    config = mobileAuthConfig();
+  } catch (error) {
+    return <MobileConfigError error={error instanceof Error ? error.message : String(error)} />;
+  }
+  if (config.mode === "enterprise") return <EnterpriseApp config={config} />;
+  if (config.mode === "standalone") return <OpenMuseApp />;
   return <OpenBotApp />;
+}
+
+function MobileConfigError({ error }: { error: string }) {
+  return (
+    <SafeAreaProvider>
+      <StatusBar style="dark" />
+      <SafeAreaView
+        style={{
+          flex: 1,
+          backgroundColor: colors.canvas,
+          justifyContent: "center",
+          alignItems: "center",
+          padding: 24,
+        }}
+      >
+        <View style={{ width: "100%", maxWidth: 420, gap: 18, alignItems: "center" }}>
+          <Mascot size={64} />
+          <Text style={[s.title, { fontSize: 24, textAlign: "center" }]}>无法启动企业登录</Text>
+          <Text style={[s.muted, { textAlign: "center" }]}>
+            部署配置不完整：企业模式必须显式提供 OpenBot authority 与 OpenMuse BFF origin。
+          </Text>
+          <ErrorNotice error={error} />
+        </View>
+      </SafeAreaView>
+    </SafeAreaProvider>
+  );
+}
+
+/*
+ * T07.10 (#600): the real app's enterprise path.
+ *
+ * ONE tenancy store and ONE scoped transport carry the verified selection from
+ * the moment a person picks a company/team; MuseApi, the workspace read and the
+ * company-assurance client all ride that same store. The only credential is the
+ * opaque session handle minted by the authority exchange — there is no
+ * accessKey path here, and a failed login clears the identity instead of
+ * falling back to the standalone supply.
+ */
+type EnterpriseStage =
+  | { kind: "signed-out"; error?: string }
+  | { kind: "completing" }
+  | { kind: "choosing"; session: EnterpriseSessionResponse; listing: WorkspaceScopeListing }
+  | {
+      kind: "ready";
+      session: EnterpriseSessionResponse;
+      listing: WorkspaceScopeListing;
+      selection: ScopeSelection;
+      api: MuseApi;
+      workspace: Workspace;
+    };
+
+function webPendingStorage(): PendingLoginStorage | undefined {
+  if (Platform.OS !== "web") return undefined;
+  try {
+    if (typeof sessionStorage === "undefined") return undefined;
+    return {
+      getItem: (key) => sessionStorage.getItem(key),
+      setItem: (key, value) => sessionStorage.setItem(key, value),
+      removeItem: (key) => sessionStorage.removeItem(key),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function openSystemBrowser(url: string): void {
+  if (Platform.OS === "web") {
+    if (typeof window !== "undefined") window.location.assign(url);
+    return;
+  }
+  void Linking.openURL(url);
+}
+
+function enterpriseErrorCopy(error: unknown): string {
+  if (error instanceof EnterpriseLoginRefused) {
+    if (error.code === "STATE_MISMATCH") return "登录回调校验失败（state 不匹配），请重新登录。";
+    if (error.code === "REDIRECT_MISMATCH") return "登录回调地址与注册地址不一致，请重新登录。";
+    if (error.code === "AUTHORITY_MISMATCH")
+      return "登录返回的 authority 与部署配置不一致，已拒绝。";
+    if (error.status === 401) return "登录会话已失效，请重新登录。";
+    if (error.status === 503) return "authority 暂时不可用，请稍后重试。";
+    return `登录失败（${error.code}），请重新登录。`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function EnterpriseApp({ config }: { config: MobileAuthConfig }) {
+  const login = useRef<EnterpriseLogin | null>(null);
+  if (login.current === null) {
+    login.current = createEnterpriseLogin({
+      config,
+      fetchLike: (url, init) => fetch(url, init),
+      storage: webPendingStorage(),
+    });
+  }
+  const [stage, setStage] = useState<EnterpriseStage>({ kind: "signed-out" });
+  const [working, setWorking] = useState(false);
+  const choosing = useRef(false);
+  // The same callback can arrive twice (getInitialURL plus the live URL event,
+  // or a web reload while the effect is running); only the first may exchange.
+  const completing = useRef(false);
+
+  const complete = useCallback(
+    async (callbackUrl: string) => {
+      if (login.current === null) return;
+      // A redeploy/refresh can land on the redirect URI itself; only a URL
+      // that actually carries a code and state is a handoff callback.
+      let callback: URL;
+      try {
+        callback = new URL(callbackUrl);
+      } catch {
+        return;
+      }
+      if (callback.searchParams.get("code") === null || callback.searchParams.get("state") === null)
+        return;
+      if (!callbackUrl.startsWith(config.redirectUri)) return;
+      if (completing.current) return;
+      completing.current = true;
+      setWorking(true);
+      try {
+        const session = await login.current.complete(callbackUrl);
+        const discovery = new MuseApi(session.token, { baseUrl: config.apiOrigin });
+        const listing = await readWorkspaceScopeListing(() =>
+          discovery.response("/api/enterprise/workspace-scope"),
+        );
+        if (listing.companies.length === 0) {
+          setStage({ kind: "signed-out", error: "你的账号还没有可用的公司或团队，请联系管理员。" });
+        } else {
+          setStage({ kind: "choosing", session, listing });
+        }
+      } catch (error) {
+        login.current.cancel();
+        setCompanyAssurance(null);
+        setStage({ kind: "signed-out", error: enterpriseErrorCopy(error) });
+      } finally {
+        completing.current = false;
+        setWorking(false);
+        if (Platform.OS === "web" && typeof window !== "undefined") {
+          window.history.replaceState({}, "", window.location.pathname);
+        }
+      }
+    },
+    [config],
+  );
+
+  useEffect(() => {
+    const subscription = Linking.addEventListener("url", ({ url }) => void complete(url));
+    void Linking.getInitialURL().then(
+      (initial) => {
+        if (initial) void complete(initial);
+      },
+      () => undefined,
+    );
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      void complete(window.location.href);
+    }
+    return () => subscription.remove();
+  }, [complete]);
+
+  /*
+   * The company-assurance callback (T07.12) rides this same app life. The
+   * enterprise entry replaces OpenBotApp, so its listener cannot be the one
+   * the live client relies on: an account change kills the flow and returns
+   * to the enterprise sign-in rather than resuming the old scope.
+   */
+  useEffect(() => {
+    const onUrl = ({ url }: { url: string }) => {
+      if (!url.startsWith("openmuse://company-auth")) return;
+      const assurance = getCompanyAssurance();
+      if (!assurance) return;
+      void assurance
+        .completeCallback(url)
+        .then((outcome) => {
+          if (outcome.status !== "account-changed") return;
+          setCompanyAssurance(null);
+          setStage({ kind: "signed-out", error: "登录账号已变更，请重新登录。" });
+        })
+        .catch(() => undefined);
+    };
+    const subscription = Linking.addEventListener("url", onUrl);
+    void Linking.getInitialURL().then(
+      (initial) => {
+        if (initial) onUrl({ url: initial });
+      },
+      () => undefined,
+    );
+    return () => subscription.remove();
+  }, []);
+
+  const begin = useCallback(() => {
+    if (login.current === null) return;
+    try {
+      const pending = login.current.begin();
+      setStage({ kind: "signed-out" });
+      openSystemBrowser(pending.authorizeUrl);
+    } catch (error) {
+      setStage({ kind: "signed-out", error: enterpriseErrorCopy(error) });
+    }
+  }, []);
+
+  const choose = useCallback(
+    async (company: WorkspaceScopeCompany, team: WorkspaceScopeTeam) => {
+      if (stage.kind !== "choosing" || choosing.current) return;
+      choosing.current = true;
+      const selection: ScopeSelection = {
+        tenantId: company.tenantId,
+        workspaceId: team.workspaceId,
+      };
+      setWorking(true);
+      const store = createTenancyStore({
+        userId: stage.session.user.id,
+        storage: {
+          getItem: () => null,
+          setItem: () => undefined,
+        },
+      });
+      await store.selectScope(selection);
+      const scopedFetch = createScopedFetch({
+        store,
+        fetchLike: (path, init) => fetch(`${config.apiOrigin}${path}`, init),
+      });
+      const api = new MuseApi(stage.session.token, {
+        fetchLike: scopedFetch,
+        baseUrl: config.apiOrigin,
+      });
+      try {
+        await api.request("/api/enterprise/workspace-scope/validate-selection", selection);
+        const workspace = await api.request<Workspace>("/api/workspace");
+        setCompanyAssurance(
+          createCompanyAssuranceClient({
+            store,
+            fetchLike: scopedFetch,
+            openBrowser: openSystemBrowser,
+            handle: stage.session.token,
+          }),
+        );
+        setStage({
+          kind: "ready",
+          session: stage.session,
+          listing: stage.listing,
+          selection,
+          api,
+          workspace,
+        });
+      } catch (error) {
+        await store.selectScope(null);
+        setCompanyAssurance(null);
+        setStage({ kind: "signed-out", error: enterpriseErrorCopy(error) });
+      } finally {
+        choosing.current = false;
+        setWorking(false);
+      }
+    },
+    [config, stage],
+  );
+
+  if (stage.kind === "ready") {
+    return (
+      <SafeAreaProvider>
+        <StatusBar style="dark" />
+        <CopilotKitProvider
+          runtimeUrl={`${config.apiOrigin}/api/copilotkit`}
+          headers={{
+            Authorization: `Bearer ${stage.session.token}`,
+            [TENANT_HEADER]: stage.selection.tenantId,
+            [WORKSPACE_HEADER]: stage.selection.workspaceId,
+          }}
+        >
+          <WorkspaceApp
+            token={stage.session.token}
+            api={stage.api}
+            initialWorkspace={stage.workspace}
+          />
+        </CopilotKitProvider>
+      </SafeAreaProvider>
+    );
+  }
+
+  return (
+    <SafeAreaProvider>
+      <StatusBar style="dark" />
+      <SafeAreaView
+        style={{
+          flex: 1,
+          backgroundColor: colors.canvas,
+          justifyContent: "center",
+          alignItems: "center",
+          padding: 24,
+        }}
+      >
+        <View style={{ width: "100%", maxWidth: 460, gap: 20, alignItems: "center" }}>
+          <Mascot size={72} />
+          <Text style={{ fontSize: 30, color: colors.text, letterSpacing: -1, fontWeight: "500" }}>
+            {t("welcomeTitle")}
+          </Text>
+          <Text style={[s.muted, { textAlign: "center" }]}>{t("welcomeSubtitle")}</Text>
+          {stage.kind === "signed-out" && <ErrorNotice error={stage.error} />}
+          {working || stage.kind === "completing" ? (
+            <ActivityIndicator color={colors.blueDark} />
+          ) : stage.kind === "choosing" ? (
+            <Card style={{ width: "100%", gap: 14 }}>
+              <Text style={[s.title, { fontSize: 18 }]}>选择公司团队</Text>
+              <Text style={s.small}>范围来自你当前的企业成员资格；未选择任何默认范围。</Text>
+              {stage.listing.companies.map((company) => (
+                <View key={company.tenantId} style={{ gap: 8 }}>
+                  <Text style={{ color: colors.text, fontWeight: "600" }}>{company.name}</Text>
+                  {company.teams.length === 0 ? (
+                    <Text style={s.small}>该公司的团队尚未开通，暂时无法进入工作区。</Text>
+                  ) : (
+                    company.teams.map((team) => (
+                      <Pressable
+                        key={team.workspaceId}
+                        accessibilityRole="button"
+                        accessibilityLabel={`${company.name} ${team.name}`}
+                        onPress={() => void choose(company, team)}
+                        style={({ pressed }) => ({
+                          paddingVertical: 12,
+                          paddingHorizontal: 14,
+                          borderRadius: 14,
+                          backgroundColor: pressed ? "#F0F1F2" : "#F8F8F8",
+                          borderWidth: 1,
+                          borderColor: "#EEEEEE",
+                        })}
+                      >
+                        <Text style={{ color: colors.text }}>{team.name}</Text>
+                      </Pressable>
+                    ))
+                  )}
+                </View>
+              ))}
+            </Card>
+          ) : (
+            <Card style={{ width: "100%", gap: 14 }}>
+              <Button primary onPress={begin}>
+                使用 OpenBot 登录
+              </Button>
+              <Text style={s.small}>
+                将在系统浏览器完成企业登录，再用一次性 PKCE 交接回到应用。
+              </Text>
+            </Card>
+          )}
+        </View>
+      </SafeAreaView>
+    </SafeAreaProvider>
+  );
 }
 
 function OpenBotApp() {
@@ -351,7 +729,6 @@ function OpenBotConnected({
   );
 }
 
-// biome-ignore lint/correctness/noUnusedVariables: legacy local flow kept in tree, unreferenced, until B04 removes it.
 function OpenMuseApp() {
   const [token, setToken] = useState("");
   const [accessKey, setAccessKey] = useState("");
@@ -361,7 +738,7 @@ function OpenMuseApp() {
     setBusy(true);
     setError("");
     try {
-      const session = await createSession(key);
+      const session = await createStandaloneSession(key);
       setToken(session.token);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -372,6 +749,7 @@ function OpenMuseApp() {
   useEffect(() => {
     void connect();
   }, [connect]);
+  const api = useMemo(() => new MuseApi(token), [token]);
   return (
     <SafeAreaProvider>
       <StatusBar style="dark" />
@@ -380,7 +758,7 @@ function OpenMuseApp() {
           runtimeUrl={`${API_URL}/api/copilotkit`}
           headers={{ Authorization: `Bearer ${token}` }}
         >
-          <WorkspaceApp token={token} />
+          <WorkspaceApp token={token} api={api} />
         </CopilotKitProvider>
       ) : (
         <SafeAreaView
@@ -426,9 +804,16 @@ function OpenMuseApp() {
     </SafeAreaProvider>
   );
 }
-function WorkspaceApp({ token }: { token: string }) {
-  const api = useMemo(() => new MuseApi(token), [token]);
-  const [workspace, setWorkspace] = useState<Workspace>();
+function WorkspaceApp({
+  token,
+  api,
+  initialWorkspace,
+}: {
+  token: string;
+  api: MuseApi;
+  initialWorkspace?: Workspace;
+}) {
+  const [workspace, setWorkspace] = useState<Workspace | undefined>(initialWorkspace);
   const [section, setSection] = useState<Section>("chat");
   const [detail, setDetail] = useState<Detail>();
   const [toast, setToast] = useState("");
@@ -440,8 +825,9 @@ function WorkspaceApp({ token }: { token: string }) {
     setError("");
   }, [api]);
   useEffect(() => {
+    if (initialWorkspace) return;
     void refresh().catch((e) => setError(String(e)));
-  }, [refresh]);
+  }, [refresh, initialWorkspace]);
   useEffect(() => {
     const listener = AppState.addEventListener("change", (state) => {
       if (state === "active") void refresh().catch((e) => setError(String(e)));
