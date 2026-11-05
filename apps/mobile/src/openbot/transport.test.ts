@@ -6,23 +6,33 @@
 // run in CI with no runtime beneath them.
 
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 
 import {
   createTenancyStore,
+  readWorkspaceScopeListing,
   type ScopeSelection,
   type ScopeStorage,
+  scopeRefusalOf,
+  WorkspaceScopeRefusedError,
 } from "./tenancy";
 import {
+  createEnterpriseLogin,
   createScopeBoundStream,
   createScopedFetch,
+  EnterpriseLoginRefused,
   mediaCacheKey,
+  memoryPendingLoginStorage,
+  pkceChallenge,
   readMediaCache,
-  scopeHeaders,
+  resolveMobileAuthConfig,
   SCOPE_HEADER_ALLOWED_PATHS,
-  TenantSelectionChangedError,
+  scopeHeaders,
+  sha256,
   TENANT_HEADER,
-  withStreamScope,
+  TenantSelectionChangedError,
   WORKSPACE_HEADER,
+  withStreamScope,
   writeMediaCache,
 } from "./transport";
 
@@ -54,6 +64,11 @@ describe("scopeHeaders", () => {
       [TENANT_HEADER]: "acme",
       [WORKSPACE_HEADER]: "acme-finance",
     });
+    // T07.10's first screen is the original Workspace read; it needs the pair too.
+    expect(scopeHeaders("/api/workspace", ACME)).toEqual({
+      [TENANT_HEADER]: "acme",
+      [WORKSPACE_HEADER]: "acme-finance",
+    });
   });
 
   test("an unreviewed path is left undecorated", () => {
@@ -73,7 +88,7 @@ describe("scopeHeaders", () => {
   test("every inventory entry names its owner and reason — a closed, reviewable list", () => {
     // Widening the list is a review, not an accident: each entry's owner names the ticket
     // that performed it (MT107's is the mobile-aggregation family's own review).
-    const reviewedBy = ["MT105", "MT107"];
+    const reviewedBy = ["MT105", "MT107", "T07.10"];
     for (const entry of SCOPE_HEADER_ALLOWED_PATHS) {
       expect(entry.id).toBeTruthy();
       expect(entry.prefix.startsWith("/api/")).toBe(true);
@@ -330,6 +345,231 @@ describe("scoped media cache", () => {
     );
     await store.selectScope(null);
     expect(mediaCacheKey(store, "/media/1")).toBe("media:personal:/media/1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T07.10 (#600): the enterprise PKCE login and its one session handoff
+// ---------------------------------------------------------------------------
+
+const ENTERPRISE_AUTH_CONFIG = {
+  mode: "enterprise" as const,
+  apiOrigin: "https://bff.example",
+  authorityOrigin: "https://auth.example",
+  clientId: "openmuse-mobile",
+  redirectUri: "openmuse://enterprise-auth",
+};
+
+describe("enterprise PKCE", () => {
+  test("the SHA-256 digest and S256 challenge match Node's crypto on the FIPS vectors", () => {
+    for (const text of [
+      "",
+      "abc",
+      "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+      "a".repeat(1000),
+    ]) {
+      const bytes = new TextEncoder().encode(text);
+      expect(Buffer.from(sha256(bytes)).toString("hex")).toBe(
+        createHash("sha256").update(text).digest("hex"),
+      );
+      expect(pkceChallenge(text)).toBe(createHash("sha256").update(text).digest("base64url"));
+    }
+  });
+
+  test("a challenge is the unpadded base64url shape the authority accepts", () => {
+    expect(pkceChallenge("verifier")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(pkceChallenge("verifier")).not.toContain("=");
+  });
+});
+
+describe("enterprise configuration", () => {
+  test("enterprise mode requires both explicit origins — no localhost fallback", () => {
+    expect(() =>
+      resolveMobileAuthConfig({ mode: "enterprise", apiOrigin: "https://bff.example" }, "ios"),
+    ).toThrow(/EXPO_PUBLIC_OPENBOT_URL/);
+    expect(() =>
+      resolveMobileAuthConfig(
+        { mode: "enterprise", authorityOrigin: "https://auth.example" },
+        "android",
+      ),
+    ).toThrow(/EXPO_PUBLIC_API_URL/);
+  });
+
+  test("an explicit enterprise config keeps the two origins and the registered callback", () => {
+    const config = resolveMobileAuthConfig(
+      {
+        mode: "enterprise",
+        apiOrigin: "https://bff.example/",
+        authorityOrigin: "https://auth.example/",
+        clientId: "openmuse-mobile",
+        redirectUri: "openmuse://enterprise-auth",
+      },
+      "web",
+    );
+    expect(config).toEqual(ENTERPRISE_AUTH_CONFIG);
+  });
+
+  test("the unset mode is legacy, never a silent enterprise/standalone switch", () => {
+    expect(resolveMobileAuthConfig({}, "ios").mode).toBe("legacy");
+    expect(resolveMobileAuthConfig({ mode: "standalone" }, "ios").mode).toBe("standalone");
+  });
+});
+
+describe("enterprise session handoff", () => {
+  test("mobile_real_app_uses_enterprise_session_handoff", async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const login = createEnterpriseLogin({
+      config: ENTERPRISE_AUTH_CONFIG,
+      storage: memoryPendingLoginStorage(),
+      randomBytes: () => new Uint8Array(32).fill(7),
+      fetchLike: async (url, init) => {
+        requests.push({ url, init });
+        return new Response(
+          JSON.stringify({
+            token: "handle-1",
+            mode: "live",
+            authMode: "enterprise",
+            authority: "https://auth.example",
+            expiresAt: "2030-01-01T00:00:00.000Z",
+            user: { id: "user-1", principalId: "principal-1" },
+            scope: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+
+    const pending = login.begin();
+    const authorize = new URL(pending.authorizeUrl);
+    expect(authorize.origin).toBe("https://auth.example");
+    expect(authorize.pathname).toBe("/api/enterprise/mobile/authorize");
+    expect(authorize.searchParams.get("client_id")).toBe("openmuse-mobile");
+    expect(authorize.searchParams.get("redirect_uri")).toBe("openmuse://enterprise-auth");
+    expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(authorize.searchParams.get("code_challenge")).toBe(pkceChallenge(pending.codeVerifier));
+
+    const session = await login.complete(
+      `openmuse://enterprise-auth?code=one-time-code&state=${encodeURIComponent(pending.state)}&intentId=intent-1`,
+    );
+
+    // The real app's session body is the frozen EnterpriseSessionInput, sent
+    // to the BFF origin — never to the authority and never with an accessKey.
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe("https://bff.example/api/session");
+    const body = JSON.parse(String(requests[0]?.init?.body)) as Record<string, unknown>;
+    expect(body.authMode).toBe("enterprise");
+    expect(body.intentId).toBe("intent-1");
+    expect(body.code).toBe("one-time-code");
+    expect(body.codeVerifier).toBe(pending.codeVerifier);
+    expect(body.redirectUri).toBe("openmuse://enterprise-auth");
+    expect("accessKey" in body).toBe(false);
+    expect(session.token).toBe("handle-1");
+    expect(session.authority).toBe("https://auth.example");
+  });
+
+  test("enterprise_login_failure_never_tries_access_key", async () => {
+    const standaloneRequests: unknown[] = [];
+    const requestUrls: string[] = [];
+    const login = createEnterpriseLogin({
+      config: ENTERPRISE_AUTH_CONFIG,
+      storage: memoryPendingLoginStorage(),
+      randomBytes: () => new Uint8Array(32).fill(3),
+      fetchLike: async (url, init) => {
+        requestUrls.push(url);
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        if ("accessKey" in body || "owner" in body) standaloneRequests.push(body);
+        return new Response(
+          JSON.stringify({ error: "Request refused.", code: "SESSION_REVOKED", requestId: "r-1" }),
+          { status: 401, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+
+    const pending = login.begin();
+    const error = await capture(
+      login.complete(
+        `openmuse://enterprise-auth?code=c&state=${encodeURIComponent(pending.state)}&intentId=i`,
+      ),
+    );
+    expect(error).toBeInstanceOf(EnterpriseLoginRefused);
+    expect((error as EnterpriseLoginRefused).code).toBe("SESSION_REVOKED");
+    expect(standaloneRequests).toHaveLength(0);
+    expect(requestUrls).toEqual(["https://bff.example/api/session"]);
+  });
+
+  test("a foreign state or an unregistered redirect never reaches the exchange", async () => {
+    let dialed = 0;
+    const login = createEnterpriseLogin({
+      config: ENTERPRISE_AUTH_CONFIG,
+      storage: memoryPendingLoginStorage(),
+      randomBytes: () => new Uint8Array(32).fill(5),
+      fetchLike: async () => {
+        dialed += 1;
+        return new Response("{}", { status: 200 });
+      },
+    });
+    const pending = login.begin();
+    const badState = await capture(
+      login.complete("openmuse://enterprise-auth?code=c&state=other&intentId=i"),
+    );
+    expect(badState).toBeInstanceOf(EnterpriseLoginRefused);
+    expect((badState as EnterpriseLoginRefused).code).toBe("STATE_MISMATCH");
+    const badRedirect = await capture(
+      login.complete(
+        `openmuse://elsewhere?code=c&state=${encodeURIComponent(pending.state)}&intentId=i`,
+      ),
+    );
+    expect(badRedirect).toBeInstanceOf(EnterpriseLoginRefused);
+    expect((badRedirect as EnterpriseLoginRefused).code).toBe("REDIRECT_MISMATCH");
+    expect(dialed).toBe(0);
+  });
+
+  test("the scope listing reads the MobileBffError's flat refusal code", async () => {
+    const error = await capture(
+      readWorkspaceScopeListing(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: "Request refused.",
+              code: "SESSION_EXPIRED",
+              requestId: "r-1",
+            }),
+            { status: 401, headers: { "content-type": "application/json" } },
+          ),
+      ),
+    );
+    expect(error).toBeInstanceOf(WorkspaceScopeRefusedError);
+    expect(scopeRefusalOf(error)?.status).toBe(401);
+    expect(scopeRefusalOf(error)?.code).toBe("SESSION_EXPIRED");
+  });
+
+  test("a session minted for another authority is refused, not adopted", async () => {
+    const login = createEnterpriseLogin({
+      config: ENTERPRISE_AUTH_CONFIG,
+      storage: memoryPendingLoginStorage(),
+      randomBytes: () => new Uint8Array(32).fill(4),
+      fetchLike: async () =>
+        new Response(
+          JSON.stringify({
+            token: "handle-1",
+            mode: "live",
+            authMode: "enterprise",
+            authority: "https://old.example",
+            expiresAt: "2030-01-01T00:00:00.000Z",
+            user: { id: "user-1", principalId: null },
+            scope: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    });
+    const pending = login.begin();
+    const error = await capture(
+      login.complete(
+        `openmuse://enterprise-auth?code=c&state=${encodeURIComponent(pending.state)}&intentId=i`,
+      ),
+    );
+    expect(error).toBeInstanceOf(EnterpriseLoginRefused);
+    expect((error as EnterpriseLoginRefused).code).toBe("AUTHORITY_MISMATCH");
   });
 });
 
