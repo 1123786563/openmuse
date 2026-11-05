@@ -43,6 +43,20 @@ import { GoogleAuth } from "./google-auth.ts";
 import { rateLimit } from "./rate-limit.ts";
 import { WorkspaceService } from "./workspace.ts";
 
+/**
+ * T07.18 (#608): the browser session DTO the enterprise supply answers with.
+ * The standalone surface's preview/console locators are signed owner URLs —
+ * a credential the enterprise supply never accepts or issues. The enterprise
+ * locator is the media seam's own ticket (minted per read by the media
+ * routes), so the fields simply leave the answer.
+ */
+function enterpriseBrowserSession<T extends { previewUrl?: string; consoleUrl?: string }>(
+  session: T,
+): Omit<T, "previewUrl" | "consoleUrl"> {
+  const { previewUrl: _preview, consoleUrl: _console, ...rest } = session;
+  return rest;
+}
+
 export async function createApp(
   db: Store,
   config: Config,
@@ -432,26 +446,35 @@ export async function createApp(
   });
   app.post("/api/browsers", async (c) => {
     const body = z.object({ url: z.url().max(4096) }).parse(await c.req.json());
-    return c.json(await browser.create(c.get("owner"), body.url), 201);
+    const created = await browser.create(c.get("owner"), body.url);
+    // T07.18: the enterprise supply never answers a standalone signed owner
+    // URL; its preview/console locators are the media seam's own tickets.
+    return c.json(enterprise ? enterpriseBrowserSession(created) : created, 201);
   });
   app.get("/api/browsers/:id", async (c) => {
     const owner = c.get("owner");
-    return c.json(browser.decorate(owner, await browser.get(owner, c.req.param("id"))));
+    const session = await browser.get(owner, c.req.param("id"));
+    return c.json(
+      enterprise ? enterpriseBrowserSession(session) : browser.decorate(owner, session),
+    );
   });
   app.post("/api/browsers/:id/navigate", async (c) => {
     const body = z.object({ url: z.url().max(4096) }).parse(await c.req.json());
-    return c.json(await browser.navigate(c.get("owner"), c.req.param("id"), body.url));
+    const moved = await browser.navigate(c.get("owner"), c.req.param("id"), body.url);
+    return c.json(enterprise ? enterpriseBrowserSession(moved) : moved);
   });
-  app.post("/api/browsers/:id/close", async (c) =>
-    c.json(await browser.close(c.get("owner"), c.req.param("id"))),
-  );
+  app.post("/api/browsers/:id/close", async (c) => {
+    const closed = await browser.close(c.get("owner"), c.req.param("id"));
+    return c.json(enterprise ? enterpriseBrowserSession(closed) : closed);
+  });
   app.get("/api/browsers/:id/read", async (c) =>
     c.json(await browser.read(c.get("owner"), c.req.param("id"))),
   );
   app.post("/api/browsers/:id/reopen", async (c) => {
     const raw = await c.req.text();
     const body = z.object({ url: z.url().max(4096).optional() }).parse(raw ? JSON.parse(raw) : {});
-    return c.json(await browser.reopen(c.get("owner"), c.req.param("id"), body.url));
+    const reopened = await browser.reopen(c.get("owner"), c.req.param("id"), body.url);
+    return c.json(enterprise ? enterpriseBrowserSession(reopened) : reopened);
   });
   app.post("/api/browsers/:id/import-downloads", async (c) =>
     c.json(await browser.imports(c.get("owner"), c.req.param("id"))),
