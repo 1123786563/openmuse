@@ -28,6 +28,15 @@ export function AgentWorkspaceProvider({ children }: { children: ReactNode }) {
   const [data, setData] = useState<AgentWorkspace>();
   const [error, setError] = useState("");
   const requestVersion = useRef(0);
+  /*
+   * T07.11 (#601): the polling world this provider serves is scoped — the
+   * agent reads ride the SAME tenancy store the MuseApi scoped fetch mounts
+   * from, so a switch that advanced the generation must also retire this
+   * provider's cached snapshot (the next poll answers under the NEW scope
+   * only). `version` is bumped by the scope key the provider renders under:
+   * the app shell re-mounts this provider inside the re-keyed provider tree,
+   * so a stale answer from the OLD scope can never land in the new state.
+   */
   const refresh = useCallback(async () => {
     const version = ++requestVersion.current;
     try {
