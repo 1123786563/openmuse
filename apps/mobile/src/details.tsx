@@ -18,7 +18,7 @@ import {
   Trash2,
   X,
 } from "lucide-react-native";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Image, Linking, Platform, Text, View } from "react-native";
 import {
   type ActionProposal,
@@ -38,6 +38,7 @@ import { browserAddress, browserSite } from "./browser-address";
 import { ComputerSheet } from "./computer";
 import DateTimeEditor from "./DateTimeEditor";
 import { localDateTime, zonedInstant } from "./date-time";
+import { dispositionOf, getCompanyAssurance, MobileBffRefused } from "./openbot/company-assurance";
 import PdfReader from "./PdfReader";
 import { statusLabel, t } from "./strings";
 import {
@@ -57,6 +58,10 @@ import {
   s,
   timeLabel,
 } from "./ui";
+
+/** T07.12: the one new copy line this ticket adds to the file detail. */
+const LOCATE_FIRST = "请先获取文件的访问票据";
+
 import { type Detail, useWorkspace } from "./workspace";
 export function Details({ detail }: { detail: Detail }) {
   const { close, navigate } = useWorkspace();
@@ -727,8 +732,20 @@ function ReviewLine({ label, value }: { label: string; value: string }) {
     </View>
   );
 }
+/*
+ * T07.12 (#602): the file detail no longer hands the reader a bearer-headered
+ * storage URL. The content path is located through the company-assurance
+ * client's ≤60-second media ticket (POST /api/media-tickets), minted on open
+ * and re-minted on retry; a refused mint (revoked session, invisible
+ * resource) surfaces as the pause path's own copy and NEVER falls back to
+ * direct storage. A 403 COMPANY_REAUTH_REQUIRED pauses here and bubbles to
+ * App.tsx's challenge flow; 401 clears identity; 503 stays failed.
+ */
 function FileDetail({ file: f }: { file: Artifact }) {
   const { api, refresh, open, close } = useWorkspace();
+  // The registered enterprise client (T07.10's wiring registers it); null on
+  // the standalone supply, where the legacy direct URL contract stays.
+  const assurance = getCompanyAssurance();
   const [values, setValues] = useState<Record<string, string | boolean>>(() =>
     Object.fromEntries(
       (f.fields || [])
@@ -741,7 +758,49 @@ function FileDetail({ file: f }: { file: Artifact }) {
   );
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const url = api.url(f.url || `/api/files/${f.id}/content`);
+  // T07.12: the reader's located bytes — a minted ticket URL, or null.
+  const [located, setLocated] = useState<string | null>(null);
+  const [locateError, setLocateError] = useState<string>("");
+  const contentPath = f.url || `/api/files/${f.id}/content`;
+  // Standalone/local supply only: the legacy direct URL this app owned before
+  // the enterprise BFF. Enterprise mode never reaches it (assurance is set).
+  const legacyUrl = api.url(contentPath);
+  const locate = useCallback(async () => {
+    setLocateError("");
+    if (!assurance) {
+      // Standalone/local supply (no enterprise session): the legacy direct
+      // URL remains this supply's own contract, unchanged.
+      setLocated(legacyUrl);
+      return;
+    }
+    try {
+      const minted = await assurance.mediaTicket({ path: contentPath, method: "GET" });
+      setLocated(minted.url);
+    } catch (e) {
+      // The typed refusal: 403 pauses for the company challenge (App.tsx
+      // owns the browser trip); 401 clears identity there; everything else
+      // stays failed here with the reader's own retry.
+      if (e instanceof MobileBffRefused) {
+        // The §5 disposition table: 401 clears identity (the app's 401 hook
+        // remounts the gate), 403 pauses onto the challenge, 503 stays failed,
+        // everything else surfaces as-is.
+        const disposition = dispositionOf(e);
+        if (disposition === "pause-reauth") {
+          assurance.pauseForReauth({ kind: "file", id: f.id });
+          void assurance.beginChallenge().catch(() => undefined);
+        } else if (disposition === "sign-out") {
+          assurance.signOut();
+        }
+        setLocateError(e.message);
+      } else {
+        setLocateError(e instanceof Error ? e.message : String(e));
+      }
+      setLocated(null);
+    }
+  }, [assurance, legacyUrl, contentPath, f.id]);
+  useEffect(() => {
+    void locate();
+  }, [locate]);
   async function fill() {
     setBusy(true);
     setError("");
@@ -759,13 +818,17 @@ function FileDetail({ file: f }: { file: Artifact }) {
     setError("");
     try {
       if (Platform.OS === "web") {
-        await Linking.openURL(url);
+        const href = located ?? (assurance ? null : legacyUrl);
+        if (!href) throw new Error(LOCATE_FIRST);
+        await Linking.openURL(href);
         return;
       }
       const target = `${FileSystem.cacheDirectory}${f.id}.pdf`;
-      await FileSystem.downloadAsync(url, target, {
-        headers: { Authorization: `Bearer ${api.token}` },
-      });
+      // T07.12: the native download shares the same minted locator; there is
+      // no bearer-headered storage fallback anywhere this sheet reaches.
+      const downloadUrl = located ?? (assurance ? null : legacyUrl);
+      if (!downloadUrl) throw new Error(LOCATE_FIRST);
+      await FileSystem.downloadAsync(downloadUrl, target);
       if (await Sharing.isAvailableAsync())
         await Sharing.shareAsync(target, { mimeType: "application/pdf", UTI: "com.adobe.pdf" });
       else throw new Error(t("sharingUnavailable"));
@@ -784,7 +847,12 @@ function FileDetail({ file: f }: { file: Artifact }) {
       onClose={close}
       wide
     >
-      <PdfReader url={url} token={api.token} pageCount={f.pageCount} />
+      <PdfReader
+        url={located}
+        error={locateError}
+        onRetry={() => void locate()}
+        pageCount={f.pageCount}
+      />
       <View style={[s.row, { gap: 10, marginVertical: 18, flexWrap: "wrap" }]}>
         <Button icon={Download} onPress={() => void share()}>
           {Platform.OS === "web" ? t("openDownload") : t("saveOrShare")}
