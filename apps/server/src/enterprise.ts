@@ -39,7 +39,11 @@ import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
-import { GoogleAuth } from "./google-auth.ts";
+import {
+  GoogleAuth,
+  type GoogleOAuthIntent,
+  type GoogleOAuthIntentVerifier,
+} from "./google-auth.ts";
 import { rateLimit } from "./rate-limit.ts";
 import { WorkspaceService } from "./workspace.ts";
 
@@ -297,10 +301,19 @@ const CONTENT_ROUTES: readonly ContentRouteRule[] = [
   },
 ];
 
+/** The body field a route binds as the source it authorizes (T07.19). */
+export type EnterpriseBodySource = "mail-attachment";
+
 /** The admission an admitted request asks: one operation, one optional object. */
 export interface EnterpriseActionAdmission {
   operation: string;
   resourceId: string | null;
+  /**
+   * T07.19: the source object lives in the JSON body, so the guard derives
+   * the admission's resourceId from it (after cloning the body) instead of
+   * falling back to a collection-level action.
+   */
+  source?: EnterpriseBodySource;
 }
 
 /**
@@ -383,6 +396,31 @@ export function enterpriseActionFor(
     path === "/api/agent" ||
     path.startsWith("/api/agent/");
   if (isRunSurface) return { operation: ENTERPRISE_OPERATIONS.copilotkitInvoke, resourceId: null };
+  // T07.19: the Google connection and file surfaces this BFF answers for an
+  // enterprise supply. The connection is one team-scoped object; a generated
+  // file binds the source artifact it reads; an attachment import binds the
+  // mail reference it reads (derived from the body by the guard).
+  if (path === "/api/google/connect" && method === "POST")
+    return {
+      operation: ENTERPRISE_OPERATIONS.workspaceRead,
+      resourceId: "google:connection",
+    };
+  if (path === "/api/google/disconnect" && method === "POST")
+    return {
+      operation: ENTERPRISE_OPERATIONS.workspaceRead,
+      resourceId: "google:connection",
+    };
+  if (path === "/api/files" && method === "POST")
+    return { operation: ENTERPRISE_OPERATIONS.fileRead, resourceId: null };
+  const fill = /^\/api\/files\/([^/]+)\/fill$/.exec(path);
+  if (fill && method === "POST")
+    return { operation: ENTERPRISE_OPERATIONS.fileRead, resourceId: `file:${fill[1]}` };
+  if (path === "/api/mail/import-attachment" && method === "POST")
+    return {
+      operation: ENTERPRISE_OPERATIONS.workspaceRead,
+      resourceId: null,
+      source: "mail-attachment",
+    };
   for (const route of CONTENT_ROUTES)
     if (route.test(path, method))
       return { operation: route.operation, resourceId: route.resourceId(path) };
@@ -533,6 +571,97 @@ export function enterpriseSessionHandler(authority: OpenbotAuthority) {
 }
 
 /**
+ * T07.19 (#609): the fixed intent a Google connect request mints its state
+ * for. Everything here is read from the guard's admitted facts or deployment
+ * config — never from the request body — so the callback can re-admit exactly
+ * this authority/handle/account/company/team/return-intent and nothing else.
+ */
+export function enterpriseGoogleIntent<
+  Env extends {
+    Variables: {
+      enterpriseAdmission: EnterpriseAdmission;
+      enterpriseTickets: EnterpriseMediaTickets;
+      owner: string;
+    };
+  },
+>(context: Context<Env>, authority: OpenbotAuthority, config: Config): GoogleOAuthIntent {
+  const facts = enterpriseFacts(context);
+  return {
+    authority: authority.authorityOrigin,
+    handle: enterpriseHandleOf(context),
+    account: facts.userId,
+    principalId: facts.principalId,
+    selector: { tenantId: facts.selector.tenantId, workspaceId: facts.selector.workspaceId },
+    operation: ENTERPRISE_OPERATIONS.workspaceRead,
+    resourceId: "google:connection",
+    returnIntent: config.googleRedirectUri,
+    owner: enterpriseOwner(facts.selector, { principalId: facts.principalId }),
+  };
+}
+
+/**
+ * T07.19: the callback's online re-admission of a stored OAuth intent. The
+ * state fixed the handle/selector/account/principal when it was minted; a
+ * live admission that now answers a different account, principal, authority
+ * or selection means the original intent is gone, and the callback refuses
+ * with ACCOUNT_CHANGED before any token is exchanged or stored.
+ */
+export function verifyEnterpriseGoogleIntent(
+  authority: OpenbotAuthority,
+): GoogleOAuthIntentVerifier {
+  return async (intent) => {
+    if (intent.authority !== authority.authorityOrigin)
+      throw AppError.fromCode("ACCOUNT_CHANGED", 401);
+    if (enterpriseOwner(intent.selector, { principalId: intent.principalId }) !== intent.owner)
+      throw AppError.fromCode("ACCOUNT_CHANGED", 401);
+    const admission = await authority.admission(
+      intent.handle,
+      intent.selector,
+      intent.operation,
+      intent.resourceId,
+    );
+    if (
+      admission.scope?.tenantId !== intent.selector.tenantId ||
+      admission.scope.workspaceId !== intent.selector.workspaceId ||
+      admission.actor.userId !== intent.account ||
+      (admission.actor.principalId ?? "") !== intent.principalId
+    )
+      throw AppError.fromCode("ACCOUNT_CHANGED", 401);
+  };
+}
+
+/**
+ * T07.19: the original Google callback DTO for both supplies. The enterprise
+ * path passes the stored-intent verifier; the standalone path passes none and
+ * keeps its owner-from-state behavior unchanged.
+ */
+export function googleCallbackHandler(google: GoogleAuth, verify?: GoogleOAuthIntentVerifier) {
+  return async (context: Context) => {
+    if (context.req.query("error"))
+      return context.html(
+        "<h1>Google connection cancelled</h1><p>You can return to OpenMuse.</p>",
+        400,
+      );
+    const state = context.req.query("state"),
+      code = context.req.query("code");
+    if (!state || !code) throw new AppError("Google callback is incomplete");
+    await google.callback(state, code, verify);
+    return context.html(
+      "<h1>Google is connected</h1><p>Return to OpenMuse and refresh your workspace.</p>",
+    );
+  };
+}
+
+/**
+ * T07.19: an artifact generated in the enterprise supply answers with the
+ * BFF's online content path, never the standalone signed owner URL. The
+ * content route itself re-admits (and re-pulls) online.
+ */
+export function onlineFileArtifact(config: Config, file: Artifact): Artifact {
+  return { ...file, url: `${config.publicUrl}/api/files/${file.id}/content` };
+}
+
+/**
  * The enterprise request gate: Bearer handle + explicit selection headers,
  * and ONE online admission for this request before any store read. The
  * admitted facts ride the request context; the actor is the authority's
@@ -616,17 +745,39 @@ export function enterpriseGuard(
     }
     const operation = control
       ? control.operation
-      : isWorkspace
-        ? ENTERPRISE_OPERATIONS.workspaceRead
-        : isRunSurface
-          ? ENTERPRISE_OPERATIONS.copilotkitInvoke
-          : isMediaTicketMint
-            ? ENTERPRISE_OPERATIONS.mediaTicket
-            : proxy
-              ? proxy.operation
-              : mediaRoute
-                ? ENTERPRISE_OPERATIONS.fileRead
-                : ENTERPRISE_OPERATIONS.workspaceRead;
+      : action
+        ? action.operation
+        : isWorkspace
+          ? ENTERPRISE_OPERATIONS.workspaceRead
+          : isRunSurface
+            ? ENTERPRISE_OPERATIONS.copilotkitInvoke
+            : isMediaTicketMint
+              ? ENTERPRISE_OPERATIONS.mediaTicket
+              : proxy
+                ? proxy.operation
+                : mediaRoute
+                  ? ENTERPRISE_OPERATIONS.fileRead
+                  : ENTERPRISE_OPERATIONS.workspaceRead;
+    let actionResourceId = control
+      ? control.resourceId
+      : action
+        ? action.resourceId
+        : (mediaRoute?.id ?? null);
+    // T07.19: an import authorizes the mail source it reads, named in the
+    // JSON body. The guard reads a clone, so the route handler still parses
+    // the original body; a missing reference is refused before admission.
+    if (action?.source === "mail-attachment") {
+      let body: unknown;
+      try {
+        body = await context.req.raw.clone().json();
+      } catch {
+        throw AppError.fromCode("INVALID_REQUEST", 400);
+      }
+      const reference = (body as { reference?: unknown } | null)?.reference;
+      if (typeof reference !== "string" || !reference)
+        throw AppError.fromCode("INVALID_REQUEST", 400);
+      actionResourceId = `mail-attachment:${reference}`;
+    }
     // scope.discover is the one scope-free word (interfaces §5.2's
     // "未选范围时可发现"): discovery may run before a selection exists, so
     // it admits without selectors exactly as the authority's route does.
@@ -635,12 +786,7 @@ export function enterpriseGuard(
     // T07.18: a control action binds the instance it names the same way.
     const admission = scopeFree
       ? await authority.admissionDiscovery(handle, operation)
-      : await authority.admission(
-          handle,
-          selector,
-          operation,
-          control ? control.resourceId : action ? action.resourceId : (mediaRoute?.id ?? null),
-        );
+      : await authority.admission(handle, selector, operation, actionResourceId);
     // The admitted scope must echo the request's one intent exactly.
     if (
       !scopeFree &&
@@ -651,6 +797,8 @@ export function enterpriseGuard(
     // An object action must come back bound to THAT object; an admission
     // that dropped or changed the resource id does not admit this request.
     if (action?.resourceId && admission.resourceId !== action.resourceId)
+      throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
+    if (action?.source && admission.resourceId !== actionResourceId)
       throw AppError.fromCode("RESOURCE_NOT_FOUND", 404);
     context.set("enterpriseAdmission", admission);
     context.set("enterpriseTickets", tickets);
@@ -1179,6 +1327,75 @@ export async function enterpriseWorkspaceSnapshot(
 }
 
 /**
+ * T07.19 (#609): the Google connection, attachment import and file routes
+ * keep their original client DTOs, but run after the guard above admitted the
+ * request online and put the server-owned namespace on the context. The
+ * connect route mints the state from that admitted intent, while the callback
+ * is mounted before the guard by the app factories and re-admits the stored
+ * intent itself.
+ */
+export function mountEnterpriseOAuthFileRoutes<
+  Env extends {
+    Variables: {
+      enterpriseAdmission: EnterpriseAdmission;
+      enterpriseTickets: EnterpriseMediaTickets;
+      owner: string;
+    };
+  },
+>(
+  app: Hono<Env>,
+  deps: {
+    config: Config;
+    authority: OpenbotAuthority;
+    google: GoogleAuth;
+    files: Files;
+    workspace: WorkspaceService;
+  },
+): void {
+  app.post("/api/google/connect", async (context) => {
+    const body = z
+      .object({ capability: z.enum(["read", "write"]) })
+      .parse(await context.req.json());
+    const intent = enterpriseGoogleIntent(context, deps.authority, deps.config);
+    return context.json(
+      await deps.google.connect(context.get("owner"), body.capability === "write", intent),
+    );
+  });
+  app.post("/api/google/disconnect", async (context) => {
+    await deps.google.disconnect(context.get("owner"));
+    return context.json({ ok: true });
+  });
+  app.post("/api/files", async (context) => {
+    const data = await context.req.parseBody();
+    const file = data.file;
+    if (!(file instanceof File)) throw new AppError("Choose a PDF file");
+    const imported = await deps.files.import(
+      context.get("owner"),
+      file.name,
+      new Uint8Array(await file.arrayBuffer()),
+      "Uploaded by you",
+    );
+    return context.json(onlineFileArtifact(deps.config, imported), 201);
+  });
+  app.post("/api/files/:id/fill", async (context) => {
+    const body = z
+      .object({ fields: z.record(z.string(), z.union([z.string(), z.boolean()])) })
+      .parse(await context.req.json());
+    const generated = await deps.files.fill(
+      context.get("owner"),
+      context.req.param("id"),
+      body.fields,
+    );
+    return context.json(onlineFileArtifact(deps.config, generated), 201);
+  });
+  app.post("/api/mail/import-attachment", async (context) => {
+    const body = z.object({ reference: z.string() }).parse(await context.req.json());
+    const imported = await deps.workspace.importAttachment(context.get("owner"), body.reference);
+    return context.json(onlineFileArtifact(deps.config, imported), 201);
+  });
+}
+
+/**
  * Mount the enterprise supply on a Hono app: the session exchange (its own
  * one-time code, never an accessKey), the per-request gate for everything
  * registered afterwards, and the original-Workspace read. app.ts mounts this
@@ -1204,6 +1421,9 @@ export function mountEnterpriseRoutes<
   } & {
     workspace: WorkspaceService;
     actions: ActionService;
+    /** T07.19: the connection and file services the OAuth/file routes call. */
+    google: GoogleAuth;
+    files: Files;
     intelligence?: MainThreadIntelligence;
     /** T07.18: the browser/computer control seam; absent leaves the routes off. */
     control?: EnterpriseControlDeps;
@@ -1315,6 +1535,7 @@ export function mountEnterpriseRoutes<
   });
   mountEnterpriseMediaRoutes(app, deps);
   mountEnterpriseControlRoutes(app, deps);
+  mountEnterpriseOAuthFileRoutes(app, deps);
 }
 
 /**
@@ -1804,10 +2025,10 @@ export async function createEnterpriseApp(
   // standalone app builds — an enterprise deployment keeps this server, so
   // the original DTO behavior comes from the original services, only ever
   // called with the server-admitted namespace owner.
+  const auth = await createAuth(db, config);
+  const files = new Files(db, config, auth);
   const google = new GoogleAuth(db, config);
-  const workspace =
-    options.workspace ??
-    new WorkspaceService(db, config, new Files(db, config, await createAuth(db, config)), google);
+  const workspace = options.workspace ?? new WorkspaceService(db, config, files, google);
   const actions =
     options.actions ??
     new ActionService(db, {
@@ -1872,6 +2093,12 @@ export async function createEnterpriseApp(
   app.get("/api/health", (context) =>
     context.json({ ok: true, mode: config.mode, authMode: "enterprise" }),
   );
+  // T07.19: the callback is registered before the guard; it recovers the
+  // fixed intent from the server-minted state and re-admits it online itself.
+  app.get(
+    "/api/google/callback",
+    googleCallbackHandler(google, verifyEnterpriseGoogleIntent(authority)),
+  );
   mountEnterpriseRoutes(app, {
     db,
     config,
@@ -1880,6 +2107,8 @@ export async function createEnterpriseApp(
     media: mediaDeps(db, config),
     workspace,
     actions,
+    google,
+    files,
     intelligence: options.intelligence,
     control: options.control ?? controlDeps(db, config, options.docker),
   });

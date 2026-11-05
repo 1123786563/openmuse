@@ -30,12 +30,16 @@ import {
   type EnterpriseActionGate,
   type EnterpriseAdmission,
   type EnterpriseMediaDeps,
+  enterpriseGoogleIntent,
   enterpriseGuard,
   enterpriseRequestSelection,
   enterpriseSessionHandler,
   enterpriseWorkspaceSnapshot,
+  googleCallbackHandler,
   mountEnterpriseMediaRoutes,
   type OpenbotAuthority,
+  onlineFileArtifact,
+  verifyEnterpriseGoogleIntent,
 } from "./enterprise.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
@@ -233,17 +237,13 @@ export async function createApp(
       return c.json(session);
     });
   }
-  app.get("/api/google/callback", async (c) => {
-    if (c.req.query("error"))
-      return c.html("<h1>Google connection cancelled</h1><p>You can return to OpenMuse.</p>", 400);
-    const state = c.req.query("state"),
-      code = c.req.query("code");
-    if (!state || !code) throw new AppError("Google callback is incomplete");
-    await google.callback(state, code);
-    return c.html(
-      "<h1>Google is connected</h1><p>Return to OpenMuse and refresh your workspace.</p>",
-    );
-  });
+  app.get(
+    "/api/google/callback",
+    googleCallbackHandler(
+      google,
+      enterprise ? verifyEnterpriseGoogleIntent(enterprise.authority) : undefined,
+    ),
+  );
   app.use("/api/*", async (c, next) => {
     // T07.05 (#595): enterprise requests admit online, per request, and never
     // fall back to a standalone owner. Routes this task has not wired for the
@@ -400,15 +400,15 @@ export async function createApp(
     const data = await c.req.parseBody();
     const file = data.file;
     if (!(file instanceof File)) throw new AppError("Choose a PDF file");
-    return c.json(
-      await files.import(
-        c.get("owner"),
-        file.name,
-        new Uint8Array(await file.arrayBuffer()),
-        "Uploaded by you",
-      ),
-      201,
+    const imported = await files.import(
+      c.get("owner"),
+      file.name,
+      new Uint8Array(await file.arrayBuffer()),
+      "Uploaded by you",
     );
+    // T07.19: the enterprise supply answers with the BFF's online content
+    // path, never the standalone signed owner URL.
+    return c.json(enterprise ? onlineFileArtifact(config, imported) : imported, 201);
   });
   app.get("/api/files/:id/content", async (c) => {
     const file = await files.get(c.get("owner"), c.req.param("id"));
@@ -420,11 +420,13 @@ export async function createApp(
     const body = z
       .object({ fields: z.record(z.string(), z.union([z.string(), z.boolean()])) })
       .parse(await c.req.json());
-    return c.json(await files.fill(c.get("owner"), c.req.param("id"), body.fields), 201);
+    const generated = await files.fill(c.get("owner"), c.req.param("id"), body.fields);
+    return c.json(enterprise ? onlineFileArtifact(config, generated) : generated, 201);
   });
   app.post("/api/mail/import-attachment", async (c) => {
     const body = z.object({ reference: z.string() }).parse(await c.req.json());
-    return c.json(await workspace.importAttachment(c.get("owner"), body.reference), 201);
+    const imported = await workspace.importAttachment(c.get("owner"), body.reference);
+    return c.json(enterprise ? onlineFileArtifact(config, imported) : imported, 201);
   });
   app.post("/api/google/connect", async (c) => {
     const body = z.object({ capability: z.enum(["read", "write"]) }).parse(await c.req.json());
@@ -436,7 +438,16 @@ export async function createApp(
       });
       return c.json({ url: null, connected: true });
     }
-    return c.json(await google.connect(c.get("owner"), body.capability === "write"));
+    // T07.19: the enterprise state is minted for the request's admitted
+    // authority/handle/account/company/team/return-intent; the callback
+    // re-admits exactly that intent before it stores a token.
+    return c.json(
+      await google.connect(
+        c.get("owner"),
+        body.capability === "write",
+        enterprise ? enterpriseGoogleIntent(c, enterprise.authority, config) : undefined,
+      ),
+    );
   });
   app.post("/api/google/disconnect", async (c) => {
     if (config.mode === "sample")

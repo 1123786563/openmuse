@@ -19,6 +19,24 @@ interface Tokens {
   scopes: string[];
   account: string;
 }
+/**
+ * T07.19 (#609): the enterprise intent an OAuth state was minted for. Every
+ * field is fixed by the server when the admitted request asks to connect, so
+ * the callback recovers the owner from this stored intent alone — never from
+ * an active session, a request body or a query identity. `owner` is the
+ * admitted company/team/principal namespace the tokens will belong to.
+ */
+export interface GoogleOAuthIntent {
+  readonly authority: string;
+  readonly handle: string;
+  readonly account: string;
+  readonly principalId: string;
+  readonly selector: Readonly<{ tenantId: string; workspaceId: string }>;
+  readonly operation: string;
+  readonly resourceId: string;
+  readonly returnIntent: string;
+  readonly owner: string;
+}
 interface OAuthState {
   id: string;
   owner: string;
@@ -26,7 +44,11 @@ interface OAuthState {
   verifier: string;
   scopes: string[];
   generation: string;
+  /** Present only for an enterprise-minted state (T07.19). */
+  enterprise?: GoogleOAuthIntent;
 }
+/** Re-admit the fixed enterprise intent online before its tokens are stored. */
+export type GoogleOAuthIntentVerifier = (intent: GoogleOAuthIntent) => Promise<void>;
 interface Credential {
   id: string;
   generation?: string;
@@ -97,7 +119,7 @@ export class GoogleAuth {
       }
     }
   }
-  async connect(owner: string, write: boolean) {
+  async connect(owner: string, write: boolean, enterprise?: GoogleOAuthIntent) {
     if (!this.configured())
       throw new AppError(
         "Configure GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and TOKEN_ENCRYPTION_KEY to connect Google",
@@ -128,6 +150,9 @@ export class GoogleAuth {
       verifier,
       scopes,
       generation,
+      // T07.19: the admitted request's fixed intent travels with the state;
+      // a callback that cannot re-admit exactly this intent stores nothing.
+      ...(enterprise ? { enterprise: { ...enterprise } } : {}),
     });
     const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
     url.search = new URLSearchParams({
@@ -144,11 +169,32 @@ export class GoogleAuth {
     }).toString();
     return { url: url.toString() };
   }
-  async callback(stateId: string, code: string) {
+  async callback(stateId: string, code: string, verifyIntent?: GoogleOAuthIntentVerifier) {
+    // The state is consumed exactly once, before any external call or store
+    // write, so a late or copied callback URL can never be retried.
     const state = await this.db.take<OAuthState>("system", "oauth", stateId);
     if (!state || state.expiresAt < Date.now())
       throw new AppError("Google sign-in expired. Connect again.", 400);
-    const credential = await this.db.get<Credential>(state.owner, "credentials", "google");
+    let owner = state.owner;
+    // An enterprise deployment never consumes a standalone state: its owner
+    // was not admitted through the authority, so it cannot become a bound
+    // connection in this supply.
+    if (verifyIntent && !state.enterprise) throw AppError.fromCode("ACCOUNT_CHANGED", 401);
+    if (state.enterprise) {
+      // T07.19: the owner is recovered from the stored intent only. The
+      // callback has no active session and reads no body/query identity; it
+      // re-admits the fixed handle/company/team online and refuses a changed
+      // account or scope before the token exchange.
+      if (!verifyIntent) throw AppError.fromCode("ACCOUNT_CHANGED", 401);
+      if (
+        state.owner !== state.enterprise.owner ||
+        state.enterprise.returnIntent !== this.config.googleRedirectUri
+      )
+        throw AppError.fromCode("ACCOUNT_CHANGED", 401);
+      await verifyIntent(state.enterprise);
+      owner = state.enterprise.owner;
+    }
+    const credential = await this.db.get<Credential>(owner, "credentials", "google");
     if (!state.generation || credential?.generation !== state.generation)
       throw new AppError("Google sign-in changed or was disconnected. Connect again.", 409);
     const response = await fetch("https://oauth2.googleapis.com/token", {
@@ -173,9 +219,9 @@ export class GoogleAuth {
     if (!profile.ok)
       throw new AppError("Google did not grant Gmail read access. Connect again.", 403);
     const { emailAddress } = z.object({ emailAddress: z.email() }).parse(await profile.json());
-    const previous = await this.tokens(state.owner);
+    const previous = await this.tokens(owner);
     await this.save(
-      state.owner,
+      owner,
       {
         connectionId: randomUUID(),
         accessToken: token.access_token,
