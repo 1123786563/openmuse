@@ -432,6 +432,8 @@ const STRINGS: Record<string, string> = {
   openThreadsMenu: "打开会话与菜单",
   openAgentActivity: "打开{name}的动态与确认",
   notificationsBadge: "通知，{n} 条未读或待处理",
+  switchScope: "切换公司团队",
+  switchScopeSubtitle: "切换会先停止当前对话，再进入所选范围。",
   backToApps: "返回应用",
   retryMainChat: "重试主对话",
   sideChat: "侧聊",

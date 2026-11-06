@@ -47,6 +47,37 @@ import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
 const displayParameters = z.record(z.string(), z.unknown());
+
+/*
+ * T07.11 (#601): the enterprise switch seam. A company/team switch must stop
+ * the LIVE agent turn before the store's selection moves; the app shell owns
+ * that order but cannot reach into a ChatScreen, so each live screen registers
+ * its stop here while mounted and withdraws it on unmount. The registry holds
+ * at most one stopper — the ACTIVE screen's — so a backgrounded thread's
+ * registrant never replaces the one a person is watching. No registrant means
+ * no live client turn: the switch then just moves the scope (the provider
+ * re-key still tears the old runtime connection down).
+ */
+const enterpriseStops = new Map<string, () => Promise<void>>();
+let enterpriseActiveKey: string | null = null;
+export function registerEnterpriseAgentStop(
+  key: string,
+  stop: () => Promise<void>,
+  active: boolean,
+): () => void {
+  if (active) enterpriseActiveKey = key;
+  if (active || enterpriseActiveKey === null) enterpriseStops.set(key, stop);
+  return () => {
+    enterpriseStops.delete(key);
+    if (enterpriseActiveKey === key) enterpriseActiveKey = null;
+  };
+}
+export async function stopEnterpriseAgent(): Promise<void> {
+  const stopper =
+    enterpriseActiveKey === null ? undefined : enterpriseStops.get(enterpriseActiveKey);
+  if (stopper === undefined) return;
+  await stopper().catch(() => undefined);
+}
 // The composer pill shows focus with its border, so the browser's ring inside it is noise.
 // Chrome draws `outline-style: auto` at any width, so only `none` removes it; React Native's
 // types omit that value, but react-native-web passes it through.
@@ -463,6 +494,16 @@ export function ChatScreen({
       setError(t("stopFailed", { error: e instanceof Error ? e.message : String(e) }));
     }
   }
+  // T07.11 (#601): the app shell's switch stops this live turn through the
+  // registry; the registration follows the active flag so only the screen a
+  // person is watching is stopped, and unmount always withdraws it.
+  useEffect(
+    () => registerEnterpriseAgentStop(`${agentId}`, stop, active),
+    // stop closes over mutable state; re-registering on every render's deps
+    // would churn — the registration only needs the identity and activity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [agentId, active, copilotkit, agent],
+  );
   function send() {
     const text = draft.trim();
     if (!text || !isReady || !loaded) return;

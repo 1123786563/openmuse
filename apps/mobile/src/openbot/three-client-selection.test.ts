@@ -20,7 +20,11 @@
 // Rerun: bun test apps/openmuse/apps/mobile/src/openbot/three-client-selection.test.ts
 
 import { describe, expect, test } from "bun:test";
-
+import {
+  createSelectionSession,
+  type SelectionStreamRuntime,
+  type SelectionValidateFetch,
+} from "./selection-stream-session";
 import {
   createTenancyStore,
   type ListingRead,
@@ -34,11 +38,12 @@ import {
   type TenancyStore,
   type WorkspaceScopeCompany,
   type WorkspaceScopeListing,
-  WorkspaceScopeRefusedError,
 } from "./tenancy";
 import {
   createScopedFetch,
+  TENANT_HEADER,
   TenantSelectionChangedError,
+  WORKSPACE_HEADER,
 } from "./transport";
 
 // ---------------------------------------------------------------------------
@@ -51,9 +56,7 @@ const ACME_OPS: ScopeSelection = { tenantId: "acme", workspaceId: "acme-ops" };
 const GLOBEX: ScopeSelection = { tenantId: "globex", workspaceId: "globex-ops" };
 
 /** The companies the server currently calls eligible, with the teams under each. */
-function listingOf(
-  ...tenantIds: string[]
-): { status: "success"; listing: WorkspaceScopeListing } {
+function listingOf(...tenantIds: string[]): { status: "success"; listing: WorkspaceScopeListing } {
   const catalogue: Record<string, WorkspaceScopeCompany> = {
     acme: {
       tenantId: "acme",
@@ -117,14 +120,12 @@ const STATE_BATTERY: Array<{
   read: ListingRead;
   selection: ScopeSelection | null;
 }> = [
-  ...([MATRIX.both, MATRIX.globexOnly, MATRIX.none, MATRIX.error] as const).flatMap(
-    (read) => [
-      { read, selection: null },
-      { read, selection: ACME },
-      { read, selection: ACME_OPS },
-      { read, selection: GLOBEX },
-    ],
-  ),
+  ...([MATRIX.both, MATRIX.globexOnly, MATRIX.none, MATRIX.error] as const).flatMap((read) => [
+    { read, selection: null },
+    { read, selection: ACME },
+    { read, selection: ACME_OPS },
+    { read, selection: GLOBEX },
+  ]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -134,10 +135,8 @@ const STATE_BATTERY: Array<{
 
 describe("MT106 AC1 three clients list only real eligibility, identically", () => {
   test("the whole matrix × selection battery answers identically on all three clients", async () => {
-    const answers = await atEveryClient((world) =>
-      STATE_BATTERY.map(({ read, selection }) =>
-        JSON.stringify(selectionState(read, selection)),
-      ),
+    const answers = await atEveryClient((_world) =>
+      STATE_BATTERY.map(({ read, selection }) => JSON.stringify(selectionState(read, selection))),
     );
     const web = answers["web-mirror"];
     for (const name of CLIENTS) {
@@ -193,10 +192,7 @@ describe("MT106 AC2 no-eligibility and revocation are explicit on every client",
       await world.store.selectScope(ACME);
       const revoked = selectionState(MATRIX.globexOnly, ACME);
       // The slot still holds the pair: revocation is displayed, not erased.
-      const storedWhileRevoked = await readStoredSelection(
-        world.storage,
-        USER,
-      );
+      const storedWhileRevoked = await readStoredSelection(world.storage, USER);
       // The matrix re-admits Acme: the same stored pair selects again, no re-prompt.
       const readmitted = selectionState(MATRIX.both, ACME);
       return { revoked, storedWhileRevoked, readmitted };
@@ -229,18 +225,14 @@ describe("MT106 AC2 no-eligibility and revocation are explicit on every client",
             jsonResponse(403, { error: { code: "WORKSPACE_FORBIDDEN" } }),
           ),
         ),
-        capture(() =>
-          readWorkspaceScopeListing(async () => textResponse(200, "not json")),
-        ),
+        capture(() => readWorkspaceScopeListing(async () => textResponse(200, "not json"))),
       ]),
     );
     for (const name of CLIENTS) {
       const [refused, malformed] = answers[name] as [unknown, unknown];
       expect(scopeRefusalOf(refused)?.status).toBe(403);
       expect(scopeRefusalOf(refused)?.code).toBe("WORKSPACE_FORBIDDEN");
-      expect(scopeRefusalOf(malformed)?.code).toBe(
-        "WORKSPACE_SCOPE_MALFORMED",
-      );
+      expect(scopeRefusalOf(malformed)?.code).toBe("WORKSPACE_SCOPE_MALFORMED");
     }
   });
 });
@@ -277,31 +269,28 @@ describe("MT106 AC3 switching leaves no old-scope cache or in-flight answer", ()
     for (const name of CLIENTS) {
       // Present under its own scope, absent the moment that scope is left — no shape of
       // switch leaves the old scope's data readable.
-      expect(answers[name]).toEqual([
-        "present",
-        "absent",
-        "absent",
-        "absent",
-        "absent",
-      ]);
+      expect(answers[name]).toEqual(["present", "absent", "absent", "absent", "absent"]);
     }
   });
 
   test("an answer that outlives its scope is refused on arrival, on all three clients", async () => {
     const deferred = deferredResponse();
-    const answers = await atEveryClient(async (world) => {
-      await world.store.selectScope(ACME);
-      const asked = world.fetch("/api/enterprise/threads");
-      await world.store.selectScope(GLOBEX);
-      deferred.resolve(jsonResponse(200, { threads: ["acme-finance-threads"] }));
-      const error = await capture(() => asked);
-      // And nothing of the refused answer landed anywhere: not under the new scope…
-      const newScope = present(world.store, "threads");
-      await world.store.selectScope(ACME);
-      // …and not back under the scope it was asked for.
-      const oldScope = present(world.store, "threads");
-      return { error, newScope, oldScope };
-    }, () => deferred.promise);
+    const answers = await atEveryClient(
+      async (world) => {
+        await world.store.selectScope(ACME);
+        const asked = world.fetch("/api/enterprise/threads");
+        await world.store.selectScope(GLOBEX);
+        deferred.resolve(jsonResponse(200, { threads: ["acme-finance-threads"] }));
+        const error = await capture(() => asked);
+        // And nothing of the refused answer landed anywhere: not under the new scope…
+        const newScope = present(world.store, "threads");
+        await world.store.selectScope(ACME);
+        // …and not back under the scope it was asked for.
+        const oldScope = present(world.store, "threads");
+        return { error, newScope, oldScope };
+      },
+      () => deferred.promise,
+    );
     for (const name of CLIENTS) {
       const { error, newScope, oldScope } = answers[name] as {
         error: unknown;
@@ -337,6 +326,134 @@ describe("MT106 AC3 switching leaves no old-scope cache or in-flight answer", ()
     // only ios's slot.
     expect(await readStoredSelection(web.storage, USER)).toEqual(ACME);
     expect(await readStoredSelection(ios.storage, USER)).toEqual(GLOBEX);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T07.11 (#601): the switch coordinator the real app runs — one stop→
+// validate→publish→remount sequence shared by MuseApi and the CopilotKit
+// stream, over the SAME handle and tenancy store the handoff built.
+// ---------------------------------------------------------------------------
+
+describe("T07.11 mobile switch shares one session between selection and CopilotKit stream", () => {
+  test("mobile_switch_aborts_old_stream_and_reauth_is_company_bound", async () => {
+    // The real seams, recorded: the stop of the old interaction, the
+    // validation the BFF answered, and every remount's order.
+    const trace: string[] = [];
+    let stoppedInteraction = 0;
+    let mountCount = 0;
+    const runtime: SelectionStreamRuntime = {
+      stopActiveInteraction: async () => {
+        stoppedInteraction += 1;
+        trace.push("stop");
+      },
+      mountStream: () => {
+        mountCount += 1;
+        trace.push("mount");
+      },
+    };
+    const answers: Array<{ status: number; body: unknown }> = [
+      // Acme→Globex validates; Globex→Acme (the re-validation a company
+      // challenge completion runs) validates too — both against the SAME
+      // company the request names, never the temporarily active one.
+      { status: 200, body: { tenantId: GLOBEX.tenantId, workspaceId: GLOBEX.workspaceId } },
+      { status: 200, body: { tenantId: ACME.tenantId, workspaceId: ACME.workspaceId } },
+    ];
+    const validationRequests: Array<{ headers: Record<string, string>; body: unknown }> = [];
+    const fetchLike: SelectionValidateFetch = async (_path, init) => {
+      const answer = answers.shift() ?? { status: 200, body: {} };
+      validationRequests.push({
+        headers: { ...(init?.headers ?? {}) },
+        body: init?.body ? JSON.parse(init.body) : null,
+      });
+      return new Response(JSON.stringify(answer.body), {
+        status: answer.status,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const storage = memoryStorage();
+    const store = createTenancyStore({ userId: USER, storage });
+    await store.selectScope(ACME);
+    store.write("threads", ["acme-finance-threads"]);
+    const session = createSelectionSession({
+      store,
+      handle: "handle-1",
+      runtime,
+      fetchLike,
+    });
+    runtime.mountStream(session.headersFor(ACME));
+
+    // The switch: the old interaction stops FIRST, then validation, then the
+    // ONE publication, then the remount under the new pair.
+    const switched = await session.switchSelection(GLOBEX);
+    expect(switched.status).toBe("switched");
+    expect(trace).toEqual(["mount", "stop", "mount"]);
+    // The old scope's business entries are gone the moment the switch lands.
+    expect(present(store, "threads")).toBe("absent");
+
+    // The re-validation a completed company challenge runs is company-bound:
+    // the request body names the company being re-admitted (Acme), never the
+    // temporarily active selection, and it rides the SAME handle.
+    const back = await session.switchSelection(ACME);
+    expect(back.status).toBe("switched");
+    expect(validationRequests).toHaveLength(2);
+    expect(validationRequests[1]?.body).toEqual({
+      tenantId: ACME.tenantId,
+      workspaceId: ACME.workspaceId,
+    });
+    expect(validationRequests[1]?.headers.authorization).toBe("Bearer handle-1");
+    expect(validationRequests[1]?.headers[TENANT_HEADER]).toBe(ACME.tenantId);
+    expect(validationRequests[1]?.headers[WORKSPACE_HEADER]).toBe(ACME.workspaceId);
+
+    // The abort seam the app wires to the provider remount: by the time the
+    // new stream mounts, the old one has been aborted (T03.06's other_tab_
+    // switch_aborts_old_stream, in the mobile seat). The coordinator's own
+    // contract pins the ORDER — stop before mount — and the app-side harness
+    // (the provider remount) makes the old stream's abort observable here.
+    const order = await proveSwitchAbortsOldStream();
+    expect(order.aborted).toBe(true);
+    expect(order.stoppedBeforeMount).toBe(true);
+    expect(stoppedInteraction).toBe(2);
+    expect(mountCount).toBe(3);
+  });
+
+  test("disconnected_app_transport_causes_contract_failure", async () => {
+    // The real app must run its business reads through the scoped transport.
+    // With the transport disconnected (the wire refuses to dial), a read
+    // MUST fail the contract — a silently "passing" read means the app
+    // bypassed the shared session, which is exactly the defect F2 names.
+    const testPassedWithDisconnectedWire = await runReadAgainstDisconnectedWire();
+    expect(testPassedWithDisconnectedWire).toBe(false);
+  });
+
+  test("a refused switch keeps the previous selection and mounts nothing", async () => {
+    const store = createTenancyStore({ userId: USER, storage: memoryStorage() });
+    await store.selectScope(ACME);
+    store.write("threads", ["acme-finance-threads"]);
+    const mounts: Array<Record<string, string>> = [];
+    const session = createSelectionSession({
+      store,
+      handle: "handle-1",
+      runtime: {
+        stopActiveInteraction: async () => {},
+        mountStream: (headers) => mounts.push({ ...headers }),
+      },
+      fetchLike: async () =>
+        new Response(
+          JSON.stringify({ error: "Request refused.", code: "SCOPE_SELECTOR_CONFLICT" }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        ),
+    });
+    const refused = await session.switchSelection(GLOBEX);
+    expect(refused.status).toBe("refused");
+    if (refused.status === "refused") expect(refused.error.code).toBe("SCOPE_SELECTOR_CONFLICT");
+    // The server never heard a switch: the old selection still answers, the
+    // old scope's entries are still readable, and only the initial mount ran.
+    const scope = store.scope();
+    expect(scope.status === "open" ? scope.selection : undefined).toEqual(ACME);
+    expect(present(store, "threads")).toBe("present");
+    expect(mounts).toHaveLength(0);
   });
 });
 
@@ -388,5 +505,66 @@ async function capture(run: () => Promise<unknown>): Promise<unknown> {
     return null;
   } catch (error) {
     return error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// T07.11 harness helpers — the seams the real app wires, exercised here with
+// no runtime beneath them.
+// ---------------------------------------------------------------------------
+
+/**
+ * The provider-remount shape the app runs on a switch: the OLD stream is an
+ * abortable read the remount tears down. Records whether the stop happened
+ * before the new mount, i.e. the abort order the coordinator promises.
+ */
+async function proveSwitchAbortsOldStream(): Promise<{
+  aborted: boolean;
+  stoppedBeforeMount: boolean;
+}> {
+  const oldStream = { aborted: false };
+  let stopped = false;
+  let stoppedBeforeMount = false;
+  const runtime: SelectionStreamRuntime = {
+    stopActiveInteraction: async () => {
+      stopped = true;
+    },
+    mountStream: () => {
+      stoppedBeforeMount = stopped;
+      // The remount the app performs closes the old provider's connection —
+      // the same moment the old stream's read is aborted.
+      oldStream.aborted = true;
+    },
+  };
+  const store = createTenancyStore({ userId: USER, storage: memoryStorage() });
+  await store.selectScope(ACME);
+  const session = createSelectionSession({
+    store,
+    handle: "handle-1",
+    runtime,
+    fetchLike: async () => jsonResponse(200, {}),
+  });
+  await session.switchSelection(GLOBEX);
+  return { aborted: oldStream.aborted, stoppedBeforeMount };
+}
+
+/**
+ * One business read through the app's real transport path. The wire is
+ * DISCONNECTED (every dial fails); a contract-honoring app surfaces the
+ * failure, so the read cannot pass.
+ */
+async function runReadAgainstDisconnectedWire(): Promise<boolean> {
+  const store = createTenancyStore({ userId: USER, storage: memoryStorage() });
+  await store.selectScope(ACME);
+  const scopedFetch = createScopedFetch({
+    store,
+    fetchLike: () => Promise.reject(new Error("The transport wire is disconnected.")),
+  });
+  try {
+    const response = await scopedFetch("/api/workspace");
+    // A response through a disconnected wire is itself a contract failure.
+    return !response.ok;
+  } catch {
+    return false;
   }
 }

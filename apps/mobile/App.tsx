@@ -2,6 +2,7 @@ import { CopilotKitProvider } from "@copilotkit/react-native/headless";
 import { StatusBar } from "expo-status-bar";
 import {
   Bell,
+  Building2,
   CalendarDays,
   Check,
   FolderOpen,
@@ -40,7 +41,7 @@ import {
 } from "./src/agent-ui";
 import { AgentWorkspaceProvider, useAgentWorkspace } from "./src/agent-workspace";
 import { API_URL, createStandaloneSession, MuseApi, mobileAuthConfig } from "./src/api";
-import { ChatScreen, WorkspaceTools } from "./src/chat";
+import { ChatScreen, stopEnterpriseAgent, WorkspaceTools } from "./src/chat";
 import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
 import { Details } from "./src/details";
@@ -59,14 +60,17 @@ import {
 import { OpenBotComputerScreen } from "./src/openbot/computer";
 import { openbotUrl } from "./src/openbot/config";
 import { OpenBotConnectionsScreen } from "./src/openbot/connections";
+import { CopilotKitEnterpriseProvider } from "./src/openbot/copilot-runtime";
 import { OpenBotFilesScreen } from "./src/openbot/files";
 import { OpenBotGate } from "./src/openbot/gate";
 import { clearPrivateState } from "./src/openbot/private-state";
+import { createSelectionSession } from "./src/openbot/selection-stream-session";
 import { OpenBotTasksScreen } from "./src/openbot/tasks";
 import {
   createTenancyStore,
   readWorkspaceScopeListing,
   type ScopeSelection,
+  type TenancyStore,
   type WorkspaceScopeCompany,
   type WorkspaceScopeListing,
   type WorkspaceScopeTeam,
@@ -79,14 +83,12 @@ import {
   type EnterpriseSessionResponse,
   type MobileAuthConfig,
   type PendingLoginStorage,
-  TENANT_HEADER,
-  WORKSPACE_HEADER,
 } from "./src/openbot/transport";
 import type { OpenBotSession, OpenBotWorkspace } from "./src/openbot/types";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
 import { t } from "./src/strings";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
-import { Button, Card, colors, ErrorNotice, Field, IconButton, Mascot, s } from "./src/ui";
+import { Button, Card, colors, ErrorNotice, Field, IconButton, Mascot, Sheet, s } from "./src/ui";
 import { type Detail, useWorkspace, WorkspaceContext } from "./src/workspace";
 
 const nav: { id: Section; label: string; icon: LucideIcon }[] = [
@@ -191,8 +193,11 @@ type EnterpriseStage =
       session: EnterpriseSessionResponse;
       listing: WorkspaceScopeListing;
       selection: ScopeSelection;
+      store: TenancyStore;
       api: MuseApi;
       workspace: Workspace;
+      /** T07.11: bumped by each switch's mount step; re-keys the provider. */
+      remountId: number;
     };
 
 function webPendingStorage(): PendingLoginStorage | undefined {
@@ -385,8 +390,10 @@ function EnterpriseApp({ config }: { config: MobileAuthConfig }) {
           session: stage.session,
           listing: stage.listing,
           selection,
+          store,
           api,
           workspace,
+          remountId: 0,
         });
       } catch (error) {
         await store.selectScope(null);
@@ -404,20 +411,32 @@ function EnterpriseApp({ config }: { config: MobileAuthConfig }) {
     return (
       <SafeAreaProvider>
         <StatusBar style="dark" />
-        <CopilotKitProvider
-          runtimeUrl={`${config.apiOrigin}/api/copilotkit`}
-          headers={{
-            Authorization: `Bearer ${stage.session.token}`,
-            [TENANT_HEADER]: stage.selection.tenantId,
-            [WORKSPACE_HEADER]: stage.selection.workspaceId,
-          }}
+        {/*
+         * T07.11 (#601): the runtime provider derives its address and headers from
+         * the SAME config and tenancy store the MuseApi scoped fetch rides, and
+         * re-keys by the store's scope key + the coordinator's remount id — a
+         * switch tears the old provider (and its agent connection) down before
+         * the new scope's mounts.
+         */}
+        <CopilotKitEnterpriseProvider
+          config={config}
+          handle={stage.session.token}
+          store={stage.store}
+          remountId={stage.remountId}
         >
           <WorkspaceApp
             token={stage.session.token}
             api={stage.api}
             initialWorkspace={stage.workspace}
+            store={stage.store}
+            listing={stage.listing}
+            onRemount={() =>
+              setStage((prev) =>
+                prev.kind === "ready" ? { ...prev, remountId: prev.remountId + 1 } : prev,
+              )
+            }
           />
-        </CopilotKitProvider>
+        </CopilotKitEnterpriseProvider>
       </SafeAreaProvider>
     );
   }
@@ -758,7 +777,7 @@ function OpenMuseApp() {
           runtimeUrl={`${API_URL}/api/copilotkit`}
           headers={{ Authorization: `Bearer ${token}` }}
         >
-          <WorkspaceApp token={token} api={api} />
+          <WorkspaceApp token={token} api={api} onRemount={() => undefined} />
         </CopilotKitProvider>
       ) : (
         <SafeAreaView
@@ -808,10 +827,17 @@ function WorkspaceApp({
   token,
   api,
   initialWorkspace,
+  store,
+  listing,
+  onRemount,
 }: {
   token: string;
   api: MuseApi;
   initialWorkspace?: Workspace;
+  store?: TenancyStore;
+  listing?: WorkspaceScopeListing;
+  /** T07.11: the coordinator's mount step — bumps the provider's remount id. */
+  onRemount: () => void;
 }) {
   const [workspace, setWorkspace] = useState<Workspace | undefined>(initialWorkspace);
   const [section, setSection] = useState<Section>("chat");
@@ -850,6 +876,48 @@ function WorkspaceApp({
     setPrompt({ id: Date.now(), text });
     setSection("chat");
   }, []);
+  /*
+   * T07.11 (#601): the ONE switch, in the coordinator's order — stop the
+   * live agent turn first (the stop is a request against the OLD scope,
+   * awaited), validate the new pair server-side against the same handle,
+   * publish (the generation advance refuses whatever leaks past and drops
+   * the old scope's business entries), then remount the runtime provider
+   * under the new pair. A refusal keeps the previous scope and surfaces the
+   * server's own refusal copy; the provider's re-key tears the old
+   * connection down, never resumed. A server-side Run the switch left behind
+   * keeps its ORIGINAL scope — the BFF re-admits each action online, the
+   * client does not redirect it.
+   */
+  const switchScope = useCallback(
+    (next: ScopeSelection) => {
+      if (store === undefined) return;
+      const coordinator = createSelectionSession({
+        store,
+        handle: token,
+        runtime: {
+          stopActiveInteraction: () => stopEnterpriseAgent(),
+          mountStream: () => onRemount(),
+        },
+        fetchLike: (path, init) =>
+          fetch(`${api.baseUrl}${path}`, {
+            method: init?.method,
+            headers: init?.headers,
+            body: init?.body,
+          }),
+      });
+      void coordinator
+        .switchSelection(next)
+        .then((outcome) => {
+          if (outcome.status === "refused") {
+            setError(`切换被拒绝（${outcome.error.code}），仍保持在当前范围。`);
+            return;
+          }
+          void refresh().catch((e) => setError(String(e)));
+        })
+        .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    },
+    [store, token, api, refresh, onRemount],
+  );
   if (!workspace)
     return (
       <SafeAreaView
@@ -882,7 +950,14 @@ function WorkspaceApp({
     <WorkspaceContext.Provider
       value={{ workspace, api, section, navigate, refresh, open, close, notify: setToast, ask }}
     >
-      <AgentWorkspaceProvider>
+      {/* T07.11: keyed by the scope key — a switch remounts the agent
+       * workspace so its cached snapshot answers under the NEW scope. */}
+      <AgentWorkspaceProvider
+        key={(() => {
+          const scope = store?.scope();
+          return scope?.status === "open" ? scope.key : "scope-pending";
+        })()}
+      >
         <ComputerDraftProvider key={token}>
           <ThreadsProvider>
             <WorkspaceShell
@@ -891,6 +966,8 @@ function WorkspaceApp({
               clearToast={() => setToast("")}
               error={error}
               prompt={prompt}
+              switchScope={switchScope}
+              listing={listing}
             />
           </ThreadsProvider>
         </ComputerDraftProvider>
@@ -904,15 +981,20 @@ function WorkspaceShell({
   clearToast,
   error,
   prompt,
+  switchScope,
+  listing,
 }: {
   detail?: Detail;
   toast: string;
   clearToast: () => void;
   error: string;
   prompt?: { id: number; text: string };
+  switchScope?: (next: ScopeSelection) => void;
+  listing?: WorkspaceScopeListing;
 }) {
   const { workspace, section, navigate, open } = useWorkspace();
   const { data } = useAgentWorkspace();
+  const [scopeOpen, setScopeOpen] = useState(false);
   const {
     selection,
     visited,
@@ -1011,6 +1093,13 @@ function WorkspaceShell({
               {section === "chat" && <ComputerEntry />}
             </View>
             <View style={{ position: "absolute", right: 0, top: 16 }}>
+              {switchScope && listing && (
+                <IconButton
+                  icon={Building2}
+                  label={t("switchScope")}
+                  onPress={() => setScopeOpen(true)}
+                />
+              )}
               <IconButton
                 icon={Bell}
                 label={t("notificationsBadge", { n: pending })}
@@ -1173,6 +1262,51 @@ function WorkspaceShell({
           </View>
         )}
         {threadsOpen && <ThreadsSheet onClose={() => setThreadsOpen(false)} />}
+        {/*
+         * T07.11 (#601): the scope switch sheet. Choosing a company/team here
+         * stops the live agent turn first and then moves the one tenancy
+         * store; the runtime provider above re-keys by the store's scope key,
+         * so the chat reconnects under the NEW selection only.
+         */}
+        {scopeOpen && switchScope && listing && (
+          <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}>
+            <Sheet
+              title={t("switchScope")}
+              subtitle={t("switchScopeSubtitle")}
+              onClose={() => setScopeOpen(false)}
+            >
+              <View style={{ gap: 10 }}>
+                {listing.companies.map((company) => (
+                  <View key={company.tenantId} style={{ gap: 6 }}>
+                    <Text style={{ color: colors.text, fontWeight: "600" }}>{company.name}</Text>
+                    {company.teams.map((team) => (
+                      <Pressable
+                        key={team.workspaceId}
+                        accessibilityRole="button"
+                        accessibilityLabel={`${company.name} ${team.name}`}
+                        onPress={() => {
+                          setScopeOpen(false);
+                          switchScope({
+                            tenantId: company.tenantId,
+                            workspaceId: team.workspaceId,
+                          });
+                        }}
+                        style={({ pressed }) => ({
+                          paddingVertical: 10,
+                          paddingHorizontal: 12,
+                          borderRadius: 12,
+                          backgroundColor: pressed ? "#F0F1F2" : "#F8F8F8",
+                        })}
+                      >
+                        <Text style={{ color: colors.text }}>{team.name}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                ))}
+              </View>
+            </Sheet>
+          </View>
+        )}
         {detail && (
           <Details
             key={
